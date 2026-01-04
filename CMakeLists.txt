@@ -13,6 +13,12 @@ if(CHJSON_BUILD_TESTS)
   enable_testing()
   add_executable(chjson_tests
     test/test_main.cpp
+    test/test_numbers.cpp
+    test/test_strings.cpp
+    test/test_structure.cpp
+    test/test_errors.cpp
+    test/test_dom.cpp
+    test/test_random.cpp
   )
   target_link_libraries(chjson_tests PRIVATE chjson)
   target_compile_features(chjson_tests PRIVATE cxx_std_17)

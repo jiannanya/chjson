@@ -4,10 +4,11 @@ A small, performant, header-only **C++17** JSON library focused on:
 
 - **Strict JSON** parsing (RFC-style; no comments / no trailing commas)
 - **High-quality errors** (error code + byte offset + line/column)
-- **Two DOM models**:
-  - Owning DOM (`chjson::value`) — copies strings
-  - Zero-copy in-situ DOM (`chjson::document` + `chjson::sv_value`) — strings are `std::string_view` into the input buffer
-- **Low allocation** parsing with an arena (`chjson::pmr::arena_resource`) for the in-situ DOM
+- **Three DOM/parse modes**:
+  - Owning DOM (`chjson::value`) via `parse()` — strings are owned (`std::string`)
+  - View DOM (`chjson::view_document` + `chjson::sv_value`) via `parse_view()` — **non-mutating**, zero-copy for unescaped strings, decoded strings stored in an arena
+  - In-situ DOM (`chjson::document` + `chjson::sv_value`) via `parse_in_situ()` — takes ownership of a mutable buffer, decodes escapes **in-place**, strings are `std::string_view` into that buffer
+- **Low allocation** parsing with an arena (`chjson::pmr::arena_resource`) for the view/in-situ DOM
 
 ---
 
@@ -16,6 +17,7 @@ A small, performant, header-only **C++17** JSON library focused on:
 - [Quick Start](#quick-start)
 - [Build](#build)
 - [API Overview](#api-overview)
+- [Zero-copy View DOM (Non-mutating)](#zero-copy-view-dom-non-mutating)
 - [Zero-copy In-situ DOM](#zero-copy-in-situ-dom)
 - [Arena / PMR](#arena--pmr)
 - [Benchmarks](#benchmarks)
@@ -119,6 +121,30 @@ int main() {
 }
 ```
 
+### Error codes (`chjson::error_code`)
+
+`r.err.code` 的枚举值定义在 `include/chjson/chjson.hpp`，当前包含以下错误码（`ok` 表示无错误）。
+
+> 说明：下面示例 JSON 仅用于触发对应错误，实际返回的 `offset/line/column` 取决于输入具体位置。
+
+| code | 含义 | 常见触发示例 |
+| --- | --- | --- |
+| `ok` | 成功 | （无） |
+| `unexpected_eof` | 输入提前结束（缺失闭合符号/字符串结束引号等） | `{"a":1` / `"unterminated` |
+| `invalid_value` | 非法 token/值（不是合法 JSON 值起始） | `]` / `tru` / `[1,]` |
+| `invalid_number` | 数字不符合 JSON number 语法 | `01` / `1.` / `1e+` |
+| `invalid_string` | 字符串不合法（例如包含未转义控制字符） | `"a\n"`（注意：这里的换行是原始换行，不是 `\\n`） |
+| `invalid_escape` | 字符串内反斜杠转义不合法 | `"\\v"` |
+| `invalid_unicode_escape` | `\uXXXX` 十六进制不合法或不完整 | `"\\u12G4"` |
+| `invalid_utf16_surrogate` | UTF-16 代理对不合法（高代理缺低代理/低代理单独出现等） | `"\\uD800"` / `"\\uDE03"` |
+| `expected_colon` | 对象成员缺少 `:` | `{"a" 1}` |
+| `expected_comma_or_end` | 期望 `,` 或闭合符号 `]`/`}`，但遇到其他字符 | `[1 2]` / `{"a":1 "b":2}` |
+| `expected_key_string` | 对象 key 不是字符串（必须以 `"` 开始） | `{a:1}` / `{"a":1, 2:3}` |
+| `trailing_characters` | 解析完一个值后仍有非空白字符（`require_eof=true` 时） | `nullx` / `true 123` |
+| `nesting_too_deep` | 超过 `parse_options::max_depth` 的嵌套深度限制 | `[[[0]]]`（小 `max_depth`） |
+
+建议用法：当 `r.err` 为真时，打印 `code + offset + line + column` 并保留原始输入，能最快定位问题。
+
 ### Parse options (depth limit, require EOF)
 
 ```cpp
@@ -141,7 +167,7 @@ Supported JSON types:
 
 - null
 - boolean
-- number (stored as int64 when possible, otherwise double)
+- number (stored as int64 when possible; otherwise the original number token is preserved for fast `dump()` and lazy `as_double()`)
 - string
 - array
 - object (in insertion order)
@@ -162,6 +188,7 @@ int main() {
 
   const chjson::value* x = r.val.find("x");
   assert(x && x->is_number());
+  // Non-integers preserve the original token and parse double lazily.
   (void)x->as_double();
 
   const chjson::value* s = r.val.find("s");
@@ -169,6 +196,37 @@ int main() {
   assert(s->as_string() == "hi");
 }
 ```
+
+### Numbers: token-preserving + lazy double
+
+By default, `parse()` does **not** eagerly parse floating-point numbers.
+
+- If a number fits in `int64_t`, it is stored as an integer.
+- Otherwise, chjson stores the original token text (e.g. `"0.1"`, `"1e-10"`) and only parses a `double` when you call `as_double()`.
+- `dump()` prefers emitting the preserved token (stable + fast).
+
+This makes round-trips stable and keeps parsing fast when you rarely need doubles.
+
+```cpp
+#include <chjson/chjson.hpp>
+#include <cassert>
+#include <string>
+
+int main() {
+  auto r = chjson::parse("1e-10");
+  assert(!r.err);
+  assert(r.val.is_number());
+  assert(!r.val.is_int());
+
+  // dump() uses the original token
+  assert(chjson::dump(r.val) == std::string("1e-10"));
+
+  // double parse happens lazily
+  (void)r.val.as_double();
+}
+```
+
+If you create numbers programmatically via `value::number(double)`, the stored representation is the `double` (no preserved token).
 
 ### Object lookup (`find`)
 
@@ -233,6 +291,55 @@ int main() {
 }
 ```
 
+---
+
+## Zero-copy View DOM (Non-mutating)
+
+If you want *zero-copy when possible* but **cannot mutate the input**, use `parse_view()` / `parse_view_into()`.
+
+- Unescaped strings/keys: `std::string_view` points into the original JSON text.
+- Escaped strings/keys: decoded into memory allocated from the document arena (`pmr::arena_resource`).
+
+### View parse
+
+```cpp
+#include <chjson/chjson.hpp>
+#include <cassert>
+#include <string>
+
+int main() {
+  std::string json = R"({"plain":"ok","esc":"a\nB"})";
+  auto r = chjson::parse_view(json);
+  assert(!r.err);
+
+  const auto& root = r.doc.root();
+  assert(root.is_object());
+
+  // Unescaped string points into the original input.
+  auto plain = root.find("plain");
+  assert(plain && plain->as_string_view() == "ok");
+
+  // Escaped string is decoded into arena memory (not pointing into json).
+  auto esc = root.find("esc");
+  assert(esc && esc->as_string_view() == std::string_view("a\nB", 3));
+}
+```
+
+### Reuse a `view_document` (arena reuse)
+
+```cpp
+#include <chjson/chjson.hpp>
+
+int main() {
+  chjson::view_document doc;
+  for (int i = 0; i < 1000; ++i) {
+    chjson::error err = chjson::parse_view_into(doc, R"({"a":"x"})");
+    if (err) return 1;
+    (void)doc.root();
+  }
+}
+```
+
 ### Zero-copy guarantee (`string_view` points into the document buffer)
 
 ```cpp
@@ -271,6 +378,23 @@ int main() {
   std::string out = chjson::dump(r.doc.root(), /*pretty=*/true);
   auto r2 = chjson::parse(out);
   assert(!r2.err);
+}
+```
+
+### Append-serialize (`dump_to`) for reuse
+
+If you want to reuse a `std::string` buffer across serializations (e.g. in hot loops), use `dump_to()`:
+
+```cpp
+#include <chjson/chjson.hpp>
+
+int main() {
+  auto r = chjson::parse(R"({"a":1,"b":2})");
+  if (r.err) return 1;
+
+  std::string out;
+  out.reserve(1024);
+  chjson::dump_to(out, r.val, /*pretty=*/false);
 }
 ```
 
