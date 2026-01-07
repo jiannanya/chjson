@@ -27,17 +27,73 @@
 #include <system_error>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <variant>
 #include <vector>
-
-namespace chjson {
 
 // Config: floating-point parsing backend.
 // Override by defining CHJSON_USE_FROM_CHARS_DOUBLE to 0/1 before including this header.
 #ifndef CHJSON_USE_FROM_CHARS_DOUBLE
   #define CHJSON_USE_FROM_CHARS_DOUBLE 0
 #endif
+
+// Optional: use chfloat (vendored under chjson/another/chfloat) when available.
+// This is typically much faster than strtod/std::from_chars on MSVC for JSON numbers.
+//
+// Back-compat: if you previously defined CHJSON_USE_FAST_FLOAT, it is treated as
+// an alias for CHJSON_USE_CHFLOAT.
+#ifndef CHJSON_USE_CHFLOAT
+  #ifdef CHJSON_USE_FAST_FLOAT
+    #define CHJSON_USE_CHFLOAT CHJSON_USE_FAST_FLOAT
+  #else
+    #define CHJSON_USE_CHFLOAT 1
+  #endif
+#endif
+
+// Config: thread-local caches for single-shot parse(dom).
+// These caches reduce heap churn for workloads that repeatedly call chjson::parse()
+// (which constructs/destroys a document each time).
+//
+// Override by defining these macros before including this header.
+#ifndef CHJSON_USE_TLS_PARSE_CACHE
+  #define CHJSON_USE_TLS_PARSE_CACHE 1
+#endif
+
+// Max std::string capacity to cache per thread (bytes).
+#ifndef CHJSON_TLS_PARSE_BUFFER_MAX
+  #define CHJSON_TLS_PARSE_BUFFER_MAX (4u * 1024u * 1024u)
+#endif
+
+// Max arena committed bytes to cache per thread.
+#ifndef CHJSON_TLS_PARSE_ARENA_MAX
+  #define CHJSON_TLS_PARSE_ARENA_MAX (8u * 1024u * 1024u)
+#endif
+
+// Config: parse(dom) fast path for inputs with no strings.
+// When enabled, chjson::parse() may skip copying the full input buffer for JSON
+// texts that contain no '"' characters, and will eagerly parse numbers.
+// This primarily improves number-heavy workloads (e.g. Parse+sum(numbers)).
+#ifndef CHJSON_PARSE_DOM_NO_STRING_FASTPATH
+  #define CHJSON_PARSE_DOM_NO_STRING_FASTPATH 1
+#endif
+
+#if CHJSON_USE_CHFLOAT
+  #if defined(__has_include)
+    #if __has_include(<chfloat/chfloat.h>)
+      #include <chfloat/chfloat.h>
+      #define CHJSON_HAS_CHFLOAT 1
+    #else
+      #define CHJSON_HAS_CHFLOAT 0
+    #endif
+  #else
+    #define CHJSON_HAS_CHFLOAT 0
+  #endif
+#else
+  #define CHJSON_HAS_CHFLOAT 0
+#endif
+
+namespace chjson {
 
 enum class error_code {
   ok = 0,
@@ -84,6 +140,12 @@ inline bool is_ws(char c) noexcept {
 }
 
 inline void skip_ws(const char* buf, std::size_t size, std::size_t& i) noexcept {
+  // Extremely common case for compact JSON: no whitespace at the current position.
+  // Avoid the heavier SIMD path (which does a 16-byte load and mask setup) unless
+  // we actually see whitespace.
+  if (i >= size) return;
+  if (!is_ws(buf[i])) return;
+
   // Fast path: SSE2 scan 16 bytes at a time (available on MSVC x64 and most x86).
 #if defined(_M_X64) || defined(__SSE2__)
   while (i + 16 <= size) {
@@ -185,15 +247,151 @@ struct number_value {
 
 struct owned_number_value {
   // For non-integers, keep the original token for fast dump and lazy double parse.
-  // If `raw` is empty, use `d`.
+  // If raw token is empty, use `d`.
   bool is_int{false};
   std::int64_t i{0};
   mutable bool has_double{false};
   mutable double d{0.0};
-  std::string raw{};
+
+  // Compact small-string storage for raw number tokens.
+  // Avoids heap allocations for common tokens without bloating value size.
+  static constexpr std::size_t kInlineRawCap = 32;
+
+  std::uint32_t raw_len{0};
+  bool raw_is_heap{false};
+  union {
+    char raw_inline[kInlineRawCap];
+    char* raw_heap;
+  };
+
+  owned_number_value() noexcept : raw_inline{} {}
+
+  owned_number_value(const owned_number_value& other)
+      : is_int(other.is_int), i(other.i), has_double(other.has_double), d(other.d), raw_len(other.raw_len), raw_is_heap(false),
+        raw_inline{} {
+    if (other.raw_len == 0) return;
+    if (other.raw_is_heap) {
+      raw_is_heap = true;
+      raw_heap = new char[raw_len];
+      std::memcpy(raw_heap, other.raw_heap, raw_len);
+      return;
+    }
+    std::memcpy(raw_inline, other.raw_inline, raw_len);
+  }
+
+  owned_number_value& operator=(const owned_number_value& other) {
+    if (this == &other) return *this;
+    clear_raw();
+    is_int = other.is_int;
+    i = other.i;
+    has_double = other.has_double;
+    d = other.d;
+    raw_len = other.raw_len;
+    if (other.raw_len == 0) {
+      raw_is_heap = false;
+      return *this;
+    }
+    if (other.raw_is_heap) {
+      raw_is_heap = true;
+      raw_heap = new char[raw_len];
+      std::memcpy(raw_heap, other.raw_heap, raw_len);
+      return *this;
+    }
+    raw_is_heap = false;
+    std::memcpy(raw_inline, other.raw_inline, raw_len);
+    return *this;
+  }
+
+  owned_number_value(owned_number_value&& other) noexcept
+      : is_int(other.is_int), i(other.i), has_double(other.has_double), d(other.d), raw_len(other.raw_len), raw_is_heap(other.raw_is_heap),
+        raw_inline{} {
+    if (raw_len == 0) {
+      raw_is_heap = false;
+      return;
+    }
+    if (raw_is_heap) {
+      raw_heap = other.raw_heap;
+      other.raw_heap = nullptr;
+      other.raw_len = 0;
+      other.raw_is_heap = false;
+      return;
+    }
+    std::memcpy(raw_inline, other.raw_inline, raw_len);
+    other.raw_len = 0;
+  }
+
+  owned_number_value& operator=(owned_number_value&& other) noexcept {
+    if (this == &other) return *this;
+    clear_raw();
+    is_int = other.is_int;
+    i = other.i;
+    has_double = other.has_double;
+    d = other.d;
+    raw_len = other.raw_len;
+    raw_is_heap = other.raw_is_heap;
+    if (raw_len == 0) {
+      raw_is_heap = false;
+      return *this;
+    }
+    if (raw_is_heap) {
+      raw_heap = other.raw_heap;
+      other.raw_heap = nullptr;
+      other.raw_len = 0;
+      other.raw_is_heap = false;
+      return *this;
+    }
+    std::memcpy(raw_inline, other.raw_inline, raw_len);
+    other.raw_len = 0;
+    other.raw_is_heap = false;
+    return *this;
+  }
+
+  ~owned_number_value() { clear_raw(); }
+
+  void clear_raw() noexcept {
+    if (raw_is_heap) {
+      delete[] raw_heap;
+    }
+    raw_is_heap = false;
+    raw_len = 0;
+  }
+
+  [[nodiscard]] std::string_view raw_token() const noexcept {
+    if (raw_len == 0) return {};
+    if (raw_is_heap) return std::string_view(raw_heap, static_cast<std::size_t>(raw_len));
+    return std::string_view(raw_inline, static_cast<std::size_t>(raw_len));
+  }
+
+  void set_raw(std::string_view token) {
+    clear_raw();
+    if (token.empty()) return;
+
+    if (token.size() <= kInlineRawCap) {
+      raw_is_heap = false;
+      raw_len = static_cast<std::uint32_t>(token.size());
+      std::memcpy(raw_inline, token.data(), token.size());
+      return;
+    }
+
+    raw_is_heap = true;
+    raw_len = static_cast<std::uint32_t>(token.size());
+    raw_heap = new char[raw_len];
+    std::memcpy(raw_heap, token.data(), token.size());
+  }
 };
 
 inline double parse_double(std::string_view token) {
+  // Fast path: chfloat.
+#if CHJSON_HAS_CHFLOAT
+  {
+    double v = 0.0;
+    const char* first = token.data();
+    const char* last = token.data() + token.size();
+    auto r = chfloat::from_chars(first, last, v);
+    if (r.ec == chfloat::errc::ok && r.ptr == last) return v;
+  }
+#endif
+
   // Backend choice:
   // - strtod: often quite fast on MSVC/Windows and very robust.
   // - from_chars: locale-free and allocation-free, but performance varies by STL.
@@ -374,7 +572,7 @@ inline bool parse_number(const char* buf, std::size_t size, std::size_t& i, owne
   const std::string_view token(buf + start, end - start);
 
   auto set_raw = [&]() {
-    out.raw.assign(token.data(), token.size());
+    out.set_raw(token);
   };
   auto set_double = [&]() {
     if (parse_fp) {
@@ -409,7 +607,7 @@ inline bool parse_number(const char* buf, std::size_t size, std::size_t& i, owne
     }
     out.is_int = true;
     out.i = (acc == limit) ? std::numeric_limits<std::int64_t>::min() : -static_cast<std::int64_t>(acc);
-    out.raw.clear();
+    out.clear_raw();
     out.has_double = false;
     return true;
   }
@@ -422,7 +620,7 @@ inline bool parse_number(const char* buf, std::size_t size, std::size_t& i, owne
   }
   out.is_int = true;
   out.i = static_cast<std::int64_t>(acc);
-  out.raw.clear();
+  out.clear_raw();
   out.has_double = false;
   return true;
 }
@@ -454,7 +652,7 @@ public:
     n.i = i;
     n.has_double = false;
     n.d = 0.0;
-    n.raw.clear();
+    n.clear_raw();
     value v;
     v.data_ = n;
     return v;
@@ -465,7 +663,7 @@ public:
     n.is_int = false;
     n.has_double = true;
     n.d = d;
-    n.raw.clear();
+    n.clear_raw();
     value v;
     v.data_ = n;
     return v;
@@ -511,9 +709,10 @@ public:
   double as_double() const {
     const auto& n = std::get<detail::owned_number_value>(data_);
     if (n.is_int) return static_cast<double>(n.i);
-    if (!n.raw.empty()) {
+    const auto tok = n.raw_token();
+    if (!tok.empty()) {
       if (!n.has_double) {
-        n.d = detail::parse_double(n.raw);
+        n.d = detail::parse_double(tok);
         n.has_double = true;
       }
       return n.d;
@@ -560,7 +759,9 @@ struct parse_options {
   bool require_eof{true};
 };
 
-struct parse_result {
+// Legacy: fully owning DOM value tree (std::string/std::vector backed).
+// Kept for programmatic construction + deep-copy parsing when desired.
+struct value_parse_result {
   value val;
   error err;
 };
@@ -570,8 +771,8 @@ struct parser {
   std::size_t i{0};
   parse_options opt;
 
-  parse_result run() {
-    parse_result r;
+  value_parse_result run() {
+    value_parse_result r;
     detail::skip_ws(s, i);
     r.val = parse_value(0, r.err);
     if (r.err) return r;
@@ -771,6 +972,16 @@ struct parser {
     detail::skip_ws(s, i);
 
     value::array a;
+    // Conservative reserve for the common pattern of a large top-level array.
+    // Avoid aggressive over-allocation; small/medium arrays keep the default growth.
+    if (depth == 1 && i < s.size()) {
+      const std::size_t remaining = s.size() - i;
+      if (remaining >= 8192) {
+        std::size_t est = remaining / 72;
+        if (est > 4096) est = 4096;
+        if (est >= 16) a.reserve(est);
+      }
+    }
     if (i < s.size() && s[i] == ']') {
       ++i;
       return value(std::move(a));
@@ -805,6 +1016,10 @@ struct parser {
     detail::skip_ws(s, i);
 
     value::object o;
+    // Most objects are small; reserving 4 avoids a couple of reallocations
+    // without over-allocating like a larger fixed reserve.
+    (void)depth;
+    o.reserve(4);
     if (i < s.size() && s[i] == '}') {
       ++i;
       return value(std::move(o));
@@ -853,15 +1068,15 @@ struct parser {
   }
 };
 
-inline parse_result parse(std::string_view json, parse_options opt = {}) {
+inline value_parse_result parse_value(std::string_view json, parse_options opt = {}) {
   parser p;
   p.s = json;
   p.opt = opt;
   return p.run();
 }
 
-inline value parse_or_throw(std::string_view json, parse_options opt = {}) {
-  auto r = parse(json, opt);
+inline value parse_value_or_throw(std::string_view json, parse_options opt = {}) {
+  auto r = parse_value(json, opt);
   if (r.err) throw std::runtime_error("chjson: parse failed");
   return std::move(r.val);
 }
@@ -1261,8 +1476,8 @@ inline void dump_to(std::string& out, const value& v, bool pretty = false, int i
           const auto& n = std::get<detail::owned_number_value>(cur.data_);
           if (n.is_int) {
             detail::dump_int64(out, n.i);
-          } else if (!n.raw.empty()) {
-            out.append(n.raw.data(), n.raw.size());
+          } else if (const auto tok = n.raw_token(); !tok.empty()) {
+            out.append(tok.data(), tok.size());
           } else {
             detail::dump_double(out, n.d);
           }
@@ -1367,11 +1582,13 @@ public:
   arena_resource& operator=(arena_resource&& other) noexcept {
     if (this == &other) return *this;
     release();
-    blocks_ = std::move(other.blocks_);
+    head_ = other.head_;
+    tail_ = other.tail_;
+    current_ = other.current_;
     initial_block_size_ = other.initial_block_size_;
-    current_block_ = other.current_block_;
-    other.blocks_.clear();
-    other.current_block_ = 0;
+    other.head_ = nullptr;
+    other.tail_ = nullptr;
+    other.current_ = nullptr;
     return *this;
   }
 
@@ -1380,43 +1597,86 @@ public:
   // Clear allocations but keep committed blocks for reuse.
   // This is the typical "bump allocator reset" operation.
   void clear() noexcept {
-    for (auto& b : blocks_) b.used = 0;
-    current_block_ = 0;
+    for (block* b = head_; b != nullptr; b = b->next) b->used = 0;
+    current_ = head_;
   }
 
   // Reset to empty (frees all blocks).
   void reset() noexcept { release(); }
 
-  std::size_t blocks() const noexcept { return blocks_.size(); }
+  std::size_t blocks() const noexcept {
+    std::size_t n = 0;
+    for (block* b = head_; b != nullptr; b = b->next) ++n;
+    return n;
+  }
   std::size_t bytes_committed() const noexcept {
     std::size_t sum = 0;
-    for (const auto& b : blocks_) sum += b.size;
+    for (block* b = head_; b != nullptr; b = b->next) sum += b->size;
     return sum;
   }
   std::size_t bytes_used() const noexcept {
     std::size_t sum = 0;
-    for (const auto& b : blocks_) sum += b.used;
+    for (block* b = head_; b != nullptr; b = b->next) sum += b->used;
     return sum;
   }
 
-  void release() noexcept {
-    for (auto& b : blocks_) {
-      ::operator delete(b.ptr);
+  // Ensure at least `bytes` of backing storage is committed.
+  // This can dramatically reduce the number of heap allocations when parsing
+  // into a fresh document (where the arena would otherwise grow via many small
+  // blocks).
+  void reserve_bytes(std::size_t bytes) {
+    if (bytes == 0) return;
+    if (bytes_committed() >= bytes) return;
+
+    const std::size_t min_block = initial_block_size_ ? initial_block_size_ : (64 * 1024);
+    const std::size_t block_size = (bytes <= min_block) ? min_block : bytes;
+
+    block* nb = block::create(block_size);
+    if (!head_) {
+      head_ = tail_ = nb;
+    } else {
+      tail_->next = nb;
+      tail_ = nb;
     }
-    blocks_.clear();
-    current_block_ = 0;
+    current_ = nb;
+  }
+
+  void release() noexcept {
+    block* b = head_;
+    while (b) {
+      block* next = b->next;
+      block::destroy(b);
+      b = next;
+    }
+    head_ = nullptr;
+    tail_ = nullptr;
+    current_ = nullptr;
   }
 
 private:
   struct block {
-    std::byte* ptr{nullptr};
     std::size_t size{0};
     std::size_t used{0};
+    block* next{nullptr};
+
+    std::byte* data() noexcept { return reinterpret_cast<std::byte*>(this + 1); }
+    const std::byte* data() const noexcept { return reinterpret_cast<const std::byte*>(this + 1); }
+
+    static block* create(std::size_t block_size) {
+      block* nb = static_cast<block*>(::operator new(sizeof(block) + block_size));
+      nb->size = block_size;
+      nb->used = 0;
+      nb->next = nullptr;
+      return nb;
+    }
+
+    static void destroy(block* b) noexcept { ::operator delete(b); }
   };
 
-  std::vector<block> blocks_;
+  block* head_{nullptr};
+  block* tail_{nullptr};
+  block* current_{nullptr};
   std::size_t initial_block_size_{64 * 1024};
-  std::size_t current_block_{0};
 
   void* do_allocate(std::size_t bytes, std::size_t alignment) override {
     if (bytes == 0) bytes = 1;
@@ -1426,25 +1686,23 @@ private:
       throw std::bad_alloc();
     }
 
-    auto try_block = [&](block& b) -> void* {
-      std::uintptr_t base = reinterpret_cast<std::uintptr_t>(b.ptr) + b.used;
+    auto try_block = [&](block* b) -> void* {
+      if (!b) return nullptr;
+      std::uintptr_t base = reinterpret_cast<std::uintptr_t>(b->data()) + b->used;
       std::uintptr_t aligned = (base + (alignment - 1)) & ~(static_cast<std::uintptr_t>(alignment) - 1u);
       const std::size_t padding = static_cast<std::size_t>(aligned - base);
-      if (b.used + padding + bytes <= b.size) {
-        b.used += padding + bytes;
+      if (b->used + padding + bytes <= b->size) {
+        b->used += padding + bytes;
         return reinterpret_cast<void*>(aligned);
       }
       return nullptr;
     };
 
-    if (!blocks_.empty()) {
-      if (current_block_ >= blocks_.size()) current_block_ = blocks_.size() - 1;
-      // Try current and subsequent existing blocks first.
-      for (std::size_t idx = current_block_; idx < blocks_.size(); ++idx) {
-        if (void* p = try_block(blocks_[idx])) {
-          current_block_ = idx;
-          return p;
-        }
+    // Try current and subsequent existing blocks first.
+    for (block* b = current_ ? current_ : head_; b != nullptr; b = b->next) {
+      if (void* p = try_block(b)) {
+        current_ = b;
+        return p;
       }
     }
 
@@ -1452,15 +1710,18 @@ private:
     const std::size_t min_block = initial_block_size_ ? initial_block_size_ : (64 * 1024);
     const std::size_t block_size = (bytes + alignment <= min_block) ? min_block : (bytes + alignment);
 
-    block nb;
-    nb.size = block_size;
-    nb.used = 0;
-    nb.ptr = static_cast<std::byte*>(::operator new(nb.size));
-    blocks_.push_back(nb);
-    current_block_ = blocks_.size() - 1;
+    block* nb = block::create(block_size);
+    if (!head_) {
+      head_ = tail_ = nb;
+    } else {
+      tail_->next = nb;
+      tail_ = nb;
+    }
+    current_ = nb;
 
-    // Try again from the fresh block.
-    return do_allocate(bytes, alignment);
+    // Allocate from the fresh block.
+    if (void* p = try_block(nb)) return p;
+    throw std::bad_alloc();
   }
 
   void do_deallocate(void*, std::size_t, std::size_t) override {
@@ -1474,151 +1735,413 @@ private:
 
 } // namespace pmr
 
-struct sv_number_value {
-  bool is_int{false};
-  std::int64_t i{0};
-  // For non-integers, we prefer to keep the original token for fast parse/dump.
-  // If `raw` is empty, use `d`.
-  mutable bool has_double{false};
-  mutable double d{0.0};
-  std::string_view raw{};
+struct sv_raw_view {
+  const char* data;
+  std::uint32_t size;
 };
 
-class sv_value {
-public:
-  using array = std::pmr::vector<sv_value>;
-  using object = std::pmr::vector<std::pair<std::string_view, sv_value>>;
+struct sv_number_value {
+  // NOTE: This type must be trivially default constructible because it lives in
+  // a union inside sv_value.
+  //
+  // Layout note (performance): sv_value size is dominated by the number payload.
+  // Pack number flags into the high bits of raw.size to keep sv_number_value small.
+  // raw.size low 30 bits: raw token size (0..(1<<30)-1)
+  // raw.size bit 30: is_int
+  // raw.size bit 31: has_double
+  // Stores either:
+  // - int64 bits when is_int()==true
+  // - double bits when has_double()==true
+  // When the value is a float token and has_double()==false, payload is unspecified.
+  mutable std::uint64_t payload;
+  const char* raw_data;
+  mutable std::uint32_t raw_size_flags;
 
-  enum class kind { null, boolean, number, string, array, object };
+  std::int64_t int_value() const noexcept {
+    std::int64_t x;
+    std::memcpy(&x, &payload, sizeof(x));
+    return x;
+  }
 
-  sv_value() noexcept : data_(std::monostate{}) {}
-  sv_value(std::nullptr_t) noexcept : data_(std::monostate{}) {}
-  explicit sv_value(bool b) : data_(b) {}
-  explicit sv_value(std::string_view s) : data_(s) {}
+  void set_int_value(std::int64_t v) const noexcept {
+    std::memcpy(&payload, &v, sizeof(v));
+  }
 
-  static sv_value integer(std::int64_t i) {
-    sv_number_value n;
-    n.is_int = true;
-    n.i = i;
+  double double_value() const noexcept {
+    double x;
+    std::memcpy(&x, &payload, sizeof(double));
+    return x;
+  }
+
+  void set_double_value(double v) const noexcept {
+    std::memcpy(&payload, &v, sizeof(double));
+  }
+
+  static constexpr std::uint32_t k_size_mask = (1u << 30) - 1u;
+  static constexpr std::uint32_t k_is_int = 1u << 30;
+  static constexpr std::uint32_t k_has_double = 1u << 31;
+
+  std::uint32_t raw_size() const noexcept { return raw_size_flags & k_size_mask; }
+  bool has_raw() const noexcept { return raw_data != nullptr && raw_size() != 0; }
+  bool is_int() const noexcept { return (raw_size_flags & k_is_int) != 0; }
+  bool has_double() const noexcept { return (raw_size_flags & k_has_double) != 0; }
+
+  void set_is_int(bool v) noexcept {
+    if (v) raw_size_flags |= k_is_int;
+    else raw_size_flags &= ~k_is_int;
+  }
+
+  void set_has_double(bool v) const noexcept {
+    if (v) raw_size_flags |= k_has_double;
+    else raw_size_flags &= ~k_has_double;
+  }
+
+  void set_raw_span(const char* p, std::uint32_t n) noexcept {
+    raw_data = p;
+    raw_size_flags = (raw_size_flags & ~k_size_mask) | (n & k_size_mask);
+  }
+};
+
+struct sv_value;
+struct sv_member;
+struct sv_array_view;
+struct sv_object_view;
+
+struct sv_value {
+  enum class kind : std::uint8_t { null, boolean, number, string, array, object };
+
+  struct array_data {
+    sv_value* data;
+    std::uint32_t size;
+    std::uint32_t cap;
+  };
+
+  struct object_data {
+    sv_member* data;
+    std::uint32_t size;
+    std::uint32_t cap;
+  };
+
+  kind k{kind::null};
+  union {
+    bool b;
+    sv_number_value num;
+    sv_raw_view s;
+    array_data a;
+    object_data o;
+  } u;
+
+  sv_value() noexcept : k(kind::null) { u.a = {}; }
+  sv_value(std::nullptr_t) noexcept : k(kind::null) { u.a = {}; }
+  explicit sv_value(bool vb) : k(kind::boolean) { u.b = vb; }
+  explicit sv_value(std::string_view vs) : k(kind::string) {
+    u.s = {vs.data(), static_cast<std::uint32_t>(vs.size())};
+  }
+
+  static sv_value make_array(std::pmr::memory_resource*) {
     sv_value v;
-    v.data_ = n;
+    v.k = kind::array;
+    v.u.a = {};
     return v;
   }
 
-  static sv_value number(double d) {
-    sv_number_value n;
-    n.is_int = false;
-    n.has_double = true;
-    n.d = d;
+  static sv_value make_object(std::pmr::memory_resource*) {
     sv_value v;
-    v.data_ = n;
+    v.k = kind::object;
+    v.u.o = {};
+    return v;
+  }
+
+  static sv_value integer(std::int64_t vi) {
+    sv_value v;
+    v.k = kind::number;
+    v.u.num = {};
+    v.u.num.set_int_value(vi);
+    v.u.num.raw_data = nullptr;
+    v.u.num.raw_size_flags = 0;
+    v.u.num.set_is_int(true);
+    v.u.num.set_has_double(false);
+    return v;
+  }
+
+  static sv_value number(double vd) {
+    sv_value v;
+    v.k = kind::number;
+    v.u.num = {};
+    v.u.num.set_double_value(vd);
+    v.u.num.raw_data = nullptr;
+    v.u.num.raw_size_flags = 0;
+    v.u.num.set_is_int(false);
+    v.u.num.set_has_double(true);
     return v;
   }
 
   static sv_value number_token(std::string_view token) {
-    sv_number_value n;
-    n.is_int = false;
-    n.raw = token;
-    n.has_double = false;
-    n.d = 0.0;
     sv_value v;
-    v.data_ = n;
+    v.k = kind::number;
+    v.u.num = {};
+    v.u.num.raw_data = nullptr;
+    v.u.num.raw_size_flags = 0;
+    v.u.num.set_is_int(false);
+    v.u.num.set_has_double(false);
+    v.u.num.set_raw_span(token.data(), static_cast<std::uint32_t>(token.size()));
+    v.u.num.payload = 0;
     return v;
   }
 
-  static sv_value make_array(std::pmr::memory_resource* mr) {
-    sv_value v;
-    v.data_ = array{mr};
-    return v;
+  kind type() const noexcept { return k; }
+
+  bool is_null() const noexcept { return k == kind::null; }
+  bool is_bool() const noexcept { return k == kind::boolean; }
+  bool is_number() const noexcept { return k == kind::number; }
+  bool is_string() const noexcept { return k == kind::string; }
+  bool is_array() const noexcept { return k == kind::array; }
+  bool is_object() const noexcept { return k == kind::object; }
+
+  bool as_bool() const {
+    if (!is_bool()) throw std::runtime_error("chjson: not bool");
+    return u.b;
   }
-
-  static sv_value make_object(std::pmr::memory_resource* mr) {
-    sv_value v;
-    v.data_ = object{mr};
-    return v;
-  }
-
-  kind type() const noexcept {
-    switch (data_.index()) {
-      case 0: return kind::null;
-      case 1: return kind::boolean;
-      case 2: return kind::number;
-      case 3: return kind::string;
-      case 4: return kind::array;
-      case 5: return kind::object;
-      default: return kind::null;
-    }
-  }
-
-  bool is_null() const noexcept { return std::holds_alternative<std::monostate>(data_); }
-  bool is_bool() const noexcept { return std::holds_alternative<bool>(data_); }
-  bool is_number() const noexcept { return std::holds_alternative<sv_number_value>(data_); }
-  bool is_string() const noexcept { return std::holds_alternative<std::string_view>(data_); }
-  bool is_array() const noexcept { return std::holds_alternative<array>(data_); }
-  bool is_object() const noexcept { return std::holds_alternative<object>(data_); }
-
-  bool as_bool() const { return std::get<bool>(data_); }
 
   bool is_int() const noexcept {
     if (!is_number()) return false;
-    return std::get<sv_number_value>(data_).is_int;
+    return u.num.is_int();
   }
 
   std::int64_t as_int() const {
-    const auto& n = std::get<sv_number_value>(data_);
-    if (!n.is_int) throw std::runtime_error("chjson: number is not int");
-    return n.i;
+    if (!is_number() || !u.num.is_int()) throw std::runtime_error("chjson: number is not int");
+    return u.num.int_value();
   }
 
   double as_double() const {
-    const auto& n = std::get<sv_number_value>(data_);
-    if (n.is_int) return static_cast<double>(n.i);
-    if (n.raw.data() != nullptr && !n.raw.empty()) {
-      if (!n.has_double) {
-        n.d = detail::parse_double(n.raw);
-        n.has_double = true;
+    if (!is_number()) throw std::runtime_error("chjson: not number");
+    const auto& n = u.num;
+    if (n.is_int()) return static_cast<double>(n.int_value());
+    if (n.has_raw()) {
+      if (!n.has_double()) {
+        n.set_double_value(detail::parse_double(std::string_view(n.raw_data, n.raw_size())));
+        n.set_has_double(true);
       }
-      return n.d;
+      return n.double_value();
     }
-    return n.d;
+    return n.double_value();
   }
 
-  std::string_view as_string_view() const { return std::get<std::string_view>(data_); }
-  const array& as_array() const { return std::get<array>(data_); }
-  const object& as_object() const { return std::get<object>(data_); }
-
-  array& as_array() { return std::get<array>(data_); }
-  object& as_object() { return std::get<object>(data_); }
-
-  const sv_value* find(std::string_view key) const noexcept {
-    if (!is_object()) return nullptr;
-    const auto& o = std::get<object>(data_);
-    for (const auto& kv : o) {
-      if (kv.first == key) return &kv.second;
+  // Fast path: assumes this value is a number.
+  // Undefined behavior if called when !is_number().
+  double as_double_unchecked() const noexcept {
+    const auto& n = u.num;
+    if (n.is_int()) return static_cast<double>(n.int_value());
+    if (n.has_raw()) {
+      if (!n.has_double()) {
+        n.set_double_value(detail::parse_double(std::string_view(n.raw_data, n.raw_size())));
+        n.set_has_double(true);
+      }
+      return n.double_value();
     }
-    return nullptr;
+    return n.double_value();
   }
 
-  sv_value* find(std::string_view key) noexcept {
-    if (!is_object()) return nullptr;
-    auto& o = std::get<object>(data_);
-    for (auto& kv : o) {
-      if (kv.first == key) return &kv.second;
-    }
-    return nullptr;
+  std::string_view as_string_view() const {
+    if (!is_string()) throw std::runtime_error("chjson: not string");
+    return std::string_view(u.s.data, u.s.size);
   }
 
-private:
-  std::variant<std::monostate, bool, sv_number_value, std::string_view, array, object> data_;
+  sv_array_view as_array() const;
+  sv_object_view as_object() const;
+
+  void array_reserve(std::pmr::memory_resource* mr, std::uint32_t new_cap) {
+    if (!is_array()) throw std::runtime_error("chjson: not array");
+    if (new_cap <= u.a.cap) return;
+    sv_value* nd = static_cast<sv_value*>(mr->allocate(sizeof(sv_value) * new_cap, alignof(sv_value)));
+    static_assert(std::is_trivially_copyable_v<sv_value>, "sv_value must be trivially copyable for memcpy relocation");
+    if (u.a.data != nullptr && u.a.size != 0) {
+      std::memcpy(nd, u.a.data, sizeof(sv_value) * u.a.size);
+    }
+    u.a.data = nd;
+    u.a.cap = new_cap;
+  }
+
+  void array_push_back(std::pmr::memory_resource* mr, sv_value&& v) {
+    if (!is_array()) throw std::runtime_error("chjson: not array");
+    if (u.a.size == u.a.cap) {
+      const std::uint32_t next = u.a.cap ? (u.a.cap * 2u) : 8u;
+      array_reserve(mr, next);
+    }
+    new (&u.a.data[u.a.size]) sv_value(std::move(v));
+    ++u.a.size;
+  }
+
+  void object_reserve(std::pmr::memory_resource* mr, std::uint32_t new_cap);
+  void object_emplace_back(std::pmr::memory_resource* mr, std::string_view key, sv_value&& v);
+
+  const sv_value* find(std::string_view key) const noexcept;
+  sv_value* find(std::string_view key) noexcept;
 
   friend class document;
+  friend class view_document;
   friend void dump_to(std::string&, const sv_value&, bool, int);
 };
 
+struct sv_member {
+  std::string_view first{};
+  sv_value second{nullptr};
+};
+
+struct sv_array_view {
+  const sv_value* data{nullptr};
+  std::size_t n{0};
+
+  bool empty() const noexcept { return n == 0; }
+  std::size_t size() const noexcept { return n; }
+  const sv_value& operator[](std::size_t idx) const { return data[idx]; }
+
+  const sv_value* begin() const noexcept { return data; }
+  const sv_value* end() const noexcept { return data + n; }
+};
+
+struct sv_object_kv {
+  std::string_view first{};
+  const sv_value& second;
+};
+
+struct sv_object_view {
+  const sv_member* data{nullptr};
+  std::size_t n{0};
+
+  bool empty() const noexcept { return n == 0; }
+  std::size_t size() const noexcept { return n; }
+
+  sv_object_kv operator[](std::size_t idx) const { return {data[idx].first, data[idx].second}; }
+
+  struct iterator {
+    const sv_member* p{nullptr};
+    sv_object_kv operator*() const { return {p->first, p->second}; }
+    iterator& operator++() {
+      ++p;
+      return *this;
+    }
+    bool operator!=(const iterator& o) const { return p != o.p; }
+  };
+
+  iterator begin() const { return iterator{data}; }
+  iterator end() const { return iterator{data + n}; }
+};
+
+inline sv_array_view sv_value::as_array() const {
+  if (!is_array()) throw std::runtime_error("chjson: not array");
+  return sv_array_view{u.a.data, u.a.size};
+}
+
+inline sv_object_view sv_value::as_object() const {
+  if (!is_object()) throw std::runtime_error("chjson: not object");
+  return sv_object_view{u.o.data, u.o.size};
+}
+
+inline void sv_value::object_reserve(std::pmr::memory_resource* mr, std::uint32_t new_cap) {
+  if (!is_object()) throw std::runtime_error("chjson: not object");
+  if (new_cap <= u.o.cap) return;
+  sv_member* nm = static_cast<sv_member*>(mr->allocate(sizeof(sv_member) * new_cap, alignof(sv_member)));
+  static_assert(std::is_trivially_copyable_v<sv_member>, "sv_member must be trivially copyable for memcpy relocation");
+  if (u.o.data != nullptr && u.o.size != 0) {
+    std::memcpy(nm, u.o.data, sizeof(sv_member) * u.o.size);
+  }
+  u.o.data = nm;
+  u.o.cap = new_cap;
+}
+
+inline void sv_value::object_emplace_back(std::pmr::memory_resource* mr, std::string_view key, sv_value&& v) {
+  if (!is_object()) throw std::runtime_error("chjson: not object");
+  if (u.o.size == u.o.cap) {
+    const std::uint32_t next = u.o.cap ? (u.o.cap * 2u) : 8u;
+    object_reserve(mr, next);
+  }
+  new (&u.o.data[u.o.size]) sv_member{key, std::move(v)};
+  ++u.o.size;
+}
+
+inline const sv_value* sv_value::find(std::string_view key) const noexcept {
+  if (!is_object()) return nullptr;
+  const sv_member* m = u.o.data;
+  const std::size_t n = u.o.size;
+  for (std::size_t idx = 0; idx < n; ++idx) {
+    if (m[idx].first == key) return &m[idx].second;
+  }
+  return nullptr;
+}
+
+inline sv_value* sv_value::find(std::string_view key) noexcept {
+  if (!is_object()) return nullptr;
+  sv_member* m = u.o.data;
+  const std::size_t n = u.o.size;
+  for (std::size_t idx = 0; idx < n; ++idx) {
+    if (m[idx].first == key) return &m[idx].second;
+  }
+  return nullptr;
+}
+
+namespace detail {
+#if CHJSON_USE_TLS_PARSE_CACHE
+inline std::string& document_buffer_stash() {
+  thread_local std::string stash;
+  return stash;
+}
+
+inline pmr::arena_resource& document_arena_stash() {
+  thread_local pmr::arena_resource stash;
+  return stash;
+}
+#endif
+} // namespace detail
+
 class document {
 public:
+#if CHJSON_USE_TLS_PARSE_CACHE
+  document() {
+    // Reuse the last freed buffer on this thread to reduce heap churn for
+    // repeated single-shot parse() calls that return a fresh document.
+    auto& stash = detail::document_buffer_stash();
+    if (stash.capacity() != 0) {
+      buffer_.swap(stash);
+      stash.clear();
+    }
+
+    auto& arena_stash = detail::document_arena_stash();
+    if (arena_stash.bytes_committed() != 0) {
+      arena_ = std::move(arena_stash);
+    }
+  }
+#else
   document() = default;
+#endif
   explicit document(std::string json) : buffer_(std::move(json)) {}
+
+#if CHJSON_USE_TLS_PARSE_CACHE
+  ~document() noexcept {
+    // Keep at most one cached buffer per thread (bounded by capacity).
+    constexpr std::size_t max_cached_capacity = static_cast<std::size_t>(CHJSON_TLS_PARSE_BUFFER_MAX);
+    if (buffer_.capacity() <= max_cached_capacity) {
+      auto& stash = detail::document_buffer_stash();
+      if (stash.capacity() < buffer_.capacity()) {
+        stash.swap(buffer_);
+        stash.clear();
+      }
+    }
+
+    // Similarly, cache arena blocks to avoid repeated heap churn for
+    // parse() patterns that construct/destroy documents in a tight loop.
+    constexpr std::size_t max_cached_arena = static_cast<std::size_t>(CHJSON_TLS_PARSE_ARENA_MAX);
+    const std::size_t committed = arena_.bytes_committed();
+    if (committed != 0 && committed <= max_cached_arena) {
+      auto& arena_stash = detail::document_arena_stash();
+      if (arena_stash.bytes_committed() < committed) {
+        arena_stash = std::move(arena_);
+      }
+    }
+  }
+#else
+  ~document() = default;
+#endif
 
   // Reuse this document for another parse. Keeps arena blocks unless you call reset().
   void clear() noexcept {
@@ -1631,6 +2154,10 @@ public:
     buffer_.assign(json.data(), json.size());
     clear();
   }
+
+  // Clear the backing buffer contents while keeping capacity.
+  // Useful when parsing from a read-only source (no string_views into buffer_).
+  void clear_buffer() noexcept { buffer_.clear(); }
 
   // Ensure buffer capacity ahead of time (useful for benchmarks / repeated parsing).
   void reserve_buffer(std::size_t n) { buffer_.reserve(n); }
@@ -1987,16 +2514,30 @@ struct view_parser {
   sv_value parse_array(std::size_t depth, error& e) {
     ++i; // '['
     detail::skip_ws(buf, size, i);
-    sv_value out = sv_value::make_array(doc->resource());
-    auto& a = out.as_array();
+    sv_value out;
+    out.k = sv_value::kind::array;
+    out.u.a = {};
+
+    auto* mr = doc->resource();
+    auto reserve = [&](std::uint32_t want) {
+      if (want <= out.u.a.cap) return;
+      std::uint32_t new_cap = out.u.a.cap ? out.u.a.cap : 1u;
+      while (new_cap < want) new_cap = (new_cap < 1024u) ? (new_cap * 2u) : (new_cap + new_cap / 2u);
+      sv_value* new_data = static_cast<sv_value*>(mr->allocate(sizeof(sv_value) * new_cap, alignof(sv_value)));
+      if (out.u.a.data && out.u.a.size) {
+        std::memcpy(new_data, out.u.a.data, sizeof(sv_value) * out.u.a.size);
+      }
+      out.u.a.data = new_data;
+      out.u.a.cap = new_cap;
+    };
 
     // Heuristic reserve to reduce reallocations in large arrays.
     if (depth <= 1) {
       const std::size_t remaining = (i < size) ? (size - i) : 0;
       const std::size_t guess = remaining / 64u;
-      if (guess > 0) a.reserve(std::min<std::size_t>(guess, 4096u));
+      if (guess >= 16) reserve(static_cast<std::uint32_t>(std::min<std::size_t>(guess, 65536u)));
     } else {
-      a.reserve(16);
+      reserve(16);
     }
 
     if (i < size && buf[i] == ']') {
@@ -2007,7 +2548,8 @@ struct view_parser {
     while (true) {
       sv_value elem = parse_value(depth, e);
       if (e) return nullptr;
-      a.emplace_back(std::move(elem));
+      if (out.u.a.size == out.u.a.cap) reserve(out.u.a.size + 1u);
+      out.u.a.data[out.u.a.size++] = elem;
 
       detail::skip_ws(buf, size, i);
       if (i >= size) {
@@ -2028,12 +2570,26 @@ struct view_parser {
   sv_value parse_object(std::size_t depth, error& e) {
     ++i; // '{'
     detail::skip_ws(buf, size, i);
-    sv_value out = sv_value::make_object(doc->resource());
-    auto& o = out.as_object();
+    sv_value out;
+    out.k = sv_value::kind::object;
+    out.u.o = {};
+
+    auto* mr = doc->resource();
+    auto reserve = [&](std::uint32_t want) {
+      if (want <= out.u.o.cap) return;
+      std::uint32_t new_cap = out.u.o.cap ? out.u.o.cap : 1u;
+      while (new_cap < want) new_cap = (new_cap < 1024u) ? (new_cap * 2u) : (new_cap + new_cap / 2u);
+      sv_member* new_data = static_cast<sv_member*>(mr->allocate(sizeof(sv_member) * new_cap, alignof(sv_member)));
+      if (out.u.o.data && out.u.o.size) {
+        std::memcpy(new_data, out.u.o.data, sizeof(sv_member) * out.u.o.size);
+      }
+      out.u.o.data = new_data;
+      out.u.o.cap = new_cap;
+    };
 
     // Many JSON objects are small and fixed-shape; reserving a few slots helps.
     (void)depth;
-    o.reserve(8);
+    reserve(8);
 
     if (i < size && buf[i] == '}') {
       ++i;
@@ -2067,7 +2623,9 @@ struct view_parser {
       detail::skip_ws(buf, size, i);
       sv_value v = parse_value(depth, e);
       if (e) return nullptr;
-      o.emplace_back(key, std::move(v));
+      if (out.u.o.size == out.u.o.cap) reserve(out.u.o.size + 1u);
+      new (&out.u.o.data[out.u.o.size]) sv_member{key, std::move(v)};
+      ++out.u.o.size;
 
       detail::skip_ws(buf, size, i);
       if (i >= size) {
@@ -2080,6 +2638,532 @@ struct view_parser {
         continue;
       }
       if (c == '}') return out;
+      set_error(e, error_code::expected_comma_or_end, i - 1);
+      return nullptr;
+    }
+  }
+};
+
+// -----------------------------
+// Owning DOM parse from read-only input (document + arena)
+// -----------------------------
+
+// Parses from a read-only buffer but produces an owning `document`.
+// Unlike the in-situ parser, this does not copy the entire JSON text.
+// Instead, it copies only strings/keys/number tokens that must outlive the input.
+struct owning_view_parser {
+  document* doc{nullptr};
+  std::string_view s;
+  const char* buf{nullptr};
+  std::size_t size{0};
+  std::size_t i{0};
+  parse_options opt;
+
+  error run_inplace(document& d, std::string_view json) {
+    doc = &d;
+    doc->clear();
+    s = json;
+    buf = json.data();
+    size = json.size();
+    i = 0;
+
+    error err;
+    detail::skip_ws(buf, size, i);
+    doc->root() = parse_value(0, err);
+    if (err) return err;
+
+    detail::skip_ws(buf, size, i);
+    if (opt.require_eof && i != size) {
+      set_error(err, error_code::trailing_characters);
+      return err;
+    }
+    return err;
+  }
+
+  document_parse_result run(std::string_view json) {
+    document_parse_result r;
+    r.err = run_inplace(r.doc, json);
+    return r;
+  }
+
+  void set_error(error& e, error_code code, std::size_t at = std::numeric_limits<std::size_t>::max()) {
+    if (e) return;
+    e.code = code;
+    e.offset = (at == std::numeric_limits<std::size_t>::max()) ? i : at;
+    detail::update_line_col(s, e.offset, e.line, e.column);
+  }
+
+  std::string_view copy_span(const char* p, std::size_t n) {
+    if (n == 0) return std::string_view{};
+    auto* mr = doc->resource();
+    char* dst = static_cast<char*>(mr->allocate(n, alignof(char)));
+    std::memcpy(dst, p, n);
+    return std::string_view(dst, n);
+  }
+
+  sv_value parse_value(std::size_t depth, error& e) {
+    if (depth > opt.max_depth) {
+      set_error(e, error_code::nesting_too_deep);
+      return nullptr;
+    }
+    if (i >= size) {
+      set_error(e, error_code::unexpected_eof);
+      return nullptr;
+    }
+
+    const char c = buf[i];
+    switch (c) {
+      case 'n': return parse_literal("null", 4, sv_value(nullptr), e);
+      case 't': return parse_literal("true", 4, sv_value(true), e);
+      case 'f': return parse_literal("false", 5, sv_value(false), e);
+      case '"': {
+        std::string_view out;
+        if (!parse_string(out, e)) return nullptr;
+        return sv_value(out);
+      }
+      case '[': return parse_array(depth + 1, e);
+      case '{': return parse_object(depth + 1, e);
+      default: {
+        if (c == '-' || (c >= '0' && c <= '9')) {
+          detail::number_value num;
+          const std::size_t start = i;
+          // RapidJSON-aligned semantics: eagerly parse floating-point numbers.
+          if (!detail::parse_number(buf, size, i, num, /*parse_fp=*/true)) {
+            set_error(e, error_code::invalid_number, start);
+            return nullptr;
+          }
+          if (num.is_int) return sv_value::integer(num.i);
+          return sv_value::number(num.d);
+        }
+        set_error(e, error_code::invalid_value);
+        return nullptr;
+      }
+    }
+  }
+
+  sv_value parse_literal(const char* lit, std::size_t len, sv_value v, error& e) {
+    if (i + len > size) {
+      set_error(e, error_code::unexpected_eof);
+      return nullptr;
+    }
+    if (std::memcmp(buf + i, lit, len) != 0) {
+      set_error(e, error_code::invalid_value);
+      return nullptr;
+    }
+    i += len;
+    return v;
+  }
+
+  bool parse_string(std::string_view& out, error& e) {
+    if (i >= size || buf[i] != '"') {
+      set_error(e, error_code::invalid_string);
+      return false;
+    }
+    const std::size_t quote_pos = i;
+    ++i;
+    const std::size_t start = i;
+
+    // Fast scan for unescaped strings.
+#if defined(_M_X64) || defined(__SSE2__)
+    {
+      const __m128i q = _mm_set1_epi8('"');
+      const __m128i bs = _mm_set1_epi8('\\');
+      const __m128i k1f = _mm_set1_epi8(0x1F);
+      const __m128i zero = _mm_setzero_si128();
+      while (i + 16 <= size) {
+        const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(buf + i));
+        const __m128i is_q = _mm_cmpeq_epi8(v, q);
+        const __m128i is_bs = _mm_cmpeq_epi8(v, bs);
+        const __m128i sub = _mm_subs_epu8(v, k1f);
+        const __m128i is_ctrl = _mm_cmpeq_epi8(sub, zero);
+        const __m128i any = _mm_or_si128(_mm_or_si128(is_q, is_bs), is_ctrl);
+        const int mask = _mm_movemask_epi8(any);
+        if (mask != 0) {
+#if defined(_MSC_VER)
+          unsigned long bit = 0;
+          _BitScanForward(&bit, static_cast<unsigned long>(mask));
+          i += static_cast<std::size_t>(bit);
+#else
+          i += static_cast<std::size_t>(__builtin_ctz(static_cast<unsigned>(mask)));
+#endif
+          const unsigned char uc = static_cast<unsigned char>(buf[i]);
+          const char c = buf[i];
+          if (c == '"') {
+            out = copy_span(buf + start, i - start);
+            ++i;
+            return true;
+          }
+          if (c == '\\') break;
+          if (uc <= 0x1F) {
+            set_error(e, error_code::invalid_string, i);
+            return false;
+          }
+        }
+        i += 16;
+      }
+    }
+#endif
+    while (i < size) {
+      const unsigned char uc = static_cast<unsigned char>(buf[i]);
+      const char c = buf[i];
+      if (c == '"') {
+        out = copy_span(buf + start, i - start);
+        ++i;
+        return true;
+      }
+      if (c == '\\') break;
+      if (uc <= 0x1F) {
+        set_error(e, error_code::invalid_string, i);
+        return false;
+      }
+      ++i;
+    }
+
+    // Escaped: two-pass decode into the arena.
+    const std::size_t first_escape = i;
+    std::size_t end_quote = std::numeric_limits<std::size_t>::max();
+    {
+      std::size_t scan = first_escape;
+      while (scan < size) {
+        const unsigned char uc = static_cast<unsigned char>(buf[scan]);
+        const char c = buf[scan++];
+        if (c == '"') {
+          end_quote = scan - 1;
+          break;
+        }
+        if (c == '\\') {
+          if (scan >= size) {
+            set_error(e, error_code::unexpected_eof, quote_pos);
+            return false;
+          }
+          const char esc = buf[scan++];
+          if (esc == 'u') {
+            if (scan + 4 > size) {
+              set_error(e, error_code::unexpected_eof, quote_pos);
+              return false;
+            }
+            scan += 4;
+          }
+          continue;
+        }
+        if (uc <= 0x1F) {
+          set_error(e, error_code::invalid_string, scan - 1);
+          return false;
+        }
+      }
+    }
+
+    if (end_quote == std::numeric_limits<std::size_t>::max()) {
+      set_error(e, error_code::unexpected_eof, quote_pos);
+      return false;
+    }
+
+    const std::size_t raw_len = end_quote - start;
+    auto* mr = doc->resource();
+    char* dst = (raw_len != 0) ? static_cast<char*>(mr->allocate(raw_len, alignof(char))) : nullptr;
+    std::size_t rpos = start;
+    std::size_t wpos = 0;
+    while (rpos < end_quote) {
+      const unsigned char uc = static_cast<unsigned char>(buf[rpos]);
+      const char c = buf[rpos++];
+      if (c == '\\') {
+        if (rpos >= end_quote) {
+          set_error(e, error_code::unexpected_eof, quote_pos);
+          return false;
+        }
+        const char esc = buf[rpos++];
+        switch (esc) {
+          case '"': dst[wpos++] = '"'; break;
+          case '\\': dst[wpos++] = '\\'; break;
+          case '/': dst[wpos++] = '/'; break;
+          case 'b': dst[wpos++] = '\b'; break;
+          case 'f': dst[wpos++] = '\f'; break;
+          case 'n': dst[wpos++] = '\n'; break;
+          case 'r': dst[wpos++] = '\r'; break;
+          case 't': dst[wpos++] = '\t'; break;
+          case 'u': {
+            std::uint32_t cp = 0;
+            if (!detail::parse_u4_insitu(buf, size, rpos, cp)) {
+              set_error(e, error_code::invalid_unicode_escape, rpos);
+              return false;
+            }
+            if (cp >= 0xD800u && cp <= 0xDBFFu) {
+              if (rpos + 2 > size || buf[rpos] != '\\' || buf[rpos + 1] != 'u') {
+                set_error(e, error_code::invalid_utf16_surrogate, rpos);
+                return false;
+              }
+              rpos += 2;
+              std::uint32_t low = 0;
+              if (!detail::parse_u4_insitu(buf, size, rpos, low)) {
+                set_error(e, error_code::invalid_unicode_escape, rpos);
+                return false;
+              }
+              if (low < 0xDC00u || low > 0xDFFFu) {
+                set_error(e, error_code::invalid_utf16_surrogate, rpos);
+                return false;
+              }
+              const std::uint32_t hi = cp - 0xD800u;
+              const std::uint32_t lo = low - 0xDC00u;
+              cp = 0x10000u + ((hi << 10) | lo);
+            } else if (cp >= 0xDC00u && cp <= 0xDFFFu) {
+              set_error(e, error_code::invalid_utf16_surrogate, rpos);
+              return false;
+            }
+            detail::write_utf8_insitu(dst, wpos, cp);
+            break;
+          }
+          default:
+            set_error(e, error_code::invalid_escape, rpos - 1);
+            return false;
+        }
+        continue;
+      }
+      if (uc <= 0x1F) {
+        set_error(e, error_code::invalid_string, rpos - 1);
+        return false;
+      }
+      dst[wpos++] = c;
+    }
+
+    out = std::string_view(dst, wpos);
+    i = end_quote + 1;
+    return true;
+  }
+
+  sv_value parse_array(std::size_t depth, error& e) {
+    ++i; // '['
+    detail::skip_ws(buf, size, i);
+    auto* mr = doc->resource();
+    sv_value out = sv_value::make_array(mr);
+
+    if (depth <= 1) {
+      const std::size_t remaining = (i < size) ? (size - i) : 0;
+      const std::size_t guess = remaining / 64u;
+      if (guess > 0) out.array_reserve(mr, static_cast<std::uint32_t>(std::min<std::size_t>(guess, 65536u)));
+    } else {
+      out.array_reserve(mr, 16u);
+    }
+
+    if (i < size && buf[i] == ']') {
+      ++i;
+      return out;
+    }
+
+    while (true) {
+      detail::skip_ws(buf, size, i);
+      sv_value elem = parse_value(depth, e);
+      if (e) return nullptr;
+      out.array_push_back(mr, std::move(elem));
+
+      detail::skip_ws(buf, size, i);
+      if (i >= size) {
+        set_error(e, error_code::unexpected_eof);
+        return nullptr;
+      }
+      const char c = buf[i++];
+      if (c == ',') continue;
+      if (c == ']') return out;
+      set_error(e, error_code::expected_comma_or_end, i - 1);
+      return nullptr;
+    }
+  }
+
+  sv_value parse_object(std::size_t depth, error& e) {
+    ++i; // '{'
+    detail::skip_ws(buf, size, i);
+    auto* mr = doc->resource();
+    sv_value out = sv_value::make_object(mr);
+    (void)depth;
+    out.object_reserve(mr, 8u);
+
+    if (i < size && buf[i] == '}') {
+      ++i;
+      return out;
+    }
+
+    while (true) {
+      detail::skip_ws(buf, size, i);
+      if (i >= size) {
+        set_error(e, error_code::unexpected_eof);
+        return nullptr;
+      }
+      if (buf[i] != '"') {
+        set_error(e, error_code::expected_key_string);
+        return nullptr;
+      }
+
+      std::string_view key;
+      if (!parse_string(key, e)) return nullptr;
+
+      detail::skip_ws(buf, size, i);
+      if (i >= size) {
+        set_error(e, error_code::unexpected_eof);
+        return nullptr;
+      }
+      if (buf[i] != ':') {
+        set_error(e, error_code::expected_colon);
+        return nullptr;
+      }
+      ++i;
+
+      detail::skip_ws(buf, size, i);
+      sv_value v = parse_value(depth, e);
+      if (e) return nullptr;
+      out.object_emplace_back(mr, key, std::move(v));
+
+      detail::skip_ws(buf, size, i);
+      if (i >= size) {
+        set_error(e, error_code::unexpected_eof);
+        return nullptr;
+      }
+      const char c = buf[i++];
+      if (c == ',') continue;
+      if (c == '}') return out;
+      set_error(e, error_code::expected_comma_or_end, i - 1);
+      return nullptr;
+    }
+  }
+};
+
+// -----------------------------
+// DOM parse fast path for inputs with no strings (no '"')
+// -----------------------------
+// This parser reads from a read-only buffer and eagerly parses numbers into
+// doubles/ints. It is only used when the input contains no strings, so the
+// resulting DOM does not require a backing buffer for string_view lifetimes.
+struct no_string_parser {
+  document* doc{nullptr};
+  std::string_view s;
+  const char* buf{nullptr};
+  std::size_t size{0};
+  std::size_t i{0};
+  parse_options opt;
+
+  error run_inplace(document& d, std::string_view json) {
+    doc = &d;
+    doc->clear();
+    doc->clear_buffer();
+    s = json;
+    buf = json.data();
+    size = json.size();
+    i = 0;
+
+    error err;
+    detail::skip_ws(buf, size, i);
+    doc->root() = parse_value(0, err);
+    if (err) return err;
+
+    detail::skip_ws(buf, size, i);
+    if (opt.require_eof && i != size) {
+      set_error(err, error_code::trailing_characters);
+      return err;
+    }
+    return err;
+  }
+
+  void set_error(error& e, error_code code, std::size_t at = std::numeric_limits<std::size_t>::max()) {
+    if (e) return;
+    e.code = code;
+    e.offset = (at == std::numeric_limits<std::size_t>::max()) ? i : at;
+    detail::update_line_col(s, e.offset, e.line, e.column);
+  }
+
+  sv_value parse_value(std::size_t depth, error& e) {
+    if (depth > opt.max_depth) {
+      set_error(e, error_code::nesting_too_deep);
+      return nullptr;
+    }
+    if (i >= size) {
+      set_error(e, error_code::unexpected_eof);
+      return nullptr;
+    }
+
+    const char c = buf[i];
+    switch (c) {
+      case 'n': return parse_literal("null", 4, sv_value(nullptr), e);
+      case 't': return parse_literal("true", 4, sv_value(true), e);
+      case 'f': return parse_literal("false", 5, sv_value(false), e);
+      case '[': return parse_array(depth + 1, e);
+      default: {
+        if (c == '-' || (c >= '0' && c <= '9')) {
+          detail::number_value num;
+          const std::size_t start = i;
+          if (!detail::parse_number(buf, size, i, num, /*parse_fp=*/true)) {
+            set_error(e, error_code::invalid_number, start);
+            return nullptr;
+          }
+          if (num.is_int) return sv_value::integer(num.i);
+          return sv_value::number(num.d);
+        }
+        set_error(e, error_code::invalid_value);
+        return nullptr;
+      }
+    }
+  }
+
+  sv_value parse_literal(const char* lit, std::size_t len, sv_value v, error& e) {
+    if (i + len > size) {
+      set_error(e, error_code::unexpected_eof);
+      return nullptr;
+    }
+    if (std::memcmp(buf + i, lit, len) != 0) {
+      set_error(e, error_code::invalid_value);
+      return nullptr;
+    }
+    i += len;
+    return v;
+  }
+
+  sv_value parse_array(std::size_t depth, error& e) {
+    ++i; // '['
+    detail::skip_ws(buf, size, i);
+    sv_value out;
+    out.k = sv_value::kind::array;
+    out.u.a = {};
+
+    auto* mr = doc->resource();
+    auto reserve = [&](std::uint32_t want) {
+      if (want <= out.u.a.cap) return;
+      std::uint32_t new_cap = out.u.a.cap ? out.u.a.cap : 1u;
+      while (new_cap < want) new_cap = (new_cap < 1024u) ? (new_cap * 2u) : (new_cap + new_cap / 2u);
+      sv_value* new_data = static_cast<sv_value*>(mr->allocate(sizeof(sv_value) * new_cap, alignof(sv_value)));
+      if (out.u.a.data && out.u.a.size) {
+        std::memcpy(new_data, out.u.a.data, sizeof(sv_value) * out.u.a.size);
+      }
+      out.u.a.data = new_data;
+      out.u.a.cap = new_cap;
+    };
+
+    // For no-string inputs, large arrays are typically number-heavy; use a
+    // tighter per-element estimate than the generic /64 heuristic.
+    if (depth <= 1) {
+      const std::size_t remaining = (i < size) ? (size - i) : 0;
+      const std::size_t guess = remaining / 20u;
+      if (guess >= 16) reserve(static_cast<std::uint32_t>(std::min<std::size_t>(guess, 262144u)));
+    } else {
+      reserve(16);
+    }
+
+    if (i < size && buf[i] == ']') {
+      ++i;
+      return out;
+    }
+
+    while (true) {
+      detail::skip_ws(buf, size, i);
+      sv_value elem = parse_value(depth, e);
+      if (e) return nullptr;
+      if (out.u.a.size == out.u.a.cap) reserve(out.u.a.size + 1u);
+      out.u.a.data[out.u.a.size++] = elem;
+
+      detail::skip_ws(buf, size, i);
+      if (i >= size) {
+        set_error(e, error_code::unexpected_eof);
+        return nullptr;
+      }
+      const char c = buf[i++];
+      if (c == ',') continue;
+      if (c == ']') return out;
       set_error(e, error_code::expected_comma_or_end, i - 1);
       return nullptr;
     }
@@ -2381,16 +3465,30 @@ struct insitu_parser {
   sv_value parse_array(std::size_t depth, error& e) {
     ++i; // '['
     detail::skip_ws(buf, size, i);
-    sv_value out = sv_value::make_array(doc->resource());
-    auto& a = out.as_array();
+    sv_value out;
+    out.k = sv_value::kind::array;
+    out.u.a = {};
+
+    auto* mr = doc->resource();
+    auto reserve = [&](std::uint32_t want) {
+      if (want <= out.u.a.cap) return;
+      std::uint32_t new_cap = out.u.a.cap ? out.u.a.cap : 1u;
+      while (new_cap < want) new_cap = (new_cap < 1024u) ? (new_cap * 2u) : (new_cap + new_cap / 2u);
+      sv_value* new_data = static_cast<sv_value*>(mr->allocate(sizeof(sv_value) * new_cap, alignof(sv_value)));
+      if (out.u.a.data && out.u.a.size) {
+        std::memcpy(new_data, out.u.a.data, sizeof(sv_value) * out.u.a.size);
+      }
+      out.u.a.data = new_data;
+      out.u.a.cap = new_cap;
+    };
 
     // Heuristic reserve to reduce reallocations in large arrays.
     if (depth <= 1) {
       const std::size_t remaining = (i < size) ? (size - i) : 0;
       const std::size_t guess = remaining / 64u;
-      if (guess > 0) a.reserve(std::min<std::size_t>(guess, 4096u));
+      if (guess >= 16) reserve(static_cast<std::uint32_t>(std::min<std::size_t>(guess, 65536u)));
     } else {
-      a.reserve(16);
+      reserve(16);
     }
 
     if (i < size && buf[i] == ']') {
@@ -2402,7 +3500,8 @@ struct insitu_parser {
       detail::skip_ws(buf, size, i);
       sv_value elem = parse_value(depth, e);
       if (e) return nullptr;
-      a.emplace_back(std::move(elem));
+      if (out.u.a.size == out.u.a.cap) reserve(out.u.a.size + 1u);
+      out.u.a.data[out.u.a.size++] = elem;
 
       detail::skip_ws(buf, size, i);
       if (i >= size) {
@@ -2420,12 +3519,26 @@ struct insitu_parser {
   sv_value parse_object(std::size_t depth, error& e) {
     ++i; // '{'
     detail::skip_ws(buf, size, i);
-    sv_value out = sv_value::make_object(doc->resource());
-    auto& o = out.as_object();
+    sv_value out;
+    out.k = sv_value::kind::object;
+    out.u.o = {};
+
+    auto* mr = doc->resource();
+    auto reserve = [&](std::uint32_t want) {
+      if (want <= out.u.o.cap) return;
+      std::uint32_t new_cap = out.u.o.cap ? out.u.o.cap : 1u;
+      while (new_cap < want) new_cap = (new_cap < 1024u) ? (new_cap * 2u) : (new_cap + new_cap / 2u);
+      sv_member* new_data = static_cast<sv_member*>(mr->allocate(sizeof(sv_member) * new_cap, alignof(sv_member)));
+      if (out.u.o.data && out.u.o.size) {
+        std::memcpy(new_data, out.u.o.data, sizeof(sv_member) * out.u.o.size);
+      }
+      out.u.o.data = new_data;
+      out.u.o.cap = new_cap;
+    };
 
     // Many JSON objects are small and fixed-shape; reserving a few slots helps.
     (void)depth;
-    o.reserve(8);
+    reserve(8);
 
     if (i < size && buf[i] == '}') {
       ++i;
@@ -2460,7 +3573,9 @@ struct insitu_parser {
       detail::skip_ws(buf, size, i);
       sv_value v = parse_value(depth, e);
       if (e) return nullptr;
-      o.emplace_back(key, std::move(v));
+      if (out.u.o.size == out.u.o.cap) reserve(out.u.o.size + 1u);
+      new (&out.u.o.data[out.u.o.size]) sv_member{key, std::move(v)};
+      ++out.u.o.size;
 
       detail::skip_ws(buf, size, i);
       if (i >= size) {
@@ -2494,6 +3609,79 @@ inline error parse_in_situ_into(document& d, std::string_view json, parse_option
   return p.run_inplace(d);
 }
 
+// -----------------------------
+// Owning DOM parse API (RapidJSON-aligned: read-only input, no full input memcpy)
+// -----------------------------
+
+// Parse from a read-only buffer into an owning `document`, without copying the full input.
+// Strings/keys are copied into the arena; floating-point numbers are parsed eagerly.
+inline error parse_owning_view_into(document& d, std::string_view json, parse_options opt = {}) {
+  owning_view_parser p;
+  p.opt = opt;
+  return p.run_inplace(d, json);
+}
+
+inline document_parse_result parse_owning_view(std::string_view json, parse_options opt = {}) {
+  owning_view_parser p;
+  p.opt = opt;
+  return p.run(json);
+}
+
+inline document parse_owning_view_or_throw(std::string_view json, parse_options opt = {}) {
+  auto r = parse_owning_view(json, opt);
+  if (r.err) throw std::runtime_error("chjson: parse_owning_view failed");
+  return std::move(r.doc);
+}
+
+// -----------------------------
+// Primary DOM parse API (owning document)
+// -----------------------------
+
+// Parses JSON into an owning `document` (arena-backed DOM) and returns it.
+// This replaces the old `value`-tree parse as the default for high throughput.
+inline document_parse_result parse(std::string_view json, parse_options opt = {}) {
+  auto estimate_arena_reserve = [](std::size_t json_bytes) noexcept -> std::size_t {
+    // For parse(dom), most strings/number tokens are views into the internal buffer,
+    // so the arena is dominated by array/object storage. Over-reserving hurts
+    // single-shot throughput (extra large allocation per parse).
+    constexpr std::size_t min_reserve = 64u * 1024u;
+    constexpr std::size_t max_reserve = 8u * 1024u * 1024u;
+
+    if (json_bytes == 0) return min_reserve;
+
+    // Reserving ahead reduces heap churn, but keep it conservative for single-shot parse().
+    std::size_t guess = json_bytes * 4u;
+    if (guess < min_reserve) guess = min_reserve;
+    if (guess > max_reserve) guess = max_reserve;
+    return guess;
+  };
+
+  document_parse_result r;
+
+  // Fast path: if the input contains no strings (no '"'), we don't need to keep
+  // a backing buffer for string_view lifetimes. Parsing from the read-only input
+  // avoids a full memcpy, which dominates Parse+sum(numbers).
+  if (CHJSON_PARSE_DOM_NO_STRING_FASTPATH && json.size() != 0 &&
+      std::memchr(json.data(), '"', json.size()) == nullptr) {
+    r.doc.arena().reserve_bytes(estimate_arena_reserve(json.size()));
+    no_string_parser p;
+    p.opt = opt;
+    r.err = p.run_inplace(r.doc, json);
+    return r;
+  }
+
+  r.doc.reserve_buffer(json.size());
+  r.doc.arena().reserve_bytes(estimate_arena_reserve(json.size()));
+  r.err = parse_in_situ_into(r.doc, json, opt);
+  return r;
+}
+
+inline document parse_or_throw(std::string_view json, parse_options opt = {}) {
+  auto r = parse(json, opt);
+  if (r.err) throw std::runtime_error("chjson: parse failed");
+  return std::move(r.doc);
+}
+
 inline document parse_in_situ_or_throw(std::string json, parse_options opt = {}) {
   auto r = parse_in_situ(std::move(json), opt);
   if (r.err) throw std::runtime_error("chjson: parse_in_situ failed");
@@ -2503,15 +3691,15 @@ inline document parse_in_situ_or_throw(std::string json, parse_options opt = {})
 inline void dump_to(std::string& out, const sv_value& v, bool pretty = false, int indent = 0) {
   // Keep the signature but avoid pretty-branching in the hot (compact) path.
   auto dump_number = [&](const sv_number_value& n) {
-    if (n.is_int) {
-      detail::dump_int64(out, n.i);
+    if (n.is_int()) {
+      detail::dump_int64(out, n.int_value());
       return;
     }
-    if (n.raw.data() != nullptr && !n.raw.empty()) {
-      out.append(n.raw.data(), n.raw.size());
+    if (n.has_raw()) {
+      out.append(n.raw_data, static_cast<std::size_t>(n.raw_size()));
       return;
     }
-    detail::dump_double(out, n.d);
+    detail::dump_double(out, n.double_value());
   };
 
   if (!pretty) {
@@ -2537,7 +3725,7 @@ inline void dump_to(std::string& out, const sv_value& v, bool pretty = false, in
           --sp;
           break;
         case sv_value::kind::number:
-          dump_number(std::get<sv_number_value>(cur.data_));
+          dump_number(cur.u.num);
           --sp;
           break;
         case sv_value::kind::string:
@@ -2598,7 +3786,7 @@ inline void dump_to(std::string& out, const sv_value& v, bool pretty = false, in
       out += v.as_bool() ? "true" : "false";
       return;
     case sv_value::kind::number:
-      dump_number(std::get<sv_number_value>(v.data_));
+      dump_number(v.u.num);
       return;
     case sv_value::kind::string:
       detail::dump_escaped(out, v.as_string_view());

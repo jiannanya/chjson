@@ -146,13 +146,13 @@ void test_random() {
   for (int iter = 0; iter < 2000; ++iter) {
     value v = random_value(r, 4);
     const std::string s = dump(v);
-    auto pr = parse(s);
+    auto pr = parse_value(s);
     CHJSON_CHECK(!pr.err);
     deep_equal(v, pr.val);
 
     // Ensure dump output is stable (idempotent under parse/dump).
     const std::string s2 = dump(pr.val);
-    auto pr2 = parse(s2);
+    auto pr2 = parse_value(s2);
     CHJSON_CHECK(!pr2.err);
     CHJSON_CHECK(s2 == dump(pr2.val));
   }

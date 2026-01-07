@@ -8,19 +8,19 @@ static void test_primitives_and_whitespace() {
   {
     auto r = parse(" \t\r\nnull\n\t ");
     CHJSON_CHECK(!r.err);
-    CHJSON_CHECK(r.val.is_null());
+    CHJSON_CHECK(r.doc.root().is_null());
   }
   {
     auto r = parse(" true ");
     CHJSON_CHECK(!r.err);
-    CHJSON_CHECK(r.val.is_bool());
-    CHJSON_CHECK(r.val.as_bool() == true);
+    CHJSON_CHECK(r.doc.root().is_bool());
+    CHJSON_CHECK(r.doc.root().as_bool() == true);
   }
   {
     auto r = parse("false");
     CHJSON_CHECK(!r.err);
-    CHJSON_CHECK(r.val.is_bool());
-    CHJSON_CHECK(r.val.as_bool() == false);
+    CHJSON_CHECK(r.doc.root().is_bool());
+    CHJSON_CHECK(r.doc.root().as_bool() == false);
   }
 }
 
@@ -35,22 +35,22 @@ static void test_arrays_objects_and_order() {
 
   auto r = parse(json);
   CHJSON_CHECK(!r.err);
-  CHJSON_CHECK(r.val.is_object());
+  CHJSON_CHECK(r.doc.root().is_object());
 
-  const value* a = r.val.find("a");
+  const sv_value* a = r.doc.root().find("a");
   CHJSON_CHECK(a && a->is_array());
   CHJSON_CHECK(a->as_array().size() == 3);
   CHJSON_CHECK(a->as_array()[0].as_int() == 1);
 
-  const value* b = r.val.find("b");
+  const sv_value* b = r.doc.root().find("b");
   CHJSON_CHECK(b && b->is_object());
-  const value* x = b->find("x");
-  const value* y = b->find("y");
+  const sv_value* x = b->find("x");
+  const sv_value* y = b->find("y");
   CHJSON_CHECK(x && x->as_bool() == true);
   CHJSON_CHECK(y && y->is_null());
 
   // Insertion order is preserved in dump.
-  const std::string dumped = dump(r.val);
+  const std::string dumped = dump(r.doc.root());
   CHJSON_CHECK(dumped.find("\"a\"") < dumped.find("\"b\""));
   CHJSON_CHECK(dumped.find("\"b\"") < dumped.find("\"s\""));
 }
@@ -58,7 +58,7 @@ static void test_arrays_objects_and_order() {
 static void test_duplicate_keys_find_first() {
   auto r = parse(R"({"k":1,"k":2})");
   CHJSON_CHECK(!r.err);
-  const value* k = r.val.find("k");
+  const sv_value* k = r.doc.root().find("k");
   CHJSON_CHECK(k != nullptr);
   CHJSON_CHECK(k->is_int());
   CHJSON_CHECK(k->as_int() == 1);
@@ -69,15 +69,15 @@ static void test_roundtrip_dump_pretty_and_compact() {
   auto r = parse(json);
   CHJSON_CHECK(!r.err);
 
-  const auto compact = dump(r.val, /*pretty=*/false);
-  const auto pretty = dump(r.val, /*pretty=*/true);
+  const auto compact = dump(r.doc.root(), /*pretty=*/false);
+  const auto pretty = dump(r.doc.root(), /*pretty=*/true);
   CHJSON_CHECK(!compact.empty());
   CHJSON_CHECK(!pretty.empty());
   CHJSON_CHECK(pretty.find('\n') != std::string::npos);
 
   auto r2 = parse(compact);
   CHJSON_CHECK(!r2.err);
-  CHJSON_CHECK(dump(r2.val) == compact);
+  CHJSON_CHECK(dump(r2.doc.root()) == compact);
 
   auto r3 = parse(pretty);
   CHJSON_CHECK(!r3.err);
@@ -93,8 +93,8 @@ static void test_require_eof_option() {
     opt.require_eof = false;
     auto r = parse("true 123", opt);
     CHJSON_CHECK(!r.err);
-    CHJSON_CHECK(r.val.is_bool());
-    CHJSON_CHECK(r.val.as_bool() == true);
+    CHJSON_CHECK(r.doc.root().is_bool());
+    CHJSON_CHECK(r.doc.root().as_bool() == true);
   }
 }
 
@@ -110,26 +110,26 @@ static void test_more_cases() {
   {
     auto r = parse("[]");
     CHJSON_CHECK(!r.err);
-    CHJSON_CHECK(r.val.is_array());
-    CHJSON_CHECK(r.val.as_array().empty());
-    CHJSON_CHECK(dump(r.val) == "[]");
+    CHJSON_CHECK(r.doc.root().is_array());
+    CHJSON_CHECK(r.doc.root().as_array().empty());
+    CHJSON_CHECK(dump(r.doc.root()) == "[]");
   }
 
   // 2) Empty object
   {
     auto r = parse("{}\n");
     CHJSON_CHECK(!r.err);
-    CHJSON_CHECK(r.val.is_object());
-    CHJSON_CHECK(r.val.as_object().empty());
-    CHJSON_CHECK(dump(r.val) == "{}");
+    CHJSON_CHECK(r.doc.root().is_object());
+    CHJSON_CHECK(r.doc.root().as_object().empty());
+    CHJSON_CHECK(dump(r.doc.root()) == "{}");
   }
 
   // 3) Mixed empty containers + find
   {
     auto r = parse(R"({"a":[],"b":{}})");
     CHJSON_CHECK(!r.err);
-    const value* a = r.val.find("a");
-    const value* b = r.val.find("b");
+    const sv_value* a = r.doc.root().find("a");
+    const sv_value* b = r.doc.root().find("b");
     CHJSON_CHECK(a && a->is_array() && a->as_array().empty());
     CHJSON_CHECK(b && b->is_object() && b->as_object().empty());
   }
@@ -138,9 +138,9 @@ static void test_more_cases() {
   {
     auto r = parse("[\n\t 1 \r\n ,\t2, 3\n]");
     CHJSON_CHECK(!r.err);
-    CHJSON_CHECK(r.val.is_array());
-    CHJSON_CHECK(r.val.as_array().size() == 3);
-    CHJSON_CHECK(r.val.as_array()[2].as_int() == 3);
+    CHJSON_CHECK(r.doc.root().is_array());
+    CHJSON_CHECK(r.doc.root().as_array().size() == 3);
+    CHJSON_CHECK(r.doc.root().as_array()[2].as_int() == 3);
   }
 
   // 5) Unexpected EOF: object not closed
@@ -177,14 +177,14 @@ static void test_more_cases() {
   {
     auto r = parse("\"\\u0000\"");
     CHJSON_CHECK(!r.err);
-    CHJSON_CHECK(r.val.is_string());
-    CHJSON_CHECK(r.val.as_string().size() == 1);
-    CHJSON_CHECK(static_cast<unsigned char>(r.val.as_string()[0]) == 0u);
-    const std::string s = dump(r.val);
+    CHJSON_CHECK(r.doc.root().is_string());
+    CHJSON_CHECK(r.doc.root().as_string_view().size() == 1);
+    CHJSON_CHECK(static_cast<unsigned char>(r.doc.root().as_string_view()[0]) == 0u);
+    const std::string s = dump(r.doc.root());
     auto r2 = parse(s);
     CHJSON_CHECK(!r2.err);
-    CHJSON_CHECK(r2.val.is_string());
-    CHJSON_CHECK(r2.val.as_string() == r.val.as_string());
+    CHJSON_CHECK(r2.doc.root().is_string());
+    CHJSON_CHECK(r2.doc.root().as_string_view() == r.doc.root().as_string_view());
   }
 }
 

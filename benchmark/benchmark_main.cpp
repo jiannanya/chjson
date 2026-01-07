@@ -83,7 +83,7 @@ bench_result bench_parse_dom(std::string_view json, std::size_t iters) {
   for (std::size_t i = 0; i < iters; ++i) {
     auto r = chjson::parse(json);
     do_not_optimize(r.err.code);
-    do_not_optimize(r.val.type());
+    do_not_optimize(r.doc.root().type());
   }
   const auto t1 = clock_type::now();
   const double sec = std::chrono::duration<double>(t1 - t0).count();
@@ -121,7 +121,7 @@ bench_result bench_dump_dom(std::string_view json, std::size_t iters) {
   const auto t0 = clock_type::now();
   std::size_t bytes = 0;
   for (std::size_t i = 0; i < iters; ++i) {
-    auto out = chjson::dump(r.val);
+    auto out = chjson::dump(r.doc.root());
     bytes += out.size();
     do_not_optimize(out.size());
   }
@@ -154,7 +154,7 @@ int main(int argc, char** argv) {
   // Warm-up
   {
     auto r = chjson::parse(payload);
-    do_not_optimize(r.val.type());
+    do_not_optimize(r.doc.root().type());
   }
   {
     auto r = chjson::parse_in_situ(std::string(payload));
