@@ -90,9 +90,11 @@ bench_result bench_parse_dom(std::string_view json, std::size_t iters) {
   return {sec, json.size() * iters};
 }
 
-bench_result bench_parse_insitu(std::string_view json, std::size_t iters, std::size_t& used_bytes_out, std::size_t& committed_bytes_out) {
+bench_result bench_parse_insitu(std::string_view json, std::size_t iters, std::size_t& used_bytes_out, std::size_t& committed_bytes_out,
+                               std::size_t& blocks_out) {
   used_bytes_out = 0;
   committed_bytes_out = 0;
+  blocks_out = 0;
 
   chjson::document doc;
   doc.reserve_buffer(json.size());
@@ -107,6 +109,7 @@ bench_result bench_parse_insitu(std::string_view json, std::size_t iters, std::s
   // Read stats after timing to avoid affecting the measured parse throughput.
   used_bytes_out = doc.arena().bytes_used();
   committed_bytes_out = doc.arena().bytes_committed();
+  blocks_out = doc.arena().blocks();
   const double sec = std::chrono::duration<double>(t1 - t0).count();
   return {sec, json.size() * iters};
 }
@@ -165,10 +168,12 @@ int main(int argc, char** argv) {
 
   std::size_t used_sum = 0;
   std::size_t committed_sum = 0;
-  auto insitu_parse = run_median(runs, [&] { return bench_parse_insitu(payload, iters, used_sum, committed_sum); });
+  std::size_t blocks_sum = 0;
+  auto insitu_parse = run_median(runs, [&] { return bench_parse_insitu(payload, iters, used_sum, committed_sum, blocks_sum); });
   print_mbps("parse(in_situ)", insitu_parse);
   std::cout << "arena used bytes: " << used_sum
-            << ", committed bytes: " << committed_sum << "\n";
+            << ", committed bytes: " << committed_sum
+            << ", blocks: " << blocks_sum << "\n";
 
   print_mbps("dump(dom)", run_median(runs, [&] { return bench_dump_dom(payload, iters); }));
 

@@ -1570,7 +1570,7 @@ namespace pmr {
 class arena_resource final : public std::pmr::memory_resource {
 public:
   explicit arena_resource(std::size_t initial_block_size = 64 * 1024)
-      : initial_block_size_(initial_block_size) {}
+  : initial_block_size_(initial_block_size) {}
 
   arena_resource(const arena_resource&) = delete;
   arena_resource& operator=(const arena_resource&) = delete;
@@ -1586,9 +1586,11 @@ public:
     tail_ = other.tail_;
     current_ = other.current_;
     initial_block_size_ = other.initial_block_size_;
+    next_block_size_ = other.next_block_size_;
     other.head_ = nullptr;
     other.tail_ = nullptr;
     other.current_ = nullptr;
+    other.next_block_size_ = 0;
     return *this;
   }
 
@@ -1599,6 +1601,14 @@ public:
   void clear() noexcept {
     for (block* b = head_; b != nullptr; b = b->next) b->used = 0;
     current_ = head_;
+
+    // Keep growth state consistent with already committed capacity.
+    if (tail_) {
+      const std::size_t doubled = tail_->size <= (k_max_block_size / 2) ? (tail_->size * 2) : k_max_block_size;
+      next_block_size_ = doubled < min_block_size() ? min_block_size() : doubled;
+    } else {
+      next_block_size_ = min_block_size();
+    }
   }
 
   // Reset to empty (frees all blocks).
@@ -1626,19 +1636,36 @@ public:
   // blocks).
   void reserve_bytes(std::size_t bytes) {
     if (bytes == 0) return;
-    if (bytes_committed() >= bytes) return;
-
-    const std::size_t min_block = initial_block_size_ ? initial_block_size_ : (64 * 1024);
-    const std::size_t block_size = (bytes <= min_block) ? min_block : bytes;
-
-    block* nb = block::create(block_size);
-    if (!head_) {
-      head_ = tail_ = nb;
-    } else {
-      tail_->next = nb;
-      tail_ = nb;
+    std::size_t committed = bytes_committed();
+    if (committed >= bytes) {
+      // Ensure growth state isn't stuck at 0 when reusing cached blocks.
+      if (next_block_size_ == 0) {
+        if (tail_) {
+          const std::size_t doubled = tail_->size <= (k_max_block_size / 2) ? (tail_->size * 2) : k_max_block_size;
+          next_block_size_ = doubled < min_block_size() ? min_block_size() : doubled;
+        } else {
+          next_block_size_ = min_block_size();
+        }
+      }
+      return;
     }
-    current_ = nb;
+
+    // Do not advance current_ while reserving; keep allocation starting point.
+    while (committed < bytes) {
+      const std::size_t need = bytes - committed;
+      const std::size_t block_size = new_block_size(need);
+
+      block* nb = block::create(block_size);
+      if (!head_) {
+        head_ = tail_ = nb;
+      } else {
+        tail_->next = nb;
+        tail_ = nb;
+      }
+      committed += block_size;
+    }
+
+    if (!current_) current_ = head_;
   }
 
   void release() noexcept {
@@ -1651,6 +1678,7 @@ public:
     head_ = nullptr;
     tail_ = nullptr;
     current_ = nullptr;
+    next_block_size_ = 0;
   }
 
 private:
@@ -1677,6 +1705,35 @@ private:
   block* tail_{nullptr};
   block* current_{nullptr};
   std::size_t initial_block_size_{64 * 1024};
+  std::size_t next_block_size_{0};
+
+  static constexpr std::size_t k_default_initial_block_size = 64u * 1024u;
+  static constexpr std::size_t k_max_block_size = 32u * 1024u * 1024u;
+
+  std::size_t min_block_size() const noexcept {
+    return initial_block_size_ ? initial_block_size_ : k_default_initial_block_size;
+  }
+
+  std::size_t new_block_size(std::size_t min_needed) noexcept {
+    const std::size_t min_block = min_block_size();
+    if (next_block_size_ == 0) next_block_size_ = min_block;
+
+    std::size_t growth = next_block_size_;
+    if (growth < min_block) growth = min_block;
+    if (growth > k_max_block_size) growth = k_max_block_size;
+
+    const std::size_t block_size = (min_needed > growth) ? min_needed : growth;
+
+    // Geometric growth up to 32MiB; huge single allocations do not increase the cap.
+    if (block_size >= k_max_block_size) {
+      next_block_size_ = k_max_block_size;
+    } else {
+      const std::size_t doubled = (block_size <= (k_max_block_size / 2)) ? (block_size * 2) : k_max_block_size;
+      next_block_size_ = doubled < min_block ? min_block : doubled;
+    }
+
+    return block_size;
+  }
 
   void* do_allocate(std::size_t bytes, std::size_t alignment) override {
     if (bytes == 0) bytes = 1;
@@ -1707,8 +1764,8 @@ private:
     }
 
     // Need a new block.
-    const std::size_t min_block = initial_block_size_ ? initial_block_size_ : (64 * 1024);
-    const std::size_t block_size = (bytes + alignment <= min_block) ? min_block : (bytes + alignment);
+    const std::size_t min_needed = bytes + alignment;
+    const std::size_t block_size = new_block_size(min_needed);
 
     block* nb = block::create(block_size);
     if (!head_) {
@@ -2727,13 +2784,14 @@ struct owning_view_parser {
         if (c == '-' || (c >= '0' && c <= '9')) {
           detail::number_value num;
           const std::size_t start = i;
-          // RapidJSON-aligned semantics: eagerly parse floating-point numbers.
-          if (!detail::parse_number(buf, size, i, num, /*parse_fp=*/true)) {
+          // Performance: avoid eager float parsing; store the raw token and parse lazily.
+          if (!detail::parse_number(buf, size, i, num, /*parse_fp=*/false)) {
             set_error(e, error_code::invalid_number, start);
             return nullptr;
           }
           if (num.is_int) return sv_value::integer(num.i);
-          return sv_value::number(num.d);
+          const std::string_view tok = copy_span(buf + start, i - start);
+          return sv_value::number_token(tok);
         }
         set_error(e, error_code::invalid_value);
         return nullptr;
@@ -3610,11 +3668,13 @@ inline error parse_in_situ_into(document& d, std::string_view json, parse_option
 }
 
 // -----------------------------
-// Owning DOM parse API (RapidJSON-aligned: read-only input, no full input memcpy)
+// Owning DOM parse API (read-only input, no full input memcpy)
 // -----------------------------
 
 // Parse from a read-only buffer into an owning `document`, without copying the full input.
-// Strings/keys are copied into the arena; floating-point numbers are parsed eagerly.
+// Strings/keys are copied into the arena.
+// For non-integer numbers, we copy the raw number token into the arena and parse to double lazily
+// on first access via as_double()/as_double_unchecked().
 inline error parse_owning_view_into(document& d, std::string_view json, parse_options opt = {}) {
   owning_view_parser p;
   p.opt = opt;

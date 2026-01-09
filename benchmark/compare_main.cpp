@@ -147,7 +147,8 @@ bench_result bench_chjson_parse_owning_view(std::string_view json, std::size_t i
 
   if (print_stats) {
     std::cout << "chjson owning_view arena used: " << doc.arena().bytes_used()
-              << ", committed: " << doc.arena().bytes_committed() << "\n";
+              << ", committed: " << doc.arena().bytes_committed()
+              << ", blocks: " << doc.arena().blocks() << "\n";
   }
 
   return {std::chrono::duration<double>(t1 - t0).count(), json.size() * iters};
@@ -260,7 +261,8 @@ bench_result bench_chjson_parse_insitu(std::string_view json, std::size_t iters,
   if (print_stats) {
     // Report memory stats outside the timed loop to avoid skewing throughput.
     std::cout << "chjson arena used: " << doc.arena().bytes_used()
-              << ", committed: " << doc.arena().bytes_committed() << "\n";
+              << ", committed: " << doc.arena().bytes_committed()
+              << ", blocks: " << doc.arena().blocks() << "\n";
   }
 
   return {std::chrono::duration<double>(t1 - t0).count(), json.size() * iters};
@@ -280,7 +282,8 @@ bench_result bench_chjson_parse_view(std::string_view json, std::size_t iters, b
   if (print_stats) {
     // Report memory stats outside the timed loop to avoid skewing throughput.
     std::cout << "chjson view arena used: " << doc.arena().bytes_used()
-              << ", committed: " << doc.arena().bytes_committed() << "\n";
+              << ", committed: " << doc.arena().bytes_committed()
+              << ", blocks: " << doc.arena().blocks() << "\n";
   }
 
   return {std::chrono::duration<double>(t1 - t0).count(), json.size() * iters};
