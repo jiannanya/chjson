@@ -529,18 +529,18 @@ int main(int argc, char** argv) {
 
   std::cout << "\n== Parse ==\n";
   print_mbps("chjson parse(dom)", run_median(runs, [&](std::size_t) { return bench_chjson_parse_dom(payload, iters); }));
-  print_mbps("chjson parse(owning_view)", run_median(runs, [&](std::size_t r) { return bench_chjson_parse_owning_view(payload, iters, /*print_stats=*/r == 0); }));
-  print_mbps("chjson parse(in_situ)", run_median(runs, [&](std::size_t r) { return bench_chjson_parse_insitu(payload, iters, /*print_stats=*/r == 0); }));
-  print_mbps("chjson parse(view)", run_median(runs, [&](std::size_t r) { return bench_chjson_parse_view(payload, iters, /*print_stats=*/r == 0); }));
+  print_mbps("chjson parse(owning_view)", run_median(runs, [&](std::size_t r) { return bench_chjson_parse_owning_view(payload, iters, /*print_stats=*/false); }));
+  print_mbps("chjson parse(in_situ)", run_median(runs, [&](std::size_t r) { return bench_chjson_parse_insitu(payload, iters, /*print_stats=*/false); }));
+  print_mbps("chjson parse(view)", run_median(runs, [&](std::size_t r) { return bench_chjson_parse_view(payload, iters, /*print_stats=*/false); }));
   // print_mbps("nlohmann parse", run_median(runs, [&](std::size_t) { return bench_nlohmann_parse(payload, iters); }));
   // print_mbps("jsoncpp parse", run_median(runs, [&](std::size_t) { return bench_jsoncpp_parse(payload, iters); }));
   print_mbps("rapidjson parse", run_median(runs, [&](std::size_t) { return bench_rapidjson_parse(payload, iters); }));
 
   std::cout << "\n== Parse (numbers) ==\n";
   print_mbps("chjson parse(dom)", run_median(runs, [&](std::size_t) { return bench_chjson_parse_dom(numbers_payload, numbers_iters); }));
-  print_mbps("chjson parse(owning_view)", run_median(runs, [&](std::size_t r) { return bench_chjson_parse_owning_view(numbers_payload, numbers_iters, /*print_stats=*/r == 0); }));
-  print_mbps("chjson parse(in_situ)", run_median(runs, [&](std::size_t r) { return bench_chjson_parse_insitu(numbers_payload, numbers_iters, /*print_stats=*/r == 0); }));
-  print_mbps("chjson parse(view)", run_median(runs, [&](std::size_t r) { return bench_chjson_parse_view(numbers_payload, numbers_iters, /*print_stats=*/r == 0); }));
+  print_mbps("chjson parse(owning_view)", run_median(runs, [&](std::size_t r) { return bench_chjson_parse_owning_view(numbers_payload, numbers_iters, /*print_stats=*/false); }));
+  print_mbps("chjson parse(in_situ)", run_median(runs, [&](std::size_t r) { return bench_chjson_parse_insitu(numbers_payload, numbers_iters, /*print_stats=*/false); }));
+  print_mbps("chjson parse(view)", run_median(runs, [&](std::size_t r) { return bench_chjson_parse_view(numbers_payload, numbers_iters, /*print_stats=*/false); }));
   print_mbps("rapidjson parse", run_median(runs, [&](std::size_t) { return bench_rapidjson_parse(numbers_payload, numbers_iters); }));
 
   std::cout << "\n== Parse+sum (numbers) ==\n";

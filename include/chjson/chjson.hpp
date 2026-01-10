@@ -118,7 +118,7 @@
 
 // Minimum average bytes per top-level span. Helps avoid MT on many tiny elements.
 #ifndef CHJSON_PARSE_MT_MIN_AVG_SPAN_BYTES
-  #define CHJSON_PARSE_MT_MIN_AVG_SPAN_BYTES (4u * 1024u)
+  #define CHJSON_PARSE_MT_MIN_AVG_SPAN_BYTES (2u * 1024u)
 #endif
 
 // Enable SSE2-accelerated scanning in the MT span splitter.
@@ -612,6 +612,71 @@ inline chjson_long_number_scratch& long_number_scratch() {
   thread_local chjson_long_number_scratch s;
   return s;
 }
+
+template <class T>
+class internal_array {
+public:
+  internal_array() = default;
+
+  explicit internal_array(std::size_t n) : p_(nullptr), n_(n) {
+    if (n_ == 0) return;
+    p_ = static_cast<T*>(chjson_allocate(sizeof(T) * n_, alignof(T)));
+    std::size_t i = 0;
+    try {
+      for (; i < n_; ++i) {
+        ::new (static_cast<void*>(p_ + i)) T;
+      }
+    } catch (...) {
+      for (std::size_t j = 0; j < i; ++j) (p_ + j)->~T();
+      chjson_deallocate(p_, sizeof(T) * n_, alignof(T));
+      p_ = nullptr;
+      n_ = 0;
+      throw;
+    }
+  }
+
+  internal_array(const internal_array&) = delete;
+  internal_array& operator=(const internal_array&) = delete;
+
+  internal_array(internal_array&& o) noexcept : p_(o.p_), n_(o.n_) {
+    o.p_ = nullptr;
+    o.n_ = 0;
+  }
+
+  internal_array& operator=(internal_array&& o) noexcept {
+    if (this == &o) return *this;
+    reset();
+    p_ = o.p_;
+    n_ = o.n_;
+    o.p_ = nullptr;
+    o.n_ = 0;
+    return *this;
+  }
+
+  ~internal_array() { reset(); }
+
+  void reset() noexcept {
+    if (!p_) {
+      n_ = 0;
+      return;
+    }
+    for (std::size_t i = 0; i < n_; ++i) (p_ + i)->~T();
+    chjson_deallocate(p_, sizeof(T) * n_, alignof(T));
+    p_ = nullptr;
+    n_ = 0;
+  }
+
+  T* get() noexcept { return p_; }
+  const T* get() const noexcept { return p_; }
+  std::size_t size() const noexcept { return n_; }
+
+  T& operator[](std::size_t i) noexcept { return p_[i]; }
+  const T& operator[](std::size_t i) const noexcept { return p_[i]; }
+
+private:
+  T* p_{nullptr};
+  std::size_t n_{0};
+};
 
 struct number_value {
   // Keep both: integers preserve round-trip and allow fast integer APIs.
@@ -1281,7 +1346,7 @@ struct parser {
   }
 
   value parse_value(std::size_t depth, error& e) {
-    if (depth > opt.max_depth) {
+    if (depth >= opt.max_depth) {
       set_error(e, error_code::nesting_too_deep);
       return nullptr;
     }
@@ -2082,8 +2147,8 @@ inline void parallel_for_chunks(std::size_t n, unsigned threads, Fn&& fn) {
   const std::size_t base = n / threads;
   const std::size_t rem = n % threads;
 
-  std::unique_ptr<std::thread[]> thr(new std::thread[threads]);
-  std::unique_ptr<std::exception_ptr[]> ep(new std::exception_ptr[threads]);
+  internal_array<std::thread> thr(threads);
+  internal_array<std::exception_ptr> ep(threads);
   std::size_t begin = 0;
   for (unsigned t = 0; t < threads; ++t) {
     const std::size_t len = base + (t < rem ? 1u : 0u);
@@ -2134,13 +2199,13 @@ inline void dump_array_pretty_mt(std::string& out, const value::array& a, int in
   }
 
   const unsigned used = threads > static_cast<unsigned>(a.size()) ? static_cast<unsigned>(a.size()) : threads;
-  std::unique_ptr<std::string[]> chunks(new std::string[used]);
+  internal_array<std::string> chunks(used);
   {
     const std::size_t n = a.size();
     const std::size_t base = n / used;
     const std::size_t rem = n % used;
-    std::unique_ptr<std::thread[]> thr(new std::thread[used]);
-    std::unique_ptr<std::exception_ptr[]> ep(new std::exception_ptr[used]);
+    internal_array<std::thread> thr(used);
+    internal_array<std::exception_ptr> ep(used);
     std::size_t begin = 0;
     for (unsigned t = 0; t < used; ++t) {
       const std::size_t len = base + (t < rem ? 1u : 0u);
@@ -2199,13 +2264,13 @@ inline void dump_object_pretty_mt(std::string& out, const value::object& o, int 
   }
 
   const unsigned used = threads > static_cast<unsigned>(o.size()) ? static_cast<unsigned>(o.size()) : threads;
-  std::unique_ptr<std::string[]> chunks(new std::string[used]);
+  internal_array<std::string> chunks(used);
   {
     const std::size_t n = o.size();
     const std::size_t base = n / used;
     const std::size_t rem = n % used;
-    std::unique_ptr<std::thread[]> thr(new std::thread[used]);
-    std::unique_ptr<std::exception_ptr[]> ep(new std::exception_ptr[used]);
+    internal_array<std::thread> thr(used);
+    internal_array<std::exception_ptr> ep(used);
     std::size_t begin = 0;
     for (unsigned t = 0; t < used; ++t) {
       const std::size_t len = base + (t < rem ? 1u : 0u);
@@ -2280,12 +2345,12 @@ inline void dump_to_mt(std::string& out, const value& v, dump_mt_options opt = {
       const auto& a = v.as_array();
       if (detail::should_parallelize_container(a.size(), /*depth=*/0, opt, threads)) {
         const unsigned used = threads > static_cast<unsigned>(a.size()) ? static_cast<unsigned>(a.size()) : threads;
-        std::unique_ptr<std::string[]> chunks(new std::string[used]);
+        detail::internal_array<std::string> chunks(used);
         const std::size_t n = a.size();
         const std::size_t base = n / used;
         const std::size_t rem = n % used;
-        std::unique_ptr<std::thread[]> thr(new std::thread[used]);
-        std::unique_ptr<std::exception_ptr[]> ep(new std::exception_ptr[used]);
+        detail::internal_array<std::thread> thr(used);
+        detail::internal_array<std::exception_ptr> ep(used);
         std::size_t begin = 0;
         for (unsigned t = 0; t < used; ++t) {
           const std::size_t len = base + (t < rem ? 1u : 0u);
@@ -2327,12 +2392,12 @@ inline void dump_to_mt(std::string& out, const value& v, dump_mt_options opt = {
       const auto& o = v.as_object();
       if (detail::should_parallelize_container(o.size(), /*depth=*/0, opt, threads)) {
         const unsigned used = threads > static_cast<unsigned>(o.size()) ? static_cast<unsigned>(o.size()) : threads;
-        std::unique_ptr<std::string[]> chunks(new std::string[used]);
+        detail::internal_array<std::string> chunks(used);
         const std::size_t n = o.size();
         const std::size_t base = n / used;
         const std::size_t rem = n % used;
-        std::unique_ptr<std::thread[]> thr(new std::thread[used]);
-        std::unique_ptr<std::exception_ptr[]> ep(new std::exception_ptr[used]);
+        detail::internal_array<std::thread> thr(used);
+        detail::internal_array<std::exception_ptr> ep(used);
         std::size_t begin = 0;
         for (unsigned t = 0; t < used; ++t) {
           const std::size_t len = base + (t < rem ? 1u : 0u);
@@ -3303,7 +3368,7 @@ struct view_parser {
   }
 
   sv_value parse_value(std::size_t depth, error& e) {
-    if (depth > opt.max_depth) {
+    if (depth >= opt.max_depth) {
       set_error(e, error_code::nesting_too_deep);
       return nullptr;
     }
@@ -3793,7 +3858,7 @@ struct owning_view_parser {
   }
 
   sv_value parse_value(std::size_t depth, error& e) {
-    if (depth > opt.max_depth) {
+    if (depth >= opt.max_depth) {
       set_error(e, error_code::nesting_too_deep);
       return nullptr;
     }
@@ -4193,6 +4258,15 @@ struct no_string_parser {
   std::size_t i{0};
   parse_options opt;
 
+  std::string_view copy_number_token(std::string_view token) {
+    // This fast path does not keep a backing buffer, so we must materialize
+    // non-integer number tokens into the arena to preserve dump() round-trips.
+    auto* mr = doc->resource();
+    char* dst = static_cast<char*>(mr->allocate(token.size(), alignof(char)));
+    if (!token.empty()) std::memcpy(dst, token.data(), token.size());
+    return std::string_view(dst, token.size());
+  }
+
   error run_inplace(document& d, std::string_view json) {
     doc = &d;
     doc->clear();
@@ -4223,7 +4297,7 @@ struct no_string_parser {
   }
 
   sv_value parse_value(std::size_t depth, error& e) {
-    if (depth > opt.max_depth) {
+    if (depth >= opt.max_depth) {
       set_error(e, error_code::nesting_too_deep);
       return nullptr;
     }
@@ -4248,9 +4322,8 @@ struct no_string_parser {
             return nullptr;
           }
           if (num.is_int) return sv_value::integer(num.i);
-          // This fast path parses from a read-only input buffer that is NOT stored in the document.
-          // Do not retain raw token pointers into that buffer.
-          return sv_value::number(num.d);
+          const std::string_view tok = copy_number_token(std::string_view(buf + start, i - start));
+          return sv_value::number_token_with_double(tok, num.d);
         }
         set_error(e, error_code::invalid_value);
         return nullptr;
@@ -4332,12 +4405,21 @@ struct no_string_parser {
           if (out.u.a.size == out.u.a.cap) reserve(out.u.a.size + 1u);
           sv_value* dst = &out.u.a.data[out.u.a.size++];
           dst->k = sv_value::kind::number;
-          dst->u.num.raw_data = nullptr;
           if (num.is_int) {
-            dst->u.num.raw_size_flags = sv_number_value::k_is_int;
+            dst->u.num = {};
+            dst->u.num.raw_data = nullptr;
+            dst->u.num.raw_size_flags = 0;
             dst->u.num.set_int_value(num.i);
+            dst->u.num.set_is_int(true);
+            dst->u.num.set_has_double(false);
           } else {
-            dst->u.num.raw_size_flags = sv_number_value::k_has_double;
+            const std::string_view tok = copy_number_token(std::string_view(buf + start, i - start));
+            dst->u.num = {};
+            dst->u.num.raw_data = nullptr;
+            dst->u.num.raw_size_flags = 0;
+            dst->u.num.set_is_int(false);
+            dst->u.num.set_has_double(true);
+            dst->u.num.set_raw_span(tok.data(), static_cast<std::uint32_t>(tok.size()));
             dst->u.num.set_double_value(num.d);
           }
 
@@ -4521,7 +4603,7 @@ struct insitu_parser {
   }
 
   sv_value parse_value(std::size_t depth, error& e) {
-    if (depth > opt.max_depth) {
+    if (depth >= opt.max_depth) {
       set_error(e, error_code::nesting_too_deep);
       return nullptr;
     }
@@ -4946,7 +5028,7 @@ inline void parse_many_into(document_parse_result* out, const std::string_view* 
 
   const std::size_t base = count / used;
   const std::size_t rem = count % used;
-  std::unique_ptr<std::future<void>[]> fut(new std::future<void>[used]);
+  detail::internal_array<std::future<void>> fut(used);
 
   std::size_t begin = 0;
   for (unsigned t = 0; t < used; ++t) {
@@ -5559,7 +5641,7 @@ inline document_parse_result parse(std::string_view json, parse_options opt) {
           }
 
           sv_value parse_value(std::size_t depth, error& e) {
-            if (depth > opt.max_depth) {
+            if (depth >= opt.max_depth) {
               set_error(e, error_code::nesting_too_deep);
               return nullptr;
             }
@@ -5685,10 +5767,10 @@ inline document_parse_result parse(std::string_view json, parse_options opt) {
           }
         };
 
-        std::unique_ptr<std::thread[]> thr(new std::thread[used]);
-        std::unique_ptr<error[]> errs(new error[used]);
-        std::unique_ptr<std::size_t[]> err_abs(new std::size_t[used]);
-        std::unique_ptr<unsigned char[]> built(new unsigned char[spans_count]);
+        detail::internal_array<std::thread> thr(used);
+        detail::internal_array<error> errs(used);
+        detail::internal_array<std::size_t> err_abs(used);
+        detail::internal_array<unsigned char> built(spans_count);
         for (unsigned t = 0; t < used; ++t) {
           errs[t] = {};
           err_abs[t] = std::numeric_limits<std::size_t>::max();
