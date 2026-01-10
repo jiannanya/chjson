@@ -1,6 +1,6 @@
 # chjson
 
-A small, header-only **C++17** JSON library.
+A high performance **C++17** JSON library.
 
 Design goals:
 
