@@ -31,8 +31,8 @@ function(chjson_enable_release_clang_perf target_name)
 endfunction()
 
 option(CHJSON_BUILD_TESTS "Build chjson tests" ON)
-option(CHJSON_BUILD_BENCHMARKS "Build chjson benchmarks" ON)
-option(CHJSON_BUILD_COMPARE_BENCH "Build comparison benchmark vs json_cpp and jsoncpp" ON)
+option(CHJSON_BUILD_BENCHMARKS "Build chjson benchmarks" OFF)
+option(CHJSON_BUILD_COMPARE_BENCH "Build comparison benchmark vs json_cpp and jsoncpp" OFF)
 
 # Paths to bundled third-party libraries (repo root siblings).
 set(_CHJSON_NLOHMANN_INC "${CMAKE_CURRENT_LIST_DIR}/../json_cpp/include")
