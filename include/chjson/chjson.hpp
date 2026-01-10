@@ -6157,23 +6157,23 @@ inline void dump_to_mt(std::string& out, const sv_value& v, dump_mt_options opt 
           const auto& a = v.as_array();
           if (detail::should_parallelize_container(a.size(), depth, opt, threads)) {
             const unsigned used = threads > static_cast<unsigned>(a.size()) ? static_cast<unsigned>(a.size()) : threads;
-            ctx.chunks.resize(used);
+            if (ctx.chunks.size() < used) ctx.chunks.resize(used);
             const std::size_t n = a.size();
             const std::size_t base = n / used;
             const std::size_t rem = n % used;
-            ctx.fut.resize(used);
+            if (ctx.fut.size() < used) ctx.fut.resize(used);
             std::size_t begin = 0;
             for (unsigned t = 0; t < used; ++t) {
               const std::size_t len = base + (t < rem ? 1u : 0u);
               const std::size_t end = begin + len;
               ctx.fut[t] = std::async(std::launch::async, [&, t, begin, end]() {
-                std::string buf;
+                std::string& buf = ctx.chunks[t];
+                buf.clear();
                 buf.reserve((end - begin) * 80u);
                 for (std::size_t i = begin; i < end; ++i) {
                   if (i != begin) buf.push_back(',');
                   dump_to(buf, a[i], /*pretty=*/false, 0);
                 }
-                ctx.chunks[t] = std::move(buf);
               });
               begin = end;
             }
@@ -6193,17 +6193,18 @@ inline void dump_to_mt(std::string& out, const sv_value& v, dump_mt_options opt 
           const auto& o = v.as_object();
           if (detail::should_parallelize_container(o.size(), depth, opt, threads)) {
             const unsigned used = threads > static_cast<unsigned>(o.size()) ? static_cast<unsigned>(o.size()) : threads;
-            ctx.chunks.resize(used);
+            if (ctx.chunks.size() < used) ctx.chunks.resize(used);
             const std::size_t n = o.size();
             const std::size_t base = n / used;
             const std::size_t rem = n % used;
-            ctx.fut.resize(used);
+            if (ctx.fut.size() < used) ctx.fut.resize(used);
             std::size_t begin = 0;
             for (unsigned t = 0; t < used; ++t) {
               const std::size_t len = base + (t < rem ? 1u : 0u);
               const std::size_t end = begin + len;
               ctx.fut[t] = std::async(std::launch::async, [&, t, begin, end]() {
-                std::string buf;
+                std::string& buf = ctx.chunks[t];
+                buf.clear();
                 buf.reserve((end - begin) * 96u);
                 for (std::size_t i = begin; i < end; ++i) {
                   if (i != begin) buf.push_back(',');
@@ -6211,7 +6212,6 @@ inline void dump_to_mt(std::string& out, const sv_value& v, dump_mt_options opt 
                   buf.push_back(':');
                   dump_to(buf, o[i].second, /*pretty=*/false, 0);
                 }
-                ctx.chunks[t] = std::move(buf);
               });
               begin = end;
             }
@@ -6256,17 +6256,18 @@ inline void dump_to_mt(std::string& out, const sv_value& v, dump_mt_options opt 
         }
 
         const unsigned used = threads > static_cast<unsigned>(a.size()) ? static_cast<unsigned>(a.size()) : threads;
-        ctx.chunks.resize(used);
+        if (ctx.chunks.size() < used) ctx.chunks.resize(used);
         const std::size_t n = a.size();
         const std::size_t base = n / used;
         const std::size_t rem = n % used;
-        ctx.fut.resize(used);
+        if (ctx.fut.size() < used) ctx.fut.resize(used);
         std::size_t begin = 0;
         for (unsigned t = 0; t < used; ++t) {
           const std::size_t len = base + (t < rem ? 1u : 0u);
           const std::size_t end = begin + len;
           ctx.fut[t] = std::async(std::launch::async, [&, t, begin, end]() {
-            std::string buf;
+            std::string& buf = ctx.chunks[t];
+            buf.clear();
             buf.reserve((end - begin) * 96u);
             for (std::size_t i = begin; i < end; ++i) {
               detail::dump_indent(buf, indent + 2);
@@ -6274,7 +6275,6 @@ inline void dump_to_mt(std::string& out, const sv_value& v, dump_mt_options opt 
               if (i + 1 != a.size()) buf.push_back(',');
               buf.push_back('\n');
             }
-            ctx.chunks[t] = std::move(buf);
           });
           begin = end;
         }
@@ -6308,17 +6308,18 @@ inline void dump_to_mt(std::string& out, const sv_value& v, dump_mt_options opt 
         }
 
         const unsigned used = threads > static_cast<unsigned>(o.size()) ? static_cast<unsigned>(o.size()) : threads;
-        ctx.chunks.resize(used);
+        if (ctx.chunks.size() < used) ctx.chunks.resize(used);
         const std::size_t n = o.size();
         const std::size_t base = n / used;
         const std::size_t rem = n % used;
-        ctx.fut.resize(used);
+        if (ctx.fut.size() < used) ctx.fut.resize(used);
         std::size_t begin = 0;
         for (unsigned t = 0; t < used; ++t) {
           const std::size_t len = base + (t < rem ? 1u : 0u);
           const std::size_t end = begin + len;
           ctx.fut[t] = std::async(std::launch::async, [&, t, begin, end]() {
-            std::string buf;
+            std::string& buf = ctx.chunks[t];
+            buf.clear();
             buf.reserve((end - begin) * 128u);
             for (std::size_t i = begin; i < end; ++i) {
               detail::dump_indent(buf, indent + 2);
@@ -6328,7 +6329,6 @@ inline void dump_to_mt(std::string& out, const sv_value& v, dump_mt_options opt 
               if (i + 1 != o.size()) buf.push_back(',');
               buf.push_back('\n');
             }
-            ctx.chunks[t] = std::move(buf);
           });
           begin = end;
         }
