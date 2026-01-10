@@ -1,6 +1,35 @@
 cmake_minimum_required(VERSION 3.15)
 project(chjson LANGUAGES CXX)
 
+# Release+Clang performance flags.
+# Note: keep this limited to safe perf knobs (no fast-math / LTO / exception model changes).
+function(chjson_enable_release_clang_perf target_name)
+  # if(NOT TARGET ${target_name})
+  #   return()
+  # endif()
+
+  # if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+  #   return()
+  # endif()
+
+  # get_target_property(_chjson_target_type ${target_name} TYPE)
+  # if(_chjson_target_type STREQUAL "INTERFACE_LIBRARY")
+  #   if(MSVC)
+  #     # MSVC/clang-cl already enables high optimization in Release by default; keep this minimal.
+  #     target_compile_options(${target_name} INTERFACE $<$<CONFIG:Release>:/O2 /DNDEBUG>)
+  #   else()
+  #     # Rely on CMake's default Release flags for -O3/-DNDEBUG; add only arch/tune knobs.
+  #     target_compile_options(${target_name} INTERFACE $<$<CONFIG:Release>:-march=native -mtune=native -fomit-frame-pointer>)
+  #   endif()
+  # else()
+  #   if(MSVC)
+  #     target_compile_options(${target_name} PRIVATE $<$<CONFIG:Release>:/O2 /DNDEBUG>)
+  #   else()
+  #     target_compile_options(${target_name} PRIVATE $<$<CONFIG:Release>:-march=native -mtune=native -fomit-frame-pointer>)
+  #   endif()
+  # endif()
+endfunction()
+
 option(CHJSON_BUILD_TESTS "Build chjson tests" ON)
 option(CHJSON_BUILD_BENCHMARKS "Build chjson benchmarks" ON)
 option(CHJSON_BUILD_COMPARE_BENCH "Build comparison benchmark vs json_cpp and jsoncpp" ON)
@@ -32,6 +61,7 @@ target_include_directories(chjson INTERFACE
   ${CMAKE_CURRENT_LIST_DIR}/another/chfloat/include
 )
 target_compile_features(chjson INTERFACE cxx_std_17)
+chjson_enable_release_clang_perf(chjson)
 
 if(CHJSON_BUILD_TESTS)
   enable_testing()
@@ -46,6 +76,7 @@ if(CHJSON_BUILD_TESTS)
   )
   target_link_libraries(chjson_tests PRIVATE chjson)
   target_compile_features(chjson_tests PRIVATE cxx_std_17)
+  chjson_enable_release_clang_perf(chjson_tests)
   add_test(NAME chjson_tests COMMAND chjson_tests)
 
   add_executable(chjson_parse_file
@@ -53,24 +84,28 @@ if(CHJSON_BUILD_TESTS)
   )
   target_link_libraries(chjson_parse_file PRIVATE chjson)
   target_compile_features(chjson_parse_file PRIVATE cxx_std_17)
+  chjson_enable_release_clang_perf(chjson_parse_file)
 
   # JSONTestSuite helper tools for cross-library robustness comparison.
   if(EXISTS "${_CHJSON_NLOHMANN_INC}")
     add_executable(nlohmann_parse_file test/nlohmann_parse_file_main.cpp)
     target_compile_features(nlohmann_parse_file PRIVATE cxx_std_17)
     target_include_directories(nlohmann_parse_file PRIVATE "${_CHJSON_NLOHMANN_INC}")
+    chjson_enable_release_clang_perf(nlohmann_parse_file)
   endif()
 
   if(EXISTS "${_CHJSON_RAPIDJSON_INC}")
     add_executable(rapidjson_parse_file test/rapidjson_parse_file_main.cpp)
     target_compile_features(rapidjson_parse_file PRIVATE cxx_std_17)
     target_include_directories(rapidjson_parse_file PRIVATE "${_CHJSON_RAPIDJSON_INC}")
+    chjson_enable_release_clang_perf(rapidjson_parse_file)
   endif()
 
   if(EXISTS "${_CHJSON_JSONCPP_DIR}/include")
     add_executable(jsoncpp_parse_file test/jsoncpp_parse_file_main.cpp)
     target_compile_features(jsoncpp_parse_file PRIVATE cxx_std_17)
     target_include_directories(jsoncpp_parse_file PRIVATE "${_CHJSON_JSONCPP_DIR}/include")
+    chjson_enable_release_clang_perf(jsoncpp_parse_file)
     if(TARGET jsoncpp_static)
       target_link_libraries(jsoncpp_parse_file PRIVATE jsoncpp_static)
     elseif(TARGET jsoncpp_lib)
@@ -85,6 +120,7 @@ if(CHJSON_BUILD_BENCHMARKS)
   )
   target_link_libraries(chjson_bench PRIVATE chjson)
   target_compile_features(chjson_bench PRIVATE cxx_std_17)
+  chjson_enable_release_clang_perf(chjson_bench)
 
   if(CHJSON_BUILD_COMPARE_BENCH)
     add_executable(chjson_compare_bench
@@ -92,6 +128,7 @@ if(CHJSON_BUILD_BENCHMARKS)
     )
     target_link_libraries(chjson_compare_bench PRIVATE chjson)
     target_compile_features(chjson_compare_bench PRIVATE cxx_std_17)
+    chjson_enable_release_clang_perf(chjson_compare_bench)
     if(EXISTS "${_CHJSON_NLOHMANN_INC}")
       target_include_directories(chjson_compare_bench PRIVATE "${_CHJSON_NLOHMANN_INC}")
     endif()

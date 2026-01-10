@@ -475,9 +475,12 @@ int main(int argc, char** argv) {
   std::cout << "payload bytes: " << payload.size() << "\n";
 
   // A second payload focused on numeric parsing.
-  const std::size_t numbers_count = std::max<std::size_t>(1, n_objects * 64);
+  std::size_t numbers_count = std::max<std::size_t>(1, n_objects * 64);
+  const bool custom_numbers_count = (argc >= 5);
+  if (custom_numbers_count) numbers_count = static_cast<std::size_t>(std::stoull(argv[4]));
   const std::string numbers_payload = make_numbers_payload(numbers_count);
-  const std::size_t numbers_iters = std::max<std::size_t>(scale_iters(iters, payload.size(), numbers_payload.size()), 50);
+  const std::size_t numbers_min_iters = custom_numbers_count ? 1 : 50;
+  const std::size_t numbers_iters = std::max<std::size_t>(scale_iters(iters, payload.size(), numbers_payload.size()), numbers_min_iters);
   std::cout << "numbers payload bytes: " << numbers_payload.size() << " (" << numbers_count << " numbers, iters=" << numbers_iters << ")\n";
 
   // Warm-up
@@ -529,8 +532,8 @@ int main(int argc, char** argv) {
   print_mbps("chjson parse(owning_view)", run_median(runs, [&](std::size_t r) { return bench_chjson_parse_owning_view(payload, iters, /*print_stats=*/r == 0); }));
   print_mbps("chjson parse(in_situ)", run_median(runs, [&](std::size_t r) { return bench_chjson_parse_insitu(payload, iters, /*print_stats=*/r == 0); }));
   print_mbps("chjson parse(view)", run_median(runs, [&](std::size_t r) { return bench_chjson_parse_view(payload, iters, /*print_stats=*/r == 0); }));
-  print_mbps("nlohmann parse", run_median(runs, [&](std::size_t) { return bench_nlohmann_parse(payload, iters); }));
-  print_mbps("jsoncpp parse", run_median(runs, [&](std::size_t) { return bench_jsoncpp_parse(payload, iters); }));
+  // print_mbps("nlohmann parse", run_median(runs, [&](std::size_t) { return bench_nlohmann_parse(payload, iters); }));
+  // print_mbps("jsoncpp parse", run_median(runs, [&](std::size_t) { return bench_jsoncpp_parse(payload, iters); }));
   print_mbps("rapidjson parse", run_median(runs, [&](std::size_t) { return bench_rapidjson_parse(payload, iters); }));
 
   std::cout << "\n== Parse (numbers) ==\n";

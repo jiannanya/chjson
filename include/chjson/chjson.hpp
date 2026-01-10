@@ -16,7 +16,7 @@
 #if defined(_M_X64) || defined(__SSE2__)
   #if defined(_MSC_VER)
     #include <intrin.h>
-  #endif
+  #endif 
   #include <immintrin.h>
 #endif
 #include <limits>
@@ -27,6 +27,8 @@
 #include <system_error>
 #include <string>
 #include <string_view>
+#include <thread>
+#include <future>
 #include <type_traits>
 #include <utility>
 #include <variant>
@@ -67,7 +69,29 @@
 
 // Max arena committed bytes to cache per thread.
 #ifndef CHJSON_TLS_PARSE_ARENA_MAX
-  #define CHJSON_TLS_PARSE_ARENA_MAX (8u * 1024u * 1024u)
+  // Default raised to keep parse(dom) competitive for medium/large documents when
+  // users call chjson::parse() in a tight loop (benchmarks, batch parsing, etc.).
+  // Override this macro before including chjson.hpp to cap per-thread cached memory.
+  #define CHJSON_TLS_PARSE_ARENA_MAX (16u * 1024u * 1024u)
+#endif
+
+// Max arena bytes to reserve up front for parse(dom).
+// This is independent from CHJSON_TLS_PARSE_ARENA_MAX (which only controls the
+// per-thread cache cap). Reserving too little for large number-heavy inputs can
+// cause excessive monotonic growth and copying.
+#ifndef CHJSON_PARSE_DOM_ARENA_RESERVE_MAX
+  #define CHJSON_PARSE_DOM_ARENA_RESERVE_MAX (16u * 1024u * 1024u)
+#endif
+
+// Max MT-parse backing bytes to cache per thread.
+// This backing stores per-thread monotonic allocations for the MT parse path.
+#ifndef CHJSON_TLS_PARSE_MT_BACKING_MAX
+  #define CHJSON_TLS_PARSE_MT_BACKING_MAX (16u * 1024u * 1024u)
+#endif
+
+// Max number of per-thread monotonic resources to cache per thread.
+#ifndef CHJSON_TLS_PARSE_MT_RESOURCES_MAX
+  #define CHJSON_TLS_PARSE_MT_RESOURCES_MAX 64u
 #endif
 
 // Config: parse(dom) fast path for inputs with no strings.
@@ -76,6 +100,30 @@
 // This primarily improves number-heavy workloads (e.g. Parse+sum(numbers)).
 #ifndef CHJSON_PARSE_DOM_NO_STRING_FASTPATH
   #define CHJSON_PARSE_DOM_NO_STRING_FASTPATH 1
+#endif
+
+// Config: conservative thresholds for MT parse(dom).
+// The MT parse path has overhead (span scan, task launch, extra alloc/init), so
+// it should be reserved for large top-level containers.
+//
+// Override these macros before including this header to tune for your workload.
+#ifndef CHJSON_PARSE_MT_MIN_BYTES
+  #define CHJSON_PARSE_MT_MIN_BYTES (256u * 1024u)
+#endif
+
+#ifndef CHJSON_PARSE_MT_MIN_SPANS
+  #define CHJSON_PARSE_MT_MIN_SPANS 64u
+#endif
+
+// Minimum average bytes per top-level span. Helps avoid MT on many tiny elements.
+#ifndef CHJSON_PARSE_MT_MIN_AVG_SPAN_BYTES
+  #define CHJSON_PARSE_MT_MIN_AVG_SPAN_BYTES (4u * 1024u)
+#endif
+
+// Enable SSE2-accelerated scanning in the MT span splitter.
+// This only affects the initial top-level span scan (used to decide MT splitting).
+#ifndef CHJSON_PARSE_MT_SCAN_SIMD
+  #define CHJSON_PARSE_MT_SCAN_SIMD 0
 #endif
 
 #if CHJSON_USE_CHFLOAT
@@ -108,7 +156,8 @@ enum class error_code {
   expected_comma_or_end,
   expected_key_string,
   trailing_characters,
-  nesting_too_deep
+  nesting_too_deep,
+  out_of_memory
 };
 
 struct error {
@@ -380,6 +429,42 @@ struct owned_number_value {
   }
 };
 
+inline double parse_double(const char* first, const char* last) {
+  const std::size_t len = static_cast<std::size_t>(last - first);
+  // Fast path: chfloat.
+#if CHJSON_HAS_CHFLOAT
+  {
+    double v = 0.0;
+    auto r = chfloat::from_chars(first, last, v);
+    if (r.ec == chfloat::errc::ok && r.ptr == last) return v;
+  }
+#endif
+
+  // Backend choice:
+  // - strtod: often quite fast on MSVC/Windows and very robust.
+  // - from_chars: locale-free and allocation-free, but performance varies by STL.
+  // Enable from_chars explicitly if it benchmarks better for your toolchain.
+#if defined(CHJSON_USE_FROM_CHARS_DOUBLE) && CHJSON_USE_FROM_CHARS_DOUBLE
+#if defined(__cpp_lib_to_chars)
+  {
+    double v = 0.0;
+    auto r = std::from_chars(first, last, v, std::chars_format::general);
+    if (r.ec == std::errc{} && r.ptr == last) return v;
+  }
+#endif
+#endif
+
+  // Fallback: token is not NUL-terminated; avoid heap alloc for typical short numbers.
+  constexpr std::size_t kStackCap = 128;
+  if (len < kStackCap) {
+    char buf[kStackCap];
+    if (len != 0) std::memcpy(buf, first, len);
+    buf[len] = '\0';
+    return std::strtod(buf, nullptr);
+  }
+  return std::strtod(std::string(first, len).c_str(), nullptr);
+}
+
 inline double parse_double(std::string_view token) {
   // Fast path: chfloat.
 #if CHJSON_HAS_CHFLOAT
@@ -422,29 +507,39 @@ inline double parse_double(std::string_view token) {
 inline bool parse_number(const char* buf, std::size_t size, std::size_t& i, number_value& out, bool parse_fp = true) {
   // JSON number grammar:
   // -?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?
+  //
+  // Performance note: float-heavy inputs ('.'/'e') are common in benchmarks.
+  // Avoid doing integer accumulation/overflow tracking unless the token is
+  // actually an integer.
   const std::size_t start = i;
   if (i >= size) return false;
 
+  std::size_t p = i;
   bool neg = false;
-  if (buf[i] == '-') {
+  if (buf[p] == '-') {
     neg = true;
-    ++i;
-    if (i >= size) return false;
+    ++p;
+    if (p >= size) return false;
   }
 
+  const std::size_t digits_begin = p;
+
+  // Integer accumulation while scanning digits (one pass for integers).
+  // We still need the full token span for float parsing fallback.
   std::uint64_t acc = 0;
   bool overflow = false;
 
-  if (buf[i] == '0') {
-    ++i;
-    if (i < size && is_digit(buf[i])) return false;
+  if (buf[p] == '0') {
+    acc = 0;
+    ++p;
+    if (p < size && is_digit(buf[p])) return false;
   } else {
-    const char c0 = buf[i];
+    const char c0 = buf[p];
     if (c0 < '1' || c0 > '9') return false;
     acc = static_cast<std::uint64_t>(c0 - '0');
-    ++i;
-    while (i < size && is_digit(buf[i])) {
-      const std::uint64_t d = static_cast<std::uint64_t>(buf[i] - '0');
+    ++p;
+    while (p < size && is_digit(buf[p])) {
+      const std::uint64_t d = static_cast<std::uint64_t>(buf[p] - '0');
       if (!overflow) {
         if (acc > (std::numeric_limits<std::uint64_t>::max() - d) / 10u) {
           overflow = true;
@@ -452,42 +547,44 @@ inline bool parse_number(const char* buf, std::size_t size, std::size_t& i, numb
           acc = acc * 10u + d;
         }
       }
-      ++i;
+      ++p;
     }
   }
 
   bool is_int = true;
-  if (i < size && buf[i] == '.') {
+  if (p < size && buf[p] == '.') {
     is_int = false;
-    ++i;
-    if (i >= size || !is_digit(buf[i])) return false;
-    while (i < size && is_digit(buf[i])) ++i;
+    ++p;
+    if (p >= size || !is_digit(buf[p])) return false;
+    while (p < size && is_digit(buf[p])) ++p;
   }
 
-  if (i < size && (buf[i] == 'e' || buf[i] == 'E')) {
+  if (p < size && (buf[p] == 'e' || buf[p] == 'E')) {
     is_int = false;
-    ++i;
-    if (i >= size) return false;
-    if (buf[i] == '+' || buf[i] == '-') {
-      ++i;
-      if (i >= size) return false;
+    ++p;
+    if (p >= size) return false;
+    if (buf[p] == '+' || buf[p] == '-') {
+      ++p;
+      if (p >= size) return false;
     }
-    if (!is_digit(buf[i])) return false;
-    while (i < size && is_digit(buf[i])) ++i;
+    if (!is_digit(buf[p])) return false;
+    while (p < size && is_digit(buf[p])) ++p;
   }
 
-  const std::size_t end = i;
-  const std::string_view token(buf + start, end - start);
+  const std::size_t end = p;
+  i = end;
+  const char* token_first = buf + start;
+  const char* token_last = buf + end;
 
   if (!is_int) {
     out.is_int = false;
-    if (parse_fp) out.d = parse_double(token);
+    if (parse_fp) out.d = parse_double(token_first, token_last);
     return true;
   }
 
   if (overflow) {
     out.is_int = false;
-    if (parse_fp) out.d = parse_double(token);
+    if (parse_fp) out.d = parse_double(token_first, token_last);
     return true;
   }
 
@@ -495,7 +592,7 @@ inline bool parse_number(const char* buf, std::size_t size, std::size_t& i, numb
     const std::uint64_t limit = static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) + 1ull;
     if (acc > limit) {
       out.is_int = false;
-      if (parse_fp) out.d = parse_double(token);
+      if (parse_fp) out.d = parse_double(token_first, token_last);
       return true;
     }
     out.is_int = true;
@@ -505,7 +602,7 @@ inline bool parse_number(const char* buf, std::size_t size, std::size_t& i, numb
 
   if (acc > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
     out.is_int = false;
-    if (parse_fp) out.d = parse_double(token);
+    if (parse_fp) out.d = parse_double(token_first, token_last);
     return true;
   }
   out.is_int = true;
@@ -513,62 +610,54 @@ inline bool parse_number(const char* buf, std::size_t size, std::size_t& i, numb
   return true;
 }
 
+
+
 inline bool parse_number(const char* buf, std::size_t size, std::size_t& i, owned_number_value& out, bool parse_fp = true) {
   const std::size_t start = i;
   if (i >= size) return false;
 
+  std::size_t p = i;
   bool neg = false;
-  if (buf[i] == '-') {
+  if (buf[p] == '-') {
     neg = true;
-    ++i;
-    if (i >= size) return false;
+    ++p;
+    if (p >= size) return false;
   }
 
-  std::uint64_t acc = 0;
-  bool overflow = false;
+  const std::size_t digits_begin = p;
 
-  if (buf[i] == '0') {
-    ++i;
-    if (i < size && is_digit(buf[i])) return false;
+  if (buf[p] == '0') {
+    ++p;
+    if (p < size && is_digit(buf[p])) return false;
   } else {
-    const char c0 = buf[i];
+    const char c0 = buf[p];
     if (c0 < '1' || c0 > '9') return false;
-    acc = static_cast<std::uint64_t>(c0 - '0');
-    ++i;
-    while (i < size && is_digit(buf[i])) {
-      const std::uint64_t d = static_cast<std::uint64_t>(buf[i] - '0');
-      if (!overflow) {
-        if (acc > (std::numeric_limits<std::uint64_t>::max() - d) / 10u) {
-          overflow = true;
-        } else {
-          acc = acc * 10u + d;
-        }
-      }
-      ++i;
-    }
+    ++p;
+    while (p < size && is_digit(buf[p])) ++p;
   }
 
   bool is_int = true;
-  if (i < size && buf[i] == '.') {
+  if (p < size && buf[p] == '.') {
     is_int = false;
-    ++i;
-    if (i >= size || !is_digit(buf[i])) return false;
-    while (i < size && is_digit(buf[i])) ++i;
+    ++p;
+    if (p >= size || !is_digit(buf[p])) return false;
+    while (p < size && is_digit(buf[p])) ++p;
   }
 
-  if (i < size && (buf[i] == 'e' || buf[i] == 'E')) {
+  if (p < size && (buf[p] == 'e' || buf[p] == 'E')) {
     is_int = false;
-    ++i;
-    if (i >= size) return false;
-    if (buf[i] == '+' || buf[i] == '-') {
-      ++i;
-      if (i >= size) return false;
+    ++p;
+    if (p >= size) return false;
+    if (buf[p] == '+' || buf[p] == '-') {
+      ++p;
+      if (p >= size) return false;
     }
-    if (!is_digit(buf[i])) return false;
-    while (i < size && is_digit(buf[i])) ++i;
+    if (!is_digit(buf[p])) return false;
+    while (p < size && is_digit(buf[p])) ++p;
   }
 
-  const std::size_t end = i;
+  const std::size_t end = p;
+  i = end;
   const std::string_view token(buf + start, end - start);
 
   auto set_raw = [&]() {
@@ -590,6 +679,21 @@ inline bool parse_number(const char* buf, std::size_t size, std::size_t& i, owne
     set_double();
     return true;
   }
+
+  // Integer: accumulation pass.
+  std::uint64_t acc = 0;
+  bool overflow = false;
+  for (std::size_t q = digits_begin; q < end; ++q) {
+    const std::uint64_t d = static_cast<std::uint64_t>(buf[q] - '0');
+    if (!overflow) {
+      if (acc > (std::numeric_limits<std::uint64_t>::max() - d) / 10u) {
+        overflow = true;
+      } else {
+        acc = acc * 10u + d;
+      }
+    }
+  }
+
   if (overflow) {
     out.is_int = false;
     set_raw();
@@ -757,6 +861,31 @@ private:
 struct parse_options {
   std::size_t max_depth{256};
   bool require_eof{true};
+};
+
+// Options for opt-in multithreaded dumping.
+//
+// Notes:
+// - Multithreaded dumping is primarily beneficial for very large arrays/objects.
+// - For small values it may be slower due to task overhead.
+struct dump_mt_options {
+  bool pretty{false};
+  // 0 => use std::thread::hardware_concurrency() (clamped to >= 1)
+  unsigned max_threads{0};
+  // Only parallelize arrays/objects with at least this many items.
+  std::size_t min_parallel_items{1024};
+  // Limit parallelization depth to avoid task explosion.
+  unsigned max_parallel_depth{1};
+};
+
+// Forward declaration: forced-mt dump() wrappers call this.
+inline void dump_to_mt(std::string& out, const value& v, dump_mt_options opt);
+
+// Options for parallel parsing of many independent JSON texts.
+struct parse_many_options {
+  parse_options opt{};
+  // 0 => use std::thread::hardware_concurrency() (clamped to >= 1)
+  unsigned max_threads{0};
 };
 
 // Legacy: fully owning DOM value tree (std::string/std::vector backed).
@@ -1308,6 +1437,14 @@ inline void dump_indent(std::string& out, int indent) {
   for (int i = 0; i < indent; ++i) out.push_back(' ');
 }
 
+inline unsigned effective_threads(unsigned max_threads) noexcept {
+  if (max_threads == 0) {
+    const unsigned hc = std::thread::hardware_concurrency();
+    return hc == 0 ? 1u : hc;
+  }
+  return max_threads;
+}
+
 } // namespace detail
 
 namespace detail {
@@ -1552,12 +1689,355 @@ inline std::string dump(const value& v, bool pretty = false) {
   std::string out;
   std::size_t& hint = pretty ? hints.pretty : hints.compact;
   out.reserve(hint);
-  dump_to(out, v, pretty, 0);
+
+  // Default dump(): use the MT-aware dumper.
+  // It will only parallelize when the top-level container is large enough.
+  dump_mt_options opt;
+  opt.pretty = pretty;
+  opt.max_threads = 0;
+  opt.min_parallel_items = 1024;
+  opt.max_parallel_depth = 1;
+  dump_to_mt(out, v, opt);
 
   constexpr std::size_t min_hint = 256;
   constexpr std::size_t max_hint = 16u * 1024u * 1024u;
   const std::size_t sz = out.size();
   hint = (sz < min_hint) ? min_hint : (sz > max_hint ? max_hint : sz);
+  return out;
+}
+
+// -----------------------------
+// Multithreaded dump (opt-in)
+// -----------------------------
+
+namespace detail {
+
+template <class Fn>
+inline void parallel_for_chunks(std::size_t n, unsigned threads, Fn&& fn) {
+  if (n == 0 || threads <= 1) {
+    fn(0, n);
+    return;
+  }
+  if (threads > static_cast<unsigned>(n)) threads = static_cast<unsigned>(n);
+
+  const std::size_t base = n / threads;
+  const std::size_t rem = n % threads;
+
+  std::unique_ptr<std::thread[]> thr(new std::thread[threads]);
+  std::unique_ptr<std::exception_ptr[]> ep(new std::exception_ptr[threads]);
+  std::size_t begin = 0;
+  for (unsigned t = 0; t < threads; ++t) {
+    const std::size_t len = base + (t < rem ? 1u : 0u);
+    const std::size_t end = begin + len;
+    ep[t] = nullptr;
+    thr[t] = std::thread([&, t, begin, end]() {
+      try {
+        fn(begin, end);
+      } catch (...) {
+        ep[t] = std::current_exception();
+      }
+    });
+    begin = end;
+  }
+  for (unsigned t = 0; t < threads; ++t) {
+    if (thr[t].joinable()) thr[t].join();
+  }
+  for (unsigned t = 0; t < threads; ++t) {
+    if (ep[t]) std::rethrow_exception(ep[t]);
+  }
+}
+
+inline bool should_parallelize_container(std::size_t items, unsigned depth, const dump_mt_options& opt, unsigned threads) noexcept {
+  if (threads <= 1) return false;
+  if (depth >= opt.max_parallel_depth) return false;
+  return items >= opt.min_parallel_items;
+}
+
+inline void dump_array_pretty_mt(std::string& out, const value::array& a, int indent, unsigned depth, const dump_mt_options& opt, unsigned threads) {
+  out.push_back('[');
+  if (a.empty()) {
+    out.push_back(']');
+    return;
+  }
+  out.push_back('\n');
+
+  const bool par = should_parallelize_container(a.size(), depth, opt, threads);
+  if (!par) {
+    for (std::size_t i = 0; i < a.size(); ++i) {
+      dump_indent(out, indent + 2);
+      dump_to(out, a[i], /*pretty=*/true, indent + 2);
+      if (i + 1 != a.size()) out.push_back(',');
+      out.push_back('\n');
+    }
+    dump_indent(out, indent);
+    out.push_back(']');
+    return;
+  }
+
+  const unsigned used = threads > static_cast<unsigned>(a.size()) ? static_cast<unsigned>(a.size()) : threads;
+  std::unique_ptr<std::string[]> chunks(new std::string[used]);
+  {
+    const std::size_t n = a.size();
+    const std::size_t base = n / used;
+    const std::size_t rem = n % used;
+    std::unique_ptr<std::thread[]> thr(new std::thread[used]);
+    std::unique_ptr<std::exception_ptr[]> ep(new std::exception_ptr[used]);
+    std::size_t begin = 0;
+    for (unsigned t = 0; t < used; ++t) {
+      const std::size_t len = base + (t < rem ? 1u : 0u);
+      const std::size_t end = begin + len;
+      ep[t] = nullptr;
+      thr[t] = std::thread([&, t, begin, end]() {
+        try {
+          std::string buf;
+          for (std::size_t i = begin; i < end; ++i) {
+            dump_indent(buf, indent + 2);
+            dump_to(buf, a[i], /*pretty=*/true, indent + 2);
+            if (i + 1 != a.size()) buf.push_back(',');
+            buf.push_back('\n');
+          }
+          chunks[t] = std::move(buf);
+        } catch (...) {
+          ep[t] = std::current_exception();
+        }
+      });
+      begin = end;
+    }
+    for (unsigned t = 0; t < used; ++t) {
+      if (thr[t].joinable()) thr[t].join();
+    }
+    for (unsigned t = 0; t < used; ++t) {
+      if (ep[t]) std::rethrow_exception(ep[t]);
+    }
+  }
+
+  for (unsigned t = 0; t < used; ++t) out.append(chunks[t]);
+  dump_indent(out, indent);
+  out.push_back(']');
+}
+
+inline void dump_object_pretty_mt(std::string& out, const value::object& o, int indent, unsigned depth, const dump_mt_options& opt, unsigned threads) {
+  out.push_back('{');
+  if (o.empty()) {
+    out.push_back('}');
+    return;
+  }
+  out.push_back('\n');
+
+  const bool par = should_parallelize_container(o.size(), depth, opt, threads);
+  if (!par) {
+    for (std::size_t i = 0; i < o.size(); ++i) {
+      dump_indent(out, indent + 2);
+      dump_escaped(out, o[i].first);
+      out.append(": ", 2);
+      dump_to(out, o[i].second, /*pretty=*/true, indent + 2);
+      if (i + 1 != o.size()) out.push_back(',');
+      out.push_back('\n');
+    }
+    dump_indent(out, indent);
+    out.push_back('}');
+    return;
+  }
+
+  const unsigned used = threads > static_cast<unsigned>(o.size()) ? static_cast<unsigned>(o.size()) : threads;
+  std::unique_ptr<std::string[]> chunks(new std::string[used]);
+  {
+    const std::size_t n = o.size();
+    const std::size_t base = n / used;
+    const std::size_t rem = n % used;
+    std::unique_ptr<std::thread[]> thr(new std::thread[used]);
+    std::unique_ptr<std::exception_ptr[]> ep(new std::exception_ptr[used]);
+    std::size_t begin = 0;
+    for (unsigned t = 0; t < used; ++t) {
+      const std::size_t len = base + (t < rem ? 1u : 0u);
+      const std::size_t end = begin + len;
+      ep[t] = nullptr;
+      thr[t] = std::thread([&, t, begin, end]() {
+        try {
+          std::string buf;
+          for (std::size_t i = begin; i < end; ++i) {
+            dump_indent(buf, indent + 2);
+            dump_escaped(buf, o[i].first);
+            buf.append(": ", 2);
+            dump_to(buf, o[i].second, /*pretty=*/true, indent + 2);
+            if (i + 1 != o.size()) buf.push_back(',');
+            buf.push_back('\n');
+          }
+          chunks[t] = std::move(buf);
+        } catch (...) {
+          ep[t] = std::current_exception();
+        }
+      });
+      begin = end;
+    }
+    for (unsigned t = 0; t < used; ++t) {
+      if (thr[t].joinable()) thr[t].join();
+    }
+    for (unsigned t = 0; t < used; ++t) {
+      if (ep[t]) std::rethrow_exception(ep[t]);
+    }
+  }
+
+  for (unsigned t = 0; t < used; ++t) out.append(chunks[t]);
+  dump_indent(out, indent);
+  out.push_back('}');
+}
+
+} // namespace detail
+
+inline void dump_to_mt(std::string& out, const value& v, dump_mt_options opt = {}) {
+  // Fast reject: only parallelize top-level arrays/objects that are large enough.
+  // This keeps default dump() MT-aware while avoiding per-call scheduling overhead
+  // in tight loops dumping small values.
+  if (opt.max_parallel_depth == 0) {
+    dump_to(out, v, opt.pretty, 0);
+    return;
+  }
+
+  if (v.type() == value::kind::array) {
+    if (v.as_array().size() < opt.min_parallel_items) {
+      dump_to(out, v, opt.pretty, 0);
+      return;
+    }
+  } else if (v.type() == value::kind::object) {
+    if (v.as_object().size() < opt.min_parallel_items) {
+      dump_to(out, v, opt.pretty, 0);
+      return;
+    }
+  } else {
+    dump_to(out, v, opt.pretty, 0);
+    return;
+  }
+
+  const unsigned threads = detail::effective_threads(opt.max_threads);
+  if (threads <= 1) {
+    dump_to(out, v, opt.pretty, 0);
+    return;
+  }
+
+  // Parallelize only for arrays/objects; everything else uses the existing dump_to.
+  if (!opt.pretty) {
+    if (v.type() == value::kind::array) {
+      const auto& a = v.as_array();
+      if (detail::should_parallelize_container(a.size(), /*depth=*/0, opt, threads)) {
+        const unsigned used = threads > static_cast<unsigned>(a.size()) ? static_cast<unsigned>(a.size()) : threads;
+        std::unique_ptr<std::string[]> chunks(new std::string[used]);
+        const std::size_t n = a.size();
+        const std::size_t base = n / used;
+        const std::size_t rem = n % used;
+        std::unique_ptr<std::thread[]> thr(new std::thread[used]);
+        std::unique_ptr<std::exception_ptr[]> ep(new std::exception_ptr[used]);
+        std::size_t begin = 0;
+        for (unsigned t = 0; t < used; ++t) {
+          const std::size_t len = base + (t < rem ? 1u : 0u);
+          const std::size_t end = begin + len;
+          ep[t] = nullptr;
+          thr[t] = std::thread([&, t, begin, end]() {
+            try {
+              std::string buf;
+              for (std::size_t i = begin; i < end; ++i) {
+                if (i != begin) buf.push_back(',');
+                dump_to(buf, a[i], /*pretty=*/false, 0);
+              }
+              chunks[t] = std::move(buf);
+            } catch (...) {
+              ep[t] = std::current_exception();
+            }
+          });
+          begin = end;
+        }
+        for (unsigned t = 0; t < used; ++t) {
+          if (thr[t].joinable()) thr[t].join();
+        }
+        for (unsigned t = 0; t < used; ++t) {
+          if (ep[t]) std::rethrow_exception(ep[t]);
+        }
+
+        out.push_back('[');
+        bool first = true;
+        for (unsigned t = 0; t < used; ++t) {
+          if (chunks[t].empty()) continue;
+          if (!first) out.push_back(',');
+          out.append(chunks[t]);
+          first = false;
+        }
+        out.push_back(']');
+        return;
+      }
+    } else if (v.type() == value::kind::object) {
+      const auto& o = v.as_object();
+      if (detail::should_parallelize_container(o.size(), /*depth=*/0, opt, threads)) {
+        const unsigned used = threads > static_cast<unsigned>(o.size()) ? static_cast<unsigned>(o.size()) : threads;
+        std::unique_ptr<std::string[]> chunks(new std::string[used]);
+        const std::size_t n = o.size();
+        const std::size_t base = n / used;
+        const std::size_t rem = n % used;
+        std::unique_ptr<std::thread[]> thr(new std::thread[used]);
+        std::unique_ptr<std::exception_ptr[]> ep(new std::exception_ptr[used]);
+        std::size_t begin = 0;
+        for (unsigned t = 0; t < used; ++t) {
+          const std::size_t len = base + (t < rem ? 1u : 0u);
+          const std::size_t end = begin + len;
+          ep[t] = nullptr;
+          thr[t] = std::thread([&, t, begin, end]() {
+            try {
+              std::string buf;
+              for (std::size_t i = begin; i < end; ++i) {
+                if (i != begin) buf.push_back(',');
+                detail::dump_escaped(buf, o[i].first);
+                buf.push_back(':');
+                dump_to(buf, o[i].second, /*pretty=*/false, 0);
+              }
+              chunks[t] = std::move(buf);
+            } catch (...) {
+              ep[t] = std::current_exception();
+            }
+          });
+          begin = end;
+        }
+        for (unsigned t = 0; t < used; ++t) {
+          if (thr[t].joinable()) thr[t].join();
+        }
+        for (unsigned t = 0; t < used; ++t) {
+          if (ep[t]) std::rethrow_exception(ep[t]);
+        }
+
+        out.push_back('{');
+        bool first = true;
+        for (unsigned t = 0; t < used; ++t) {
+          if (chunks[t].empty()) continue;
+          if (!first) out.push_back(',');
+          out.append(chunks[t]);
+          first = false;
+        }
+        out.push_back('}');
+        return;
+      }
+    }
+
+    dump_to(out, v, /*pretty=*/false, 0);
+    return;
+  }
+
+  // pretty
+  if (v.type() == value::kind::array) {
+    const auto& a = v.as_array();
+    detail::dump_array_pretty_mt(out, a, /*indent=*/0, /*depth=*/0, opt, threads);
+    return;
+  }
+  if (v.type() == value::kind::object) {
+    const auto& o = v.as_object();
+    detail::dump_object_pretty_mt(out, o, /*indent=*/0, /*depth=*/0, opt, threads);
+    return;
+  }
+
+  dump_to(out, v, /*pretty=*/true, 0);
+}
+
+inline std::string dump_mt(const value& v, dump_mt_options opt = {}) {
+  std::string out;
+  out.reserve(detail::estimate_dump_reserve(v, opt.pretty));
+  dump_to_mt(out, v, opt);
   return out;
 }
 
@@ -1946,6 +2426,19 @@ struct sv_value {
     return v;
   }
 
+  static sv_value number_token_with_double(std::string_view token, double vd) {
+    sv_value v;
+    v.k = kind::number;
+    v.u.num = {};
+    v.u.num.raw_data = nullptr;
+    v.u.num.raw_size_flags = 0;
+    v.u.num.set_is_int(false);
+    v.u.num.set_has_double(true);
+    v.u.num.set_raw_span(token.data(), static_cast<std::uint32_t>(token.size()));
+    v.u.num.set_double_value(vd);
+    return v;
+  }
+
   kind type() const noexcept { return k; }
 
   bool is_null() const noexcept { return k == kind::null; }
@@ -1973,12 +2466,13 @@ struct sv_value {
   double as_double() const {
     if (!is_number()) throw std::runtime_error("chjson: not number");
     const auto& n = u.num;
-    if (n.is_int()) return static_cast<double>(n.int_value());
-    if (n.has_raw()) {
-      if (!n.has_double()) {
-        n.set_double_value(detail::parse_double(std::string_view(n.raw_data, n.raw_size())));
-        n.set_has_double(true);
-      }
+    const std::uint32_t flags = n.raw_size_flags;
+    if ((flags & sv_number_value::k_has_double) != 0) return n.double_value();
+    if ((flags & sv_number_value::k_is_int) != 0) return static_cast<double>(n.int_value());
+    const std::uint32_t raw_n = flags & sv_number_value::k_size_mask;
+    if (n.raw_data != nullptr && raw_n != 0) {
+      n.set_double_value(detail::parse_double(std::string_view(n.raw_data, raw_n)));
+      n.set_has_double(true);
       return n.double_value();
     }
     return n.double_value();
@@ -1988,12 +2482,13 @@ struct sv_value {
   // Undefined behavior if called when !is_number().
   double as_double_unchecked() const noexcept {
     const auto& n = u.num;
-    if (n.is_int()) return static_cast<double>(n.int_value());
-    if (n.has_raw()) {
-      if (!n.has_double()) {
-        n.set_double_value(detail::parse_double(std::string_view(n.raw_data, n.raw_size())));
-        n.set_has_double(true);
-      }
+    const std::uint32_t flags = n.raw_size_flags;
+    if ((flags & sv_number_value::k_has_double) != 0) return n.double_value();
+    if ((flags & sv_number_value::k_is_int) != 0) return static_cast<double>(n.int_value());
+    const std::uint32_t raw_n = flags & sv_number_value::k_size_mask;
+    if (n.raw_data != nullptr && raw_n != 0) {
+      n.set_double_value(detail::parse_double(std::string_view(n.raw_data, raw_n)));
+      n.set_has_double(true);
       return n.double_value();
     }
     return n.double_value();
@@ -2148,13 +2643,35 @@ inline pmr::arena_resource& document_arena_stash() {
   thread_local pmr::arena_resource stash;
   return stash;
 }
+
+struct mt_parse_tls_cache {
+  std::unique_ptr<std::byte[]> backing;
+  std::size_t backing_size{0};
+
+  std::pmr::monotonic_buffer_resource* resources{nullptr};
+  unsigned resources_count{0};
+
+  ~mt_parse_tls_cache() noexcept {
+    if (resources != nullptr) {
+      for (unsigned i = 0; i < resources_count; ++i) resources[i].~monotonic_buffer_resource();
+      ::operator delete[](resources);
+    }
+  }
+};
+
+inline mt_parse_tls_cache& document_mt_parse_stash() {
+  thread_local mt_parse_tls_cache stash;
+  return stash;
+}
 #endif
 } // namespace detail
+
+struct document_parse_result;
 
 class document {
 public:
 #if CHJSON_USE_TLS_PARSE_CACHE
-  document() {
+  document() : mt_parse_resources_(nullptr, mt_parse_resources_deleter{}) {
     // Reuse the last freed buffer on this thread to reduce heap churn for
     // repeated single-shot parse() calls that return a fresh document.
     auto& stash = detail::document_buffer_stash();
@@ -2167,11 +2684,29 @@ public:
     if (arena_stash.bytes_committed() != 0) {
       arena_ = std::move(arena_stash);
     }
+
+    // Optional: reuse MT-parse backing/resources from this thread.
+    // This reduces heap churn for workloads that repeatedly call parse() where
+    // the MT path is taken.
+    auto& mt_stash = detail::document_mt_parse_stash();
+    if (mt_stash.backing_size != 0 && mt_stash.backing) {
+      mt_parse_backing_.swap(mt_stash.backing);
+      mt_parse_backing_size_ = mt_stash.backing_size;
+      mt_stash.backing_size = 0;
+    }
+
+    if (mt_stash.resources != nullptr && mt_stash.resources_count != 0) {
+      std::pmr::monotonic_buffer_resource* p = mt_stash.resources;
+      const unsigned n = mt_stash.resources_count;
+      mt_stash.resources = nullptr;
+      mt_stash.resources_count = 0;
+      mt_parse_resources_ = decltype(mt_parse_resources_)(p, mt_parse_resources_deleter{n});
+    }
   }
 #else
   document() = default;
 #endif
-  explicit document(std::string json) : buffer_(std::move(json)) {}
+  explicit document(std::string json) : buffer_(std::move(json)), mt_parse_resources_(nullptr, mt_parse_resources_deleter{}) {}
 
 #if CHJSON_USE_TLS_PARSE_CACHE
   ~document() noexcept {
@@ -2187,12 +2722,51 @@ public:
 
     // Similarly, cache arena blocks to avoid repeated heap churn for
     // parse() patterns that construct/destroy documents in a tight loop.
-    constexpr std::size_t max_cached_arena = static_cast<std::size_t>(CHJSON_TLS_PARSE_ARENA_MAX);
-    const std::size_t committed = arena_.bytes_committed();
-    if (committed != 0 && committed <= max_cached_arena) {
-      auto& arena_stash = detail::document_arena_stash();
-      if (arena_stash.bytes_committed() < committed) {
-        arena_stash = std::move(arena_);
+    // If this document used MT parse arenas, don't stash the arena: we'd also
+    // need to cache the backing buffer/resources to make it worthwhile.
+    if (!mt_parse_resources_) {
+      constexpr std::size_t max_cached_arena = static_cast<std::size_t>(CHJSON_TLS_PARSE_ARENA_MAX);
+      const std::size_t committed = arena_.bytes_committed();
+      if (committed != 0 && committed <= max_cached_arena) {
+        auto& arena_stash = detail::document_arena_stash();
+        if (arena_stash.bytes_committed() < committed) {
+          arena_stash = std::move(arena_);
+        }
+      }
+    }
+
+    // Cache MT parse backing/resources to reduce allocations for repeated MT parses.
+    // Keep at most one set per thread.
+    if (mt_parse_backing_ || mt_parse_resources_) {
+      auto& mt_stash = detail::document_mt_parse_stash();
+
+      if (mt_parse_backing_) {
+        constexpr std::size_t max_cached_backing = static_cast<std::size_t>(CHJSON_TLS_PARSE_MT_BACKING_MAX);
+        if (mt_parse_backing_size_ != 0 && mt_parse_backing_size_ <= max_cached_backing) {
+          if (mt_stash.backing_size < mt_parse_backing_size_) {
+            mt_stash.backing.swap(mt_parse_backing_);
+            mt_stash.backing_size = mt_parse_backing_size_;
+          }
+        }
+      }
+
+      if (mt_parse_resources_) {
+        const unsigned n = mt_parse_resources_.get_deleter().count;
+        constexpr unsigned max_cached_n = static_cast<unsigned>(CHJSON_TLS_PARSE_MT_RESOURCES_MAX);
+        if (n != 0 && n <= max_cached_n) {
+          if (mt_stash.resources_count < n) {
+            if (mt_stash.resources != nullptr) {
+              for (unsigned i = 0; i < mt_stash.resources_count; ++i) mt_stash.resources[i].~monotonic_buffer_resource();
+              ::operator delete[](mt_stash.resources);
+              mt_stash.resources = nullptr;
+              mt_stash.resources_count = 0;
+            }
+
+            // Transfer ownership out of the document without deleting.
+            mt_stash.resources = mt_parse_resources_.release();
+            mt_stash.resources_count = n;
+          }
+        }
       }
     }
   }
@@ -2204,6 +2778,9 @@ public:
   void clear() noexcept {
     root_ = sv_value(nullptr);
     arena_.clear();
+    mt_parse_resources_.reset();
+    mt_parse_backing_.reset();
+    mt_parse_backing_size_ = 0;
   }
 
   // Replace the underlying buffer content (reusing capacity) and clear arena.
@@ -2239,6 +2816,25 @@ private:
   pmr::arena_resource arena_;
   std::string buffer_;
   sv_value root_;
+
+  // Optional: multithreaded parse backing + per-thread resources.
+  // When non-empty, parts of the DOM may be allocated out of these resources.
+  struct mt_parse_resources_deleter {
+    unsigned count{0};
+    void operator()(std::pmr::monotonic_buffer_resource* p) const noexcept {
+      if (!p) return;
+      for (unsigned i = 0; i < count; ++i) {
+        p[i].~monotonic_buffer_resource();
+      }
+      ::operator delete[](p);
+    }
+  };
+
+  std::unique_ptr<std::pmr::monotonic_buffer_resource, mt_parse_resources_deleter> mt_parse_resources_;
+  std::unique_ptr<std::byte[]> mt_parse_backing_;
+  std::size_t mt_parse_backing_size_{0};
+
+  friend document_parse_result parse(std::string_view json, parse_options opt);
 
   friend struct insitu_parser;
 };
@@ -2578,8 +3174,14 @@ struct view_parser {
     auto* mr = doc->resource();
     auto reserve = [&](std::uint32_t want) {
       if (want <= out.u.a.cap) return;
-      std::uint32_t new_cap = out.u.a.cap ? out.u.a.cap : 1u;
-      while (new_cap < want) new_cap = (new_cap < 1024u) ? (new_cap * 2u) : (new_cap + new_cap / 2u);
+      std::uint32_t new_cap = 0;
+      if (out.u.a.cap == 0) {
+        // First reserve: allocate exactly to avoid overshoot on huge arrays.
+        new_cap = want ? want : 1u;
+      } else {
+        new_cap = out.u.a.cap;
+        while (new_cap < want) new_cap = (new_cap < 1024u) ? (new_cap * 2u) : (new_cap + new_cap / 2u);
+      }
       sv_value* new_data = static_cast<sv_value*>(mr->allocate(sizeof(sv_value) * new_cap, alignof(sv_value)));
       if (out.u.a.data && out.u.a.size) {
         std::memcpy(new_data, out.u.a.data, sizeof(sv_value) * out.u.a.size);
@@ -2588,11 +3190,25 @@ struct view_parser {
       out.u.a.cap = new_cap;
     };
 
-    // Heuristic reserve to reduce reallocations in large arrays.
+    auto is_num_start = [](char c) noexcept {
+      return c == '-' || (c >= '0' && c <= '9');
+    };
+
+    // For top-level arrays that start with a number (e.g. the numbers payload),
+    // reserve using remaining/20 without the old 2M cap to avoid realloc+memcpy
+    // and monotonic arena waste. For other arrays, keep a conservative cap.
     if (depth <= 1) {
       const std::size_t remaining = (i < size) ? (size - i) : 0;
-      const std::size_t guess = remaining / 64u;
-      if (guess >= 16) reserve(static_cast<std::uint32_t>(std::min<std::size_t>(guess, 65536u)));
+      const std::size_t guess = remaining / 20u;
+      if (guess >= 16) {
+        constexpr std::size_t kCap = 2u * 1024u * 1024u;
+        const bool starts_number = (i < size) && is_num_start(buf[i]);
+        const std::size_t want_sz = starts_number ? guess : std::min<std::size_t>(guess, kCap);
+        const std::uint32_t want = (want_sz > static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max()))
+                                     ? std::numeric_limits<std::uint32_t>::max()
+                                     : static_cast<std::uint32_t>(want_sz);
+        reserve(want);
+      }
     } else {
       reserve(16);
     }
@@ -2600,6 +3216,58 @@ struct view_parser {
     if (i < size && buf[i] == ']') {
       ++i;
       return out;
+    }
+
+    // Fast path for number-only arrays (e.g. the numbers payload):
+    // parse floats eagerly to avoid lazy conversion during sum.
+    {
+      detail::skip_ws(buf, size, i);
+      if (i < size && is_num_start(buf[i])) {
+        while (true) {
+          detail::number_value num;
+          const std::size_t start = i;
+          if (!detail::parse_number(buf, size, i, num, /*parse_fp=*/true)) {
+            set_error(e, error_code::invalid_number, start);
+            return nullptr;
+          }
+          if (out.u.a.size == out.u.a.cap) reserve(out.u.a.size + 1u);
+          if (num.is_int) {
+            out.u.a.data[out.u.a.size++] = sv_value::integer(num.i);
+          } else {
+            out.u.a.data[out.u.a.size++] = sv_value::number_token_with_double(std::string_view(buf + start, i - start), num.d);
+          }
+
+          if (i >= size) {
+            set_error(e, error_code::unexpected_eof);
+            return nullptr;
+          }
+
+          // Common case: no whitespace between token and delimiter.
+          char c = buf[i];
+          if (static_cast<unsigned char>(c) <= static_cast<unsigned char>(' ')) {
+            detail::skip_ws(buf, size, i);
+            if (i >= size) {
+              set_error(e, error_code::unexpected_eof);
+              return nullptr;
+            }
+            c = buf[i];
+          }
+
+          if (c == ',') {
+            ++i;
+            if (i < size && is_num_start(buf[i])) continue;
+            detail::skip_ws(buf, size, i);
+            if (i < size && is_num_start(buf[i])) continue;
+            break;
+          }
+          if (c == ']') {
+            ++i;
+            return out;
+          }
+          set_error(e, error_code::expected_comma_or_end, i);
+          return nullptr;
+        }
+      }
     }
 
     while (true) {
@@ -2994,10 +3662,22 @@ struct owning_view_parser {
     auto* mr = doc->resource();
     sv_value out = sv_value::make_array(mr);
 
+    auto is_num_start = [](char c) noexcept {
+      return c == '-' || (c >= '0' && c <= '9');
+    };
+
     if (depth <= 1) {
       const std::size_t remaining = (i < size) ? (size - i) : 0;
-      const std::size_t guess = remaining / 64u;
-      if (guess > 0) out.array_reserve(mr, static_cast<std::uint32_t>(std::min<std::size_t>(guess, 65536u)));
+      const std::size_t guess = remaining / 20u;
+      if (guess > 0) {
+        constexpr std::size_t kCap = 2u * 1024u * 1024u;
+        const bool starts_number = (i < size) && is_num_start(buf[i]);
+        const std::size_t want_sz = starts_number ? guess : std::min<std::size_t>(guess, kCap);
+        const std::uint32_t want = (want_sz > static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max()))
+                                     ? std::numeric_limits<std::uint32_t>::max()
+                                     : static_cast<std::uint32_t>(want_sz);
+        out.array_reserve(mr, want);
+      }
     } else {
       out.array_reserve(mr, 16u);
     }
@@ -3005,6 +3685,56 @@ struct owning_view_parser {
     if (i < size && buf[i] == ']') {
       ++i;
       return out;
+    }
+
+    // Fast path for number-only arrays (e.g. the numbers payload):
+    // eagerly parse floats (no raw token copying) so Parse+sum doesn't pay lazy conversion.
+    {
+      detail::skip_ws(buf, size, i);
+      if (i < size && is_num_start(buf[i])) {
+        while (true) {
+          detail::number_value num;
+          const std::size_t start = i;
+          if (!detail::parse_number(buf, size, i, num, /*parse_fp=*/true)) {
+            set_error(e, error_code::invalid_number, start);
+            return nullptr;
+          }
+          if (num.is_int) {
+            out.array_push_back(mr, sv_value::integer(num.i));
+          } else {
+            out.array_push_back(mr, sv_value::number(num.d));
+          }
+
+          if (i >= size) {
+            set_error(e, error_code::unexpected_eof);
+            return nullptr;
+          }
+
+          char c = buf[i];
+          if (static_cast<unsigned char>(c) <= static_cast<unsigned char>(' ')) {
+            detail::skip_ws(buf, size, i);
+            if (i >= size) {
+              set_error(e, error_code::unexpected_eof);
+              return nullptr;
+            }
+            c = buf[i];
+          }
+
+          if (c == ',') {
+            ++i;
+            if (i < size && is_num_start(buf[i])) continue;
+            detail::skip_ws(buf, size, i);
+            if (i < size && is_num_start(buf[i])) continue;
+            break;
+          }
+          if (c == ']') {
+            ++i;
+            return out;
+          }
+          set_error(e, error_code::expected_comma_or_end, i);
+          return nullptr;
+        }
+      }
     }
 
     while (true) {
@@ -3141,6 +3871,7 @@ struct no_string_parser {
       case 'n': return parse_literal("null", 4, sv_value(nullptr), e);
       case 't': return parse_literal("true", 4, sv_value(true), e);
       case 'f': return parse_literal("false", 5, sv_value(false), e);
+      case '{': return parse_object(depth + 1, e);
       case '[': return parse_array(depth + 1, e);
       default: {
         if (c == '-' || (c >= '0' && c <= '9')) {
@@ -3151,6 +3882,8 @@ struct no_string_parser {
             return nullptr;
           }
           if (num.is_int) return sv_value::integer(num.i);
+          // This fast path parses from a read-only input buffer that is NOT stored in the document.
+          // Do not retain raw token pointers into that buffer.
           return sv_value::number(num.d);
         }
         set_error(e, error_code::invalid_value);
@@ -3182,8 +3915,14 @@ struct no_string_parser {
     auto* mr = doc->resource();
     auto reserve = [&](std::uint32_t want) {
       if (want <= out.u.a.cap) return;
-      std::uint32_t new_cap = out.u.a.cap ? out.u.a.cap : 1u;
-      while (new_cap < want) new_cap = (new_cap < 1024u) ? (new_cap * 2u) : (new_cap + new_cap / 2u);
+      std::uint32_t new_cap = 0;
+      if (out.u.a.cap == 0) {
+        // First reserve: allocate exactly to avoid overshoot on huge arrays.
+        new_cap = want ? want : 1u;
+      } else {
+        new_cap = out.u.a.cap;
+        while (new_cap < want) new_cap = (new_cap < 1024u) ? (new_cap * 2u) : (new_cap + new_cap / 2u);
+      }
       sv_value* new_data = static_cast<sv_value*>(mr->allocate(sizeof(sv_value) * new_cap, alignof(sv_value)));
       if (out.u.a.data && out.u.a.size) {
         std::memcpy(new_data, out.u.a.data, sizeof(sv_value) * out.u.a.size);
@@ -3197,7 +3936,7 @@ struct no_string_parser {
     if (depth <= 1) {
       const std::size_t remaining = (i < size) ? (size - i) : 0;
       const std::size_t guess = remaining / 20u;
-      if (guess >= 16) reserve(static_cast<std::uint32_t>(std::min<std::size_t>(guess, 262144u)));
+      if (guess >= 16) reserve(static_cast<std::uint32_t>(std::min<std::size_t>(guess, 2u * 1024u * 1024u)));
     } else {
       reserve(16);
     }
@@ -3205,6 +3944,70 @@ struct no_string_parser {
     if (i < size && buf[i] == ']') {
       ++i;
       return out;
+    }
+
+    auto is_num_start = [](char c) noexcept {
+      return c == '-' || (c >= '0' && c <= '9');
+    };
+
+    // Fast path for number-heavy arrays (e.g. the numbers benchmark payload):
+    // avoid calling parse_value() per element when the array contains only numbers.
+    // If we encounter a non-number element, fall back to the generic loop.
+    {
+      detail::skip_ws(buf, size, i);
+      if (i < size && is_num_start(buf[i])) {
+        while (true) {
+          detail::number_value num;
+          const std::size_t start = i;
+          if (!detail::parse_number(buf, size, i, num, /*parse_fp=*/true)) {
+            set_error(e, error_code::invalid_number, start);
+            return nullptr;
+          }
+          if (out.u.a.size == out.u.a.cap) reserve(out.u.a.size + 1u);
+          sv_value* dst = &out.u.a.data[out.u.a.size++];
+          dst->k = sv_value::kind::number;
+          dst->u.num.raw_data = nullptr;
+          if (num.is_int) {
+            dst->u.num.raw_size_flags = sv_number_value::k_is_int;
+            dst->u.num.set_int_value(num.i);
+          } else {
+            dst->u.num.raw_size_flags = sv_number_value::k_has_double;
+            dst->u.num.set_double_value(num.d);
+          }
+
+          if (i >= size) {
+            set_error(e, error_code::unexpected_eof);
+            return nullptr;
+          }
+
+          // Common case for number payloads: no whitespace between token and delimiter.
+          char c = buf[i];
+          if (static_cast<unsigned char>(c) <= static_cast<unsigned char>(' ')) {
+            detail::skip_ws(buf, size, i);
+            if (i >= size) {
+              set_error(e, error_code::unexpected_eof);
+              return nullptr;
+            }
+            c = buf[i];
+          }
+
+          if (c == ',') {
+            ++i;
+            // Common case: next token starts immediately.
+            if (i < size && is_num_start(buf[i])) continue;
+            detail::skip_ws(buf, size, i);
+            if (i < size && is_num_start(buf[i])) continue;
+            // Non-number element follows; fall back to the generic path for the rest.
+            break;
+          }
+          if (c == ']') {
+            ++i;
+            return out;
+          }
+          set_error(e, error_code::expected_comma_or_end, i);
+          return nullptr;
+        }
+      }
     }
 
     while (true) {
@@ -3225,6 +4028,29 @@ struct no_string_parser {
       set_error(e, error_code::expected_comma_or_end, i - 1);
       return nullptr;
     }
+  }
+
+  sv_value parse_object(std::size_t depth, error& e) {
+    (void)depth;
+    ++i; // '{'
+    detail::skip_ws(buf, size, i);
+    if (i >= size) {
+      set_error(e, error_code::unexpected_eof);
+      return nullptr;
+    }
+
+    // In the no-string fast path, any non-empty object would necessarily contain
+    // a quoted key, which would have disabled this parser. Therefore we only
+    // accept empty objects here.
+    if (buf[i] != '}') {
+      set_error(e, error_code::expected_key_string);
+      return nullptr;
+    }
+    ++i; // '}'
+    sv_value out;
+    out.k = sv_value::kind::object;
+    out.u.o = {};
+    return out;
   }
 };
 
@@ -3540,11 +4366,25 @@ struct insitu_parser {
       out.u.a.cap = new_cap;
     };
 
-    // Heuristic reserve to reduce reallocations in large arrays.
+    auto is_num_start = [](char c) noexcept {
+      return c == '-' || (c >= '0' && c <= '9');
+    };
+
+    // For top-level arrays that start with a number, reserve using remaining/20
+    // without the old 2M cap to avoid realloc+memcpy and monotonic arena waste.
+    // For other arrays, keep a conservative cap.
     if (depth <= 1) {
       const std::size_t remaining = (i < size) ? (size - i) : 0;
-      const std::size_t guess = remaining / 64u;
-      if (guess >= 16) reserve(static_cast<std::uint32_t>(std::min<std::size_t>(guess, 65536u)));
+      const std::size_t guess = remaining / 20u;
+      if (guess >= 16) {
+        constexpr std::size_t kCap = 2u * 1024u * 1024u;
+        const bool starts_number = (i < size) && is_num_start(buf[i]);
+        const std::size_t want_sz = starts_number ? guess : std::min<std::size_t>(guess, kCap);
+        const std::uint32_t want = (want_sz > static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max()))
+                                     ? std::numeric_limits<std::uint32_t>::max()
+                                     : static_cast<std::uint32_t>(want_sz);
+        reserve(want);
+      }
     } else {
       reserve(16);
     }
@@ -3552,6 +4392,57 @@ struct insitu_parser {
     if (i < size && buf[i] == ']') {
       ++i;
       return out;
+    }
+
+    // Fast path for number-only arrays (e.g. the numbers payload):
+    // parse floats eagerly to avoid lazy conversion during sum.
+    {
+      detail::skip_ws(buf, size, i);
+      if (i < size && is_num_start(buf[i])) {
+        while (true) {
+          detail::number_value num;
+          const std::size_t start = i;
+          if (!detail::parse_number(buf, size, i, num, /*parse_fp=*/true)) {
+            set_error(e, error_code::invalid_number, start);
+            return nullptr;
+          }
+          if (out.u.a.size == out.u.a.cap) reserve(out.u.a.size + 1u);
+          if (num.is_int) {
+            out.u.a.data[out.u.a.size++] = sv_value::integer(num.i);
+          } else {
+            out.u.a.data[out.u.a.size++] = sv_value::number_token_with_double(std::string_view(buf + start, i - start), num.d);
+          }
+
+          if (i >= size) {
+            set_error(e, error_code::unexpected_eof);
+            return nullptr;
+          }
+
+          char c = buf[i];
+          if (static_cast<unsigned char>(c) <= static_cast<unsigned char>(' ')) {
+            detail::skip_ws(buf, size, i);
+            if (i >= size) {
+              set_error(e, error_code::unexpected_eof);
+              return nullptr;
+            }
+            c = buf[i];
+          }
+
+          if (c == ',') {
+            ++i;
+            if (i < size && is_num_start(buf[i])) continue;
+            detail::skip_ws(buf, size, i);
+            if (i < size && is_num_start(buf[i])) continue;
+            break;
+          }
+          if (c == ']') {
+            ++i;
+            return out;
+          }
+          set_error(e, error_code::expected_comma_or_end, i);
+          return nullptr;
+        }
+      }
     }
 
     while (true) {
@@ -3667,6 +4558,42 @@ inline error parse_in_situ_into(document& d, std::string_view json, parse_option
   return p.run_inplace(d);
 }
 
+// Forward declaration for parse_many_into (defined later in this header).
+inline document_parse_result parse(std::string_view json, parse_options opt = {});
+
+// Parse many independent JSON texts in parallel.
+//
+// This is a throughput helper for workloads like "parse N documents".
+// It does not change single-document parsing semantics.
+inline void parse_many_into(document_parse_result* out, const std::string_view* inputs, std::size_t count, parse_many_options options = {}) {
+  if (out == nullptr || inputs == nullptr) return;
+  if (count == 0) return;
+
+  const unsigned threads = detail::effective_threads(options.max_threads);
+  if (threads <= 1 || count == 1) {
+    for (std::size_t i = 0; i < count; ++i) out[i] = parse(inputs[i], options.opt);
+    return;
+  }
+
+  unsigned used = threads;
+  if (used > static_cast<unsigned>(count)) used = static_cast<unsigned>(count);
+
+  const std::size_t base = count / used;
+  const std::size_t rem = count % used;
+  std::unique_ptr<std::future<void>[]> fut(new std::future<void>[used]);
+
+  std::size_t begin = 0;
+  for (unsigned t = 0; t < used; ++t) {
+    const std::size_t len = base + (t < rem ? 1u : 0u);
+    const std::size_t end = begin + len;
+    fut[t] = std::async(std::launch::async, [&, begin, end]() {
+      for (std::size_t i = begin; i < end; ++i) out[i] = parse(inputs[i], options.opt);
+    });
+    begin = end;
+  }
+  for (unsigned t = 0; t < used; ++t) fut[t].get();
+}
+
 // -----------------------------
 // Owning DOM parse API (read-only input, no full input memcpy)
 // -----------------------------
@@ -3699,18 +4626,27 @@ inline document parse_owning_view_or_throw(std::string_view json, parse_options 
 
 // Parses JSON into an owning `document` (arena-backed DOM) and returns it.
 // This replaces the old `value`-tree parse as the default for high throughput.
-inline document_parse_result parse(std::string_view json, parse_options opt = {}) {
-  auto estimate_arena_reserve = [](std::size_t json_bytes) noexcept -> std::size_t {
+inline document_parse_result parse(std::string_view json, parse_options opt) {
+  auto estimate_arena_reserve = [](std::size_t json_bytes, bool no_strings) noexcept -> std::size_t {
     // For parse(dom), most strings/number tokens are views into the internal buffer,
-    // so the arena is dominated by array/object storage. Over-reserving hurts
-    // single-shot throughput (extra large allocation per parse).
+    // so the arena is dominated by array/object storage.
+    //
+    // However, the no-string fast path does not keep a backing buffer, so it
+    // materializes more into the arena (especially number-heavy arrays). Use a
+    // larger multiplier to avoid many growth allocations.
     constexpr std::size_t min_reserve = 64u * 1024u;
-    constexpr std::size_t max_reserve = 8u * 1024u * 1024u;
+    constexpr std::size_t max_reserve = static_cast<std::size_t>(CHJSON_PARSE_DOM_ARENA_RESERVE_MAX);
 
     if (json_bytes == 0) return min_reserve;
 
-    // Reserving ahead reduces heap churn, but keep it conservative for single-shot parse().
-    std::size_t guess = json_bytes * 4u;
+    const std::size_t mult = no_strings ? 2u : 4u;
+    std::size_t guess = json_bytes;
+    if (guess > (std::numeric_limits<std::size_t>::max)() / mult) {
+      guess = max_reserve;
+    } else {
+      guess *= mult;
+    }
+
     if (guess < min_reserve) guess = min_reserve;
     if (guess > max_reserve) guess = max_reserve;
     return guess;
@@ -3723,15 +4659,826 @@ inline document_parse_result parse(std::string_view json, parse_options opt = {}
   // avoids a full memcpy, which dominates Parse+sum(numbers).
   if (CHJSON_PARSE_DOM_NO_STRING_FASTPATH && json.size() != 0 &&
       std::memchr(json.data(), '"', json.size()) == nullptr) {
-    r.doc.arena().reserve_bytes(estimate_arena_reserve(json.size()));
+    r.doc.arena().reserve_bytes(estimate_arena_reserve(json.size(), /*no_strings=*/true));
     no_string_parser p;
     p.opt = opt;
     r.err = p.run_inplace(r.doc, json);
     return r;
   }
 
+  // Default MT parse path (top-level array/object) that avoids allocator locks:
+  // - Copy input into the final document buffer.
+  // - Scan top-level element/member spans.
+  // - Preallocate one backing buffer, split into per-thread slices.
+  // - Parse each slice in parallel, allocating only from that thread's slice.
+  // - Write results into preallocated root storage (no deep-copy).
+  {
+    // Avoid the extra full-buffer scan on small inputs. We'll only attempt the
+    // MT path for large top-level containers, and for that case we fuse
+    // "copy input into document buffer" + "span scan" into a single pass.
+    const unsigned threads = detail::effective_threads(0);
+    if (threads > 1 && json.size() >= static_cast<std::size_t>(CHJSON_PARSE_MT_MIN_BYTES)) {
+      std::size_t top_i = 0;
+      detail::skip_ws(json, top_i);
+      const char top = (top_i < json.size()) ? json[top_i] : '\0';
+
+      if (top == '[' || top == '{') {
+        // Prepare document for in-situ parse without resetting MT buffers.
+        r.doc.reserve_buffer(json.size());
+        r.doc.root() = sv_value(nullptr);
+        r.doc.arena().clear();
+        r.doc.buffer_.resize(json.size());
+
+        char* dst = r.doc.buffer_.data();
+        const char* in = json.data();
+        const std::size_t nbytes = json.size();
+        const std::string_view src(dst, nbytes);
+
+        const std::size_t min_avg = static_cast<std::size_t>(CHJSON_PARSE_MT_MIN_AVG_SPAN_BYTES);
+        const std::size_t max_spans_for_avg = (min_avg == 0) ? (std::numeric_limits<std::size_t>::max)()
+                         : (std::max<std::size_t>(1u, nbytes / min_avg));
+
+        auto set_err_abs = [&](error_code code, std::size_t abs_off) {
+          r.err.code = code;
+          r.err.offset = abs_off;
+          detail::update_line_col(src, abs_off, r.err.line, r.err.column);
+        };
+
+        auto trim_ws_span = [&](std::size_t& b, std::size_t& e) {
+          while (b < e && detail::is_ws(src[b])) ++b;
+          while (e > b && detail::is_ws(src[e - 1])) --e;
+        };
+
+        // Collect spans for top-level elements/members.
+        std::vector<std::pair<std::size_t, std::size_t>> spans;
+        spans.reserve(128);
+
+        const std::size_t open = top_i;
+        std::size_t first = open + 1;
+        detail::skip_ws(json, first);
+        if (first >= json.size()) {
+          // Still copy the buffer for consistent offsets.
+          std::memcpy(dst, in, nbytes);
+          set_err_abs(error_code::unexpected_eof, json.size());
+          return r;
+        }
+
+        const char close_ch = (top == '[') ? ']' : '}';
+
+        // Copy + scan in a single pass.
+        std::size_t cur = first;
+        bool in_str = false;
+        int depth = 1;
+        bool closed = false;
+        std::size_t close_pos = std::numeric_limits<std::size_t>::max();
+        bool mt_abort = false;
+
+        // Copy the prefix [0, first) upfront (no scanning work needed there).
+        if (first > 0) std::memcpy(dst, in, first);
+
+#if CHJSON_PARSE_MT_SCAN_SIMD && (defined(_M_X64) || defined(__SSE2__) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2))
+        #include <emmintrin.h>
+#endif
+
+        std::size_t pos = first;
+        while (pos < nbytes) {
+          if (mt_abort) {
+            std::memcpy(dst + pos, in + pos, nbytes - pos);
+            break;
+          }
+          if (closed) {
+            // Copy the remainder and stop scanning.
+            std::memcpy(dst + pos, in + pos, nbytes - pos);
+            break;
+          }
+
+          if (in_str) {
+            // Fast-skip string content by jumping to the next '"' using memchr.
+            // Only take a small slow-path when we see an escaped quote.
+            const char* p = in + pos;
+            const char* endp = in + nbytes;
+            while (true) {
+              const void* qv = std::memchr(p, '"', static_cast<std::size_t>(endp - p));
+              if (qv == nullptr) {
+                std::memcpy(dst + pos, in + pos, nbytes - pos);
+                set_err_abs(error_code::unexpected_eof, nbytes);
+                return r;
+              }
+              const char* q = static_cast<const char*>(qv);
+              const std::size_t qpos = static_cast<std::size_t>(q - in);
+
+              std::memcpy(dst + pos, in + pos, (qpos + 1) - pos);
+
+              // Count consecutive backslashes immediately preceding the quote.
+              std::size_t bs = 0;
+              std::size_t k = qpos;
+              while (k > 0 && k > open && in[k - 1] == '\\') {
+                ++bs;
+                --k;
+              }
+
+              pos = qpos + 1;
+              if ((bs & 1u) == 0u) {
+                in_str = false;
+                break;
+              }
+
+              // Escaped quote: continue scanning from after it.
+              p = in + pos;
+              if (p >= endp) {
+                set_err_abs(error_code::unexpected_eof, nbytes);
+                return r;
+              }
+            }
+            continue;
+          }
+
+          // Not in string: SIMD-skip blocks with no special characters.
+#if CHJSON_PARSE_MT_SCAN_SIMD && (defined(_M_X64) || defined(__SSE2__) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2))
+          if (pos + 16 <= nbytes) {
+            const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(in + pos));
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + pos), v);
+
+            const __m128i q = _mm_cmpeq_epi8(v, _mm_set1_epi8('"'));
+            const __m128i lb = _mm_cmpeq_epi8(v, _mm_set1_epi8('['));
+            const __m128i rb = _mm_cmpeq_epi8(v, _mm_set1_epi8(']'));
+            const __m128i lc = _mm_cmpeq_epi8(v, _mm_set1_epi8('{'));
+            const __m128i rc = _mm_cmpeq_epi8(v, _mm_set1_epi8('}'));
+            const __m128i cm = _mm_cmpeq_epi8(v, _mm_set1_epi8(','));
+
+            const __m128i any = _mm_or_si128(_mm_or_si128(_mm_or_si128(q, lb), _mm_or_si128(rb, lc)), _mm_or_si128(rc, cm));
+            const int mask = _mm_movemask_epi8(any);
+            if (mask == 0) {
+              pos += 16;
+              continue;
+            }
+
+            // Slow path within this 16-byte block: handle only interesting bytes.
+            for (int off = 0; off < 16; ++off) {
+              const std::size_t i2 = pos + static_cast<std::size_t>(off);
+              const char c = in[i2];
+
+              if (c == '"') {
+                in_str = true;
+                pos = i2 + 1;
+                break;
+              }
+
+              if (c == '[' || c == '{') {
+                ++depth;
+                continue;
+              }
+              if (c == ']' || c == '}') {
+                --depth;
+                if (depth == 0 && c == close_ch) {
+                  std::size_t b = cur;
+                  std::size_t e = i2;
+                  trim_ws_span(b, e);
+                  if (b == e) {
+                    set_err_abs(top == '[' ? error_code::invalid_value : error_code::expected_key_string, b);
+                    return r;
+                  }
+                  spans.emplace_back(b, e);
+                  close_pos = i2;
+                  closed = true;
+                  pos = i2 + 1;
+                  break;
+                }
+                continue;
+              }
+
+              if (c == ',' && depth == 1) {
+                std::size_t b = cur;
+                std::size_t e = i2;
+                trim_ws_span(b, e);
+                if (b == e) {
+                  set_err_abs(top == '[' ? error_code::invalid_value : error_code::expected_key_string, b);
+                  return r;
+                }
+                spans.emplace_back(b, e);
+                if (spans.size() > max_spans_for_avg) {
+                  // MT thresholds are now impossible (avg_span would be < min_avg).
+                  // Stop scanning early and fall back to single-thread parse.
+                  mt_abort = true;
+                  pos = i2 + 1;
+                  break;
+                }
+                cur = i2 + 1;
+                continue;
+              }
+            }
+
+            if (mt_abort) {
+              std::memcpy(dst + pos, in + pos, nbytes - pos);
+              break;
+            }
+
+            // If we didn't break out (still not in_str and not closed), advance past the block.
+            if (!in_str && !closed) pos += 16;
+            continue;
+          }
+#endif
+
+          // Scalar tail / fallback.
+          const char c = in[pos];
+          dst[pos] = c;
+          if (c == '"') {
+            in_str = true;
+            ++pos;
+            continue;
+          }
+
+          if (c == '[' || c == '{') {
+            ++depth;
+            ++pos;
+            continue;
+          }
+          if (c == ']' || c == '}') {
+            --depth;
+            if (depth == 0 && c == close_ch) {
+              std::size_t b = cur;
+              std::size_t e = pos;
+              trim_ws_span(b, e);
+              if (b == e) {
+                set_err_abs(top == '[' ? error_code::invalid_value : error_code::expected_key_string, b);
+                return r;
+              }
+              spans.emplace_back(b, e);
+              close_pos = pos;
+              closed = true;
+            }
+            ++pos;
+            continue;
+          }
+
+          if (c == ',' && depth == 1) {
+            std::size_t b = cur;
+            std::size_t e = pos;
+            trim_ws_span(b, e);
+            if (b == e) {
+              set_err_abs(top == '[' ? error_code::invalid_value : error_code::expected_key_string, b);
+              return r;
+            }
+            spans.emplace_back(b, e);
+            if (spans.size() > max_spans_for_avg) {
+              mt_abort = true;
+              ++pos;
+              std::memcpy(dst + pos, in + pos, nbytes - pos);
+              break;
+            }
+            cur = pos + 1;
+            ++pos;
+            continue;
+          }
+
+          ++pos;
+        }
+
+        if (mt_abort) {
+          // MT thresholds are impossible: parse in-situ on the already-copied buffer.
+          r.doc.arena().reserve_bytes(estimate_arena_reserve(json.size(), /*no_strings=*/false));
+          insitu_parser p;
+          p.opt = opt;
+          r.err = p.run_inplace(r.doc);
+          return r;
+        }
+
+        if (!closed) {
+          set_err_abs(error_code::unexpected_eof, src.size());
+          return r;
+        }
+
+        // Validate trailing characters if required.
+        std::size_t end = close_pos + 1;
+        detail::skip_ws(src, end);
+        if (opt.require_eof && end != src.size()) {
+          set_err_abs(error_code::trailing_characters, end);
+          return r;
+        }
+
+        // Heuristic: only parallelize if there is enough work.
+        // MT parse has fixed overheads (task launch, alloc/init), so keep it conservative.
+        const std::size_t spans_count = spans.size();
+        const std::size_t total_bytes = src.size();
+        const std::size_t avg_span = (spans_count == 0) ? 0 : (total_bytes / spans_count);
+        if (spans_count >= static_cast<std::size_t>(CHJSON_PARSE_MT_MIN_SPANS) &&
+            avg_span >= static_cast<std::size_t>(CHJSON_PARSE_MT_MIN_AVG_SPAN_BYTES)) {
+        unsigned used = threads;
+        if (used > static_cast<unsigned>(spans_count)) used = static_cast<unsigned>(spans_count);
+
+        // Lock-free-ish MT parse: threads only allocate from pre-sized per-thread slices.
+        // No heap fallback inside worker threads.
+        constexpr unsigned k_max_mt_retries = 2;
+        for (unsigned attempt = 0; attempt < k_max_mt_retries; ++attempt) {
+          // Allocate one backing buffer and split it into per-thread slices.
+          // Keep it conservative: the DOM arena demand is typically <= ~4x input.
+          std::size_t total = estimate_arena_reserve(src.size(), /*no_strings=*/false);
+          if (attempt != 0) total *= 2;
+          const std::size_t per = (used == 0) ? total : (total / used);
+          const std::size_t align = alignof(std::max_align_t);
+          const std::size_t slice = ((per + align - 1) / align) * align;
+          const std::size_t backing = slice * static_cast<std::size_t>(used);
+
+          // Reuse MT backing/resources if possible to avoid per-parse allocations.
+          if (!r.doc.mt_parse_backing_ || r.doc.mt_parse_backing_size_ < backing) {
+            r.doc.mt_parse_backing_.reset(new std::byte[backing]);
+            r.doc.mt_parse_backing_size_ = backing;
+          }
+
+          unsigned res_cap = 0;
+          if (r.doc.mt_parse_resources_) res_cap = r.doc.mt_parse_resources_.get_deleter().count;
+          if (res_cap < used) {
+            auto* raw = static_cast<std::pmr::monotonic_buffer_resource*>(
+                ::operator new[](sizeof(std::pmr::monotonic_buffer_resource) * static_cast<std::size_t>(used)));
+            r.doc.mt_parse_resources_ = decltype(r.doc.mt_parse_resources_)(raw, document::mt_parse_resources_deleter{used});
+            res_cap = used;
+          }
+
+          auto* res = r.doc.mt_parse_resources_.get();
+          for (unsigned t = 0; t < used; ++t) {
+            void* base = r.doc.mt_parse_backing_.get() + static_cast<std::size_t>(t) * slice;
+            // Reset by rebuilding with a fresh initial buffer.
+            res[t].~monotonic_buffer_resource();
+            new (res + t) std::pmr::monotonic_buffer_resource(base, slice, std::pmr::null_memory_resource());
+          }
+
+          // Root container storage lives in the document arena (single-thread allocate).
+          // Publish size only after successful parse to avoid exposing partially-initialized slots.
+          if (top == '[') {
+            sv_value root = sv_value::make_array(r.doc.resource());
+            root.array_reserve(r.doc.resource(), static_cast<std::uint32_t>(spans_count));
+            root.u.a.size = 0;
+            r.doc.root() = root;
+          } else {
+            sv_value root = sv_value::make_object(r.doc.resource());
+            root.object_reserve(r.doc.resource(), static_cast<std::uint32_t>(spans_count));
+            root.u.o.size = 0;
+            r.doc.root() = root;
+          }
+
+          sv_value* array_out = nullptr;
+          sv_member* object_out = nullptr;
+          if (top == '[') {
+            array_out = r.doc.root().u.a.data;
+          } else {
+            object_out = r.doc.root().u.o.data;
+          }
+
+        // Read-only parser that allocates only on escapes/containers.
+        struct readonly_parser {
+          std::pmr::memory_resource* mr{nullptr};
+          std::string_view s;
+          const char* buf{nullptr};
+          std::size_t size{0};
+          std::size_t i{0};
+          parse_options opt;
+
+          void set_error(error& e, error_code code, std::size_t at = std::numeric_limits<std::size_t>::max()) {
+            if (e) return;
+            e.code = code;
+            e.offset = (at == std::numeric_limits<std::size_t>::max()) ? i : at;
+            detail::update_line_col(s, e.offset, e.line, e.column);
+          }
+
+          sv_value parse_literal(const char* lit, std::size_t len, sv_value v, error& e) {
+            if (i + len > size) {
+              set_error(e, error_code::unexpected_eof);
+              return nullptr;
+            }
+            if (std::memcmp(buf + i, lit, len) != 0) {
+              set_error(e, error_code::invalid_value);
+              return nullptr;
+            }
+            i += len;
+            return v;
+          }
+
+          bool parse_string(std::string_view& out, error& e) {
+            if (i >= size || buf[i] != '"') {
+              set_error(e, error_code::invalid_string);
+              return false;
+            }
+            const std::size_t quote_pos = i;
+            ++i;
+            const std::size_t start = i;
+
+            // Fast scan for unescaped strings.
+            while (i < size) {
+              const unsigned char uc = static_cast<unsigned char>(buf[i]);
+              const char c = buf[i];
+              if (c == '"') {
+                out = std::string_view(buf + start, i - start);
+                ++i;
+                return true;
+              }
+              if (c == '\\') break;
+              if (uc <= 0x1F) {
+                set_error(e, error_code::invalid_string, i);
+                return false;
+              }
+              ++i;
+            }
+
+            // Escaped: two-pass decode into the arena.
+            const std::size_t first_escape = i;
+            std::size_t end_quote = std::numeric_limits<std::size_t>::max();
+            {
+              std::size_t scan = first_escape;
+              while (scan < size) {
+                const unsigned char uc = static_cast<unsigned char>(buf[scan]);
+                const char c = buf[scan++];
+                if (c == '"') {
+                  end_quote = scan - 1;
+                  break;
+                }
+                if (c == '\\') {
+                  if (scan >= size) {
+                    set_error(e, error_code::unexpected_eof, quote_pos);
+                    return false;
+                  }
+                  const char esc = buf[scan++];
+                  if (esc == 'u') {
+                    if (scan + 4 > size) {
+                      set_error(e, error_code::unexpected_eof, quote_pos);
+                      return false;
+                    }
+                    scan += 4;
+                  }
+                  continue;
+                }
+                if (uc <= 0x1F) {
+                  set_error(e, error_code::invalid_string, scan - 1);
+                  return false;
+                }
+              }
+            }
+
+            if (end_quote == std::numeric_limits<std::size_t>::max()) {
+              set_error(e, error_code::unexpected_eof, quote_pos);
+              return false;
+            }
+
+            const std::size_t raw_len = end_quote - start;
+            char* dst = (raw_len != 0) ? static_cast<char*>(mr->allocate(raw_len, alignof(char))) : nullptr;
+            std::size_t rpos = start;
+            std::size_t wpos = 0;
+            while (rpos < end_quote) {
+              const unsigned char uc = static_cast<unsigned char>(buf[rpos]);
+              const char c = buf[rpos++];
+              if (c == '\\') {
+                if (rpos >= end_quote) {
+                  set_error(e, error_code::unexpected_eof, quote_pos);
+                  return false;
+                }
+                const char esc = buf[rpos++];
+                switch (esc) {
+                  case '"': dst[wpos++] = '"'; break;
+                  case '\\': dst[wpos++] = '\\'; break;
+                  case '/': dst[wpos++] = '/'; break;
+                  case 'b': dst[wpos++] = '\b'; break;
+                  case 'f': dst[wpos++] = '\f'; break;
+                  case 'n': dst[wpos++] = '\n'; break;
+                  case 'r': dst[wpos++] = '\r'; break;
+                  case 't': dst[wpos++] = '\t'; break;
+                  case 'u': {
+                    std::uint32_t cp = 0;
+                    if (!detail::parse_u4_insitu(buf, size, rpos, cp)) {
+                      set_error(e, error_code::invalid_unicode_escape, rpos);
+                      return false;
+                    }
+                    if (cp >= 0xD800u && cp <= 0xDBFFu) {
+                      if (rpos + 2 > size || buf[rpos] != '\\' || buf[rpos + 1] != 'u') {
+                        set_error(e, error_code::invalid_utf16_surrogate, rpos);
+                        return false;
+                      }
+                      rpos += 2;
+                      std::uint32_t low = 0;
+                      if (!detail::parse_u4_insitu(buf, size, rpos, low)) {
+                        set_error(e, error_code::invalid_unicode_escape, rpos);
+                        return false;
+                      }
+                      if (low < 0xDC00u || low > 0xDFFFu) {
+                        set_error(e, error_code::invalid_utf16_surrogate, rpos);
+                        return false;
+                      }
+                      const std::uint32_t hi = cp - 0xD800u;
+                      const std::uint32_t lo = low - 0xDC00u;
+                      cp = 0x10000u + ((hi << 10) | lo);
+                    } else if (cp >= 0xDC00u && cp <= 0xDFFFu) {
+                      set_error(e, error_code::invalid_utf16_surrogate, rpos);
+                      return false;
+                    }
+                    detail::write_utf8_insitu(dst, wpos, cp);
+                    break;
+                  }
+                  default:
+                    set_error(e, error_code::invalid_escape, rpos - 1);
+                    return false;
+                }
+                continue;
+              }
+              if (uc <= 0x1F) {
+                set_error(e, error_code::invalid_string, rpos - 1);
+                return false;
+              }
+              dst[wpos++] = c;
+            }
+
+            out = std::string_view(dst, wpos);
+            i = end_quote + 1;
+            return true;
+          }
+
+          sv_value parse_value(std::size_t depth, error& e) {
+            if (depth > opt.max_depth) {
+              set_error(e, error_code::nesting_too_deep);
+              return nullptr;
+            }
+            if (i >= size) {
+              set_error(e, error_code::unexpected_eof);
+              return nullptr;
+            }
+
+            const char c = buf[i];
+            switch (c) {
+              case 'n': return parse_literal("null", 4, sv_value(nullptr), e);
+              case 't': return parse_literal("true", 4, sv_value(true), e);
+              case 'f': return parse_literal("false", 5, sv_value(false), e);
+              case '"': {
+                std::string_view out;
+                if (!parse_string(out, e)) return nullptr;
+                return sv_value(out);
+              }
+              case '[': return parse_array(depth + 1, e);
+              case '{': return parse_object(depth + 1, e);
+              default: {
+                if (c == '-' || (c >= '0' && c <= '9')) {
+                  detail::number_value num;
+                  const std::size_t start = i;
+                  if (!detail::parse_number(buf, size, i, num, /*parse_fp=*/false)) {
+                    set_error(e, error_code::invalid_number, start);
+                    return nullptr;
+                  }
+                  if (num.is_int) return sv_value::integer(num.i);
+                  return sv_value::number_token(std::string_view(buf + start, i - start));
+                }
+                set_error(e, error_code::invalid_value);
+                return nullptr;
+              }
+            }
+          }
+
+          sv_value parse_array(std::size_t depth, error& e) {
+            ++i; // '['
+            detail::skip_ws(buf, size, i);
+            sv_value out = sv_value::make_array(mr);
+
+            if (i < size && buf[i] == ']') {
+              ++i;
+              return out;
+            }
+
+            // Conservative reserve.
+            out.array_reserve(mr, 16u);
+
+            while (true) {
+              detail::skip_ws(buf, size, i);
+              sv_value elem = parse_value(depth, e);
+              if (e) return nullptr;
+              out.array_push_back(mr, std::move(elem));
+
+              detail::skip_ws(buf, size, i);
+              if (i >= size) {
+                set_error(e, error_code::unexpected_eof);
+                return nullptr;
+              }
+              const char c = buf[i++];
+              if (c == ',') continue;
+              if (c == ']') return out;
+              set_error(e, error_code::expected_comma_or_end, i - 1);
+              return nullptr;
+            }
+          }
+
+          sv_value parse_object(std::size_t depth, error& e) {
+            ++i; // '{'
+            detail::skip_ws(buf, size, i);
+            sv_value out = sv_value::make_object(mr);
+            (void)depth;
+            out.object_reserve(mr, 8u);
+
+            if (i < size && buf[i] == '}') {
+              ++i;
+              return out;
+            }
+
+            while (true) {
+              detail::skip_ws(buf, size, i);
+              if (i >= size) {
+                set_error(e, error_code::unexpected_eof);
+                return nullptr;
+              }
+              if (buf[i] != '"') {
+                set_error(e, error_code::expected_key_string);
+                return nullptr;
+              }
+
+              std::string_view key;
+              if (!parse_string(key, e)) return nullptr;
+
+              detail::skip_ws(buf, size, i);
+              if (i >= size) {
+                set_error(e, error_code::unexpected_eof);
+                return nullptr;
+              }
+              if (buf[i] != ':') {
+                set_error(e, error_code::expected_colon);
+                return nullptr;
+              }
+              ++i;
+
+              detail::skip_ws(buf, size, i);
+              sv_value v = parse_value(depth, e);
+              if (e) return nullptr;
+              out.object_emplace_back(mr, key, std::move(v));
+
+              detail::skip_ws(buf, size, i);
+              if (i >= size) {
+                set_error(e, error_code::unexpected_eof);
+                return nullptr;
+              }
+              const char c = buf[i++];
+              if (c == ',') continue;
+              if (c == '}') return out;
+              set_error(e, error_code::expected_comma_or_end, i - 1);
+              return nullptr;
+            }
+          }
+        };
+
+        std::unique_ptr<std::thread[]> thr(new std::thread[used]);
+        std::unique_ptr<error[]> errs(new error[used]);
+        std::unique_ptr<std::size_t[]> err_abs(new std::size_t[used]);
+        std::unique_ptr<unsigned char[]> built(new unsigned char[spans_count]);
+        for (unsigned t = 0; t < used; ++t) {
+          errs[t] = {};
+          err_abs[t] = std::numeric_limits<std::size_t>::max();
+        }
+        std::memset(built.get(), 0, spans_count);
+
+        const std::size_t n = spans.size();
+        const std::size_t base = n / used;
+        const std::size_t rem = n % used;
+        std::size_t begin = 0;
+        for (unsigned t = 0; t < used; ++t) {
+          const std::size_t len = base + (t < rem ? 1u : 0u); 
+          const std::size_t end = begin + len;
+          thr[t] = std::thread([&, t, begin, end]() {
+            readonly_parser p;
+            p.mr = r.doc.mt_parse_resources_.get() + t;
+            p.opt = opt;
+
+            try {
+              for (std::size_t idx = begin; idx < end; ++idx) {
+                const auto [b, e] = spans[idx];
+                const std::string_view slice(src.data() + b, e - b);
+                p.s = slice;
+                p.buf = slice.data();
+                p.size = slice.size();
+                p.i = 0;
+
+                error err;
+                detail::skip_ws(p.buf, p.size, p.i);
+                if (top == '[') {
+                  // element is inside the outer array => depth=1
+                  sv_value v = p.parse_value(1, err);
+                  if (err) {
+                    errs[t] = err;
+                    err_abs[t] = b + err.offset;
+                    return;
+                  }
+                  detail::skip_ws(p.buf, p.size, p.i);
+                  if (opt.require_eof && p.i != p.size) {
+                    errs[t].code = error_code::expected_comma_or_end;
+                    errs[t].offset = p.i;
+                    err_abs[t] = b + p.i;
+                    return;
+                  }
+                  // Write into preallocated root storage.
+                  new (array_out + idx) sv_value(std::move(v));
+                  built[idx] = 1;
+                } else {
+                  // member: parse key ':' value
+                  if (p.i >= p.size || p.buf[p.i] != '"') {
+                    errs[t].code = error_code::expected_key_string;
+                    errs[t].offset = p.i;
+                    err_abs[t] = b + p.i;
+                    return;
+                  }
+                  std::string_view key;
+                  if (!p.parse_string(key, err)) {
+                    errs[t] = err;
+                    err_abs[t] = b + err.offset;
+                    return;
+                  }
+                  detail::skip_ws(p.buf, p.size, p.i);
+                  if (p.i >= p.size || p.buf[p.i] != ':') {
+                    errs[t].code = error_code::expected_colon;
+                    errs[t].offset = p.i;
+                    err_abs[t] = b + p.i;
+                    return;
+                  }
+                  ++p.i;
+                  detail::skip_ws(p.buf, p.size, p.i);
+                  sv_value v = p.parse_value(1, err);
+                  if (err) {
+                    errs[t] = err;
+                    err_abs[t] = b + err.offset;
+                    return;
+                  }
+                  detail::skip_ws(p.buf, p.size, p.i);
+                  if (opt.require_eof && p.i != p.size) {
+                    errs[t].code = error_code::expected_comma_or_end;
+                    errs[t].offset = p.i;
+                    err_abs[t] = b + p.i;
+                    return;
+                  }
+                  new (object_out + idx) sv_member{key, std::move(v)};
+                  built[idx] = 1;
+                }
+              }
+            } catch (const std::bad_alloc&) {
+              errs[t].code = error_code::out_of_memory;
+              errs[t].offset = 0;
+              err_abs[t] = 0;
+              return;
+            } catch (...) {
+              errs[t].code = error_code::out_of_memory;
+              errs[t].offset = 0;
+              err_abs[t] = 0;
+              return;
+            }
+          });
+          begin = end;
+        }
+
+        for (unsigned t = 0; t < used; ++t) {
+          if (thr[t].joinable()) thr[t].join();
+        }
+
+        // Report earliest error.
+        std::size_t best_off = std::numeric_limits<std::size_t>::max();
+        error best_err;
+        for (unsigned t = 0; t < used; ++t) {
+          if (errs[t] && err_abs[t] < best_off) {
+            best_off = err_abs[t];
+            best_err = errs[t];
+          }
+        }
+        if (best_off != std::numeric_limits<std::size_t>::max()) {
+          // Clean up constructed root slots so retries/fallback don't overwrite live objects.
+          if (top == '[') {
+            for (std::size_t idx = 0; idx < spans_count; ++idx) {
+              if (built[idx]) (array_out + idx)->~sv_value();
+            }
+          } else {
+            for (std::size_t idx = 0; idx < spans_count; ++idx) {
+              if (built[idx]) (object_out + idx)->~sv_member();
+            }
+          }
+
+          if (best_err.code == error_code::out_of_memory && attempt + 1 < k_max_mt_retries) {
+            // Retry with larger per-thread slices.
+            continue;
+          }
+          set_err_abs(best_err.code, best_off);
+          return r;
+        }
+
+        if (top == '[') {
+          r.doc.root().u.a.size = static_cast<std::uint32_t>(spans_count);
+        } else {
+          r.doc.root().u.o.size = static_cast<std::uint32_t>(spans_count);
+        }
+
+        r.err = {};
+        return r;
+        }
+      }
+
+        // MT thresholds not met: parse in-situ on the already-copied buffer.
+        r.doc.arena().reserve_bytes(estimate_arena_reserve(json.size(), /*no_strings=*/false));
+        insitu_parser p;
+        p.opt = opt;
+        r.err = p.run_inplace(r.doc);
+        return r;
+      }
+    }
+  }
+
+  // Fallback: keep existing single-thread behavior.
   r.doc.reserve_buffer(json.size());
-  r.doc.arena().reserve_bytes(estimate_arena_reserve(json.size()));
+  r.doc.arena().reserve_bytes(estimate_arena_reserve(json.size(), /*no_strings=*/false));
   r.err = parse_in_situ_into(r.doc, json, opt);
   return r;
 }
@@ -3884,6 +5631,9 @@ inline void dump_to(std::string& out, const sv_value& v, bool pretty = false, in
   }
 }
 
+// Forward declaration: forced-mt dump() wrapper calls this.
+inline void dump_to_mt(std::string& out, const sv_value& v, dump_mt_options opt);
+
 inline std::string dump(const sv_value& v, bool pretty = false) {
   struct dump_reserve_hints {
     std::size_t compact{256};
@@ -3894,7 +5644,15 @@ inline std::string dump(const sv_value& v, bool pretty = false) {
   std::string out;
   std::size_t& hint = pretty ? hints.pretty : hints.compact;
   out.reserve(hint);
-  dump_to(out, v, pretty, 0);
+
+  // Default dump(): use the MT-aware dumper.
+  // It will only parallelize when the top-level container is large enough.
+  dump_mt_options opt;
+  opt.pretty = pretty;
+  opt.max_threads = 0;
+  opt.min_parallel_items = 1024;
+  opt.max_parallel_depth = 1;
+  dump_to_mt(out, v, opt);
 
   constexpr std::size_t min_hint = 256;
   constexpr std::size_t max_hint = 16u * 1024u * 1024u;
@@ -3903,4 +5661,246 @@ inline std::string dump(const sv_value& v, bool pretty = false) {
   return out;
 }
 
+// Multithreaded dump for arena-backed DOM values (sv_value).
+inline void dump_to_mt(std::string& out, const sv_value& v, dump_mt_options opt = {}) {
+  // Fast reject: only parallelize top-level arrays/objects that are large enough.
+  // Avoids per-call async/scheduler overhead for tiny payloads in hot loops.
+  if (opt.max_parallel_depth == 0) {
+    dump_to(out, v, opt.pretty, 0);
+    return;
+  }
+
+  if (v.type() == sv_value::kind::array) {
+    if (v.u.a.size < opt.min_parallel_items) {
+      dump_to(out, v, opt.pretty, 0);
+      return;
+    }
+  } else if (v.type() == sv_value::kind::object) {
+    if (v.u.o.size < opt.min_parallel_items) {
+      dump_to(out, v, opt.pretty, 0);
+      return;
+    }
+  } else {
+    dump_to(out, v, opt.pretty, 0);
+    return;
+  }
+
+  const unsigned threads = detail::effective_threads(opt.max_threads);
+  if (threads <= 1) {
+    dump_to(out, v, opt.pretty, 0);
+    return;
+  }
+
+  struct mt_ctx {
+    std::vector<std::string> chunks;
+    std::vector<std::future<void>> fut;
+  };
+  thread_local mt_ctx ctx;
+
+  // Only parallelize top-level array/object; nested parallelism is limited by opt.max_parallel_depth.
+  // Primitive values fall back to the existing single-thread code.
+  struct mt {
+    static void dump_value(std::string& out, const sv_value& v, int indent, unsigned depth, const dump_mt_options& opt, unsigned threads, mt_ctx& ctx) {
+      if (!opt.pretty) {
+        if (v.type() == sv_value::kind::array) {
+          const auto& a = v.as_array();
+          if (detail::should_parallelize_container(a.size(), depth, opt, threads)) {
+            const unsigned used = threads > static_cast<unsigned>(a.size()) ? static_cast<unsigned>(a.size()) : threads;
+            ctx.chunks.resize(used);
+            const std::size_t n = a.size();
+            const std::size_t base = n / used;
+            const std::size_t rem = n % used;
+            ctx.fut.resize(used);
+            std::size_t begin = 0;
+            for (unsigned t = 0; t < used; ++t) {
+              const std::size_t len = base + (t < rem ? 1u : 0u);
+              const std::size_t end = begin + len;
+              ctx.fut[t] = std::async(std::launch::async, [&, t, begin, end]() {
+                std::string buf;
+                buf.reserve((end - begin) * 80u);
+                for (std::size_t i = begin; i < end; ++i) {
+                  if (i != begin) buf.push_back(',');
+                  dump_to(buf, a[i], /*pretty=*/false, 0);
+                }
+                ctx.chunks[t] = std::move(buf);
+              });
+              begin = end;
+            }
+            for (unsigned t = 0; t < used; ++t) ctx.fut[t].get();
+            out.push_back('[');
+            bool first = true;
+            for (unsigned t = 0; t < used; ++t) {
+              if (ctx.chunks[t].empty()) continue;
+              if (!first) out.push_back(',');
+              out.append(ctx.chunks[t]);
+              first = false;
+            }
+            out.push_back(']');
+            return;
+          }
+        } else if (v.type() == sv_value::kind::object) {
+          const auto& o = v.as_object();
+          if (detail::should_parallelize_container(o.size(), depth, opt, threads)) {
+            const unsigned used = threads > static_cast<unsigned>(o.size()) ? static_cast<unsigned>(o.size()) : threads;
+            ctx.chunks.resize(used);
+            const std::size_t n = o.size();
+            const std::size_t base = n / used;
+            const std::size_t rem = n % used;
+            ctx.fut.resize(used);
+            std::size_t begin = 0;
+            for (unsigned t = 0; t < used; ++t) {
+              const std::size_t len = base + (t < rem ? 1u : 0u);
+              const std::size_t end = begin + len;
+              ctx.fut[t] = std::async(std::launch::async, [&, t, begin, end]() {
+                std::string buf;
+                buf.reserve((end - begin) * 96u);
+                for (std::size_t i = begin; i < end; ++i) {
+                  if (i != begin) buf.push_back(',');
+                  detail::dump_escaped(buf, o[i].first);
+                  buf.push_back(':');
+                  dump_to(buf, o[i].second, /*pretty=*/false, 0);
+                }
+                ctx.chunks[t] = std::move(buf);
+              });
+              begin = end;
+            }
+            for (unsigned t = 0; t < used; ++t) ctx.fut[t].get();
+            out.push_back('{');
+            bool first = true;
+            for (unsigned t = 0; t < used; ++t) {
+              if (ctx.chunks[t].empty()) continue;
+              if (!first) out.push_back(',');
+              out.append(ctx.chunks[t]);
+              first = false;
+            }
+            out.push_back('}');
+            return;
+          }
+        }
+
+        dump_to(out, v, /*pretty=*/false, 0);
+        return;
+      }
+
+      // pretty
+      if (v.type() == sv_value::kind::array) {
+        const auto& a = v.as_array();
+        out.push_back('[');
+        if (a.empty()) {
+          out.push_back(']');
+          return;
+        }
+        out.push_back('\n');
+        const bool par = detail::should_parallelize_container(a.size(), depth, opt, threads);
+        if (!par) {
+          for (std::size_t i = 0; i < a.size(); ++i) {
+            detail::dump_indent(out, indent + 2);
+            dump_to(out, a[i], /*pretty=*/true, indent + 2);
+            if (i + 1 != a.size()) out.push_back(',');
+            out.push_back('\n');
+          }
+          detail::dump_indent(out, indent);
+          out.push_back(']');
+          return;
+        }
+
+        const unsigned used = threads > static_cast<unsigned>(a.size()) ? static_cast<unsigned>(a.size()) : threads;
+        ctx.chunks.resize(used);
+        const std::size_t n = a.size();
+        const std::size_t base = n / used;
+        const std::size_t rem = n % used;
+        ctx.fut.resize(used);
+        std::size_t begin = 0;
+        for (unsigned t = 0; t < used; ++t) {
+          const std::size_t len = base + (t < rem ? 1u : 0u);
+          const std::size_t end = begin + len;
+          ctx.fut[t] = std::async(std::launch::async, [&, t, begin, end]() {
+            std::string buf;
+            buf.reserve((end - begin) * 96u);
+            for (std::size_t i = begin; i < end; ++i) {
+              detail::dump_indent(buf, indent + 2);
+              dump_to(buf, a[i], /*pretty=*/true, indent + 2);
+              if (i + 1 != a.size()) buf.push_back(',');
+              buf.push_back('\n');
+            }
+            ctx.chunks[t] = std::move(buf);
+          });
+          begin = end;
+        }
+        for (unsigned t = 0; t < used; ++t) ctx.fut[t].get();
+        for (unsigned t = 0; t < used; ++t) out.append(ctx.chunks[t]);
+        detail::dump_indent(out, indent);
+        out.push_back(']');
+        return;
+      }
+      if (v.type() == sv_value::kind::object) {
+        const auto& o = v.as_object();
+        out.push_back('{');
+        if (o.empty()) {
+          out.push_back('}');
+          return;
+        }
+        out.push_back('\n');
+        const bool par = detail::should_parallelize_container(o.size(), depth, opt, threads);
+        if (!par) {
+          for (std::size_t i = 0; i < o.size(); ++i) {
+            detail::dump_indent(out, indent + 2);
+            detail::dump_escaped(out, o[i].first);
+            out.append(": ", 2);
+            dump_to(out, o[i].second, /*pretty=*/true, indent + 2);
+            if (i + 1 != o.size()) out.push_back(',');
+            out.push_back('\n');
+          }
+          detail::dump_indent(out, indent);
+          out.push_back('}');
+          return;
+        }
+
+        const unsigned used = threads > static_cast<unsigned>(o.size()) ? static_cast<unsigned>(o.size()) : threads;
+        ctx.chunks.resize(used);
+        const std::size_t n = o.size();
+        const std::size_t base = n / used;
+        const std::size_t rem = n % used;
+        ctx.fut.resize(used);
+        std::size_t begin = 0;
+        for (unsigned t = 0; t < used; ++t) {
+          const std::size_t len = base + (t < rem ? 1u : 0u);
+          const std::size_t end = begin + len;
+          ctx.fut[t] = std::async(std::launch::async, [&, t, begin, end]() {
+            std::string buf;
+            buf.reserve((end - begin) * 128u);
+            for (std::size_t i = begin; i < end; ++i) {
+              detail::dump_indent(buf, indent + 2);
+              detail::dump_escaped(buf, o[i].first);
+              buf.append(": ", 2);
+              dump_to(buf, o[i].second, /*pretty=*/true, indent + 2);
+              if (i + 1 != o.size()) buf.push_back(',');
+              buf.push_back('\n');
+            }
+            ctx.chunks[t] = std::move(buf);
+          });
+          begin = end;
+        }
+        for (unsigned t = 0; t < used; ++t) ctx.fut[t].get();
+        for (unsigned t = 0; t < used; ++t) out.append(ctx.chunks[t]);
+        detail::dump_indent(out, indent);
+        out.push_back('}');
+        return;
+      }
+
+      dump_to(out, v, /*pretty=*/true, indent);
+    }
+  };
+
+  mt::dump_value(out, v, /*indent=*/0, /*depth=*/0, opt, threads, ctx);
+}
+
+inline std::string dump_mt(const sv_value& v, dump_mt_options opt = {}) {
+  std::string out;
+  out.reserve(256);
+  dump_to_mt(out, v, opt);
+  return out;
+}
+
 } // namespace chjson
+   

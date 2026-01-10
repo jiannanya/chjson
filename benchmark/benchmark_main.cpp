@@ -51,6 +51,7 @@ std::string make_payload(std::size_t n_objects, std::size_t str_len) {
     }
 
     s += "\",\"val\":";
+    // Keep this field float-heavy to stress number parsing.
     s += (i % 3 == 0) ? "3.141592653589793" : "1e-10";
     s += "}";
   }
