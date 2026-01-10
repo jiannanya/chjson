@@ -135,6 +135,12 @@
   #define CHJSON_USE_INTERNAL_ALLOCATOR 1
 #endif
 
+// Max cached scratch capacity for long-number NUL-termination buffers (bytes, per thread).
+// If a number token exceeds this, chjson will fall back to one-shot allocation instead of caching.
+#ifndef CHJSON_TLS_LONG_NUMBER_SCRATCH_MAX
+  #define CHJSON_TLS_LONG_NUMBER_SCRATCH_MAX (256u * 1024u)
+#endif
+
 #if CHJSON_USE_CHFLOAT
   #if defined(__has_include)
     #if __has_include(<chfloat/chfloat.h>)
@@ -569,6 +575,44 @@ struct chjson_sized_byte_deleter {
 
 using chjson_byte_ptr = std::unique_ptr<std::byte, chjson_sized_byte_deleter>;
 
+struct chjson_long_number_scratch {
+  char* buf{nullptr};
+  std::size_t cap{0};
+
+  ~chjson_long_number_scratch() noexcept {
+    if (buf) {
+      chjson_deallocate(buf, cap, alignof(char));
+      buf = nullptr;
+      cap = 0;
+    }
+  }
+
+  char* ensure(std::size_t need) {
+    if (need <= cap) return buf;
+
+    // Do not cache absurdly large buffers per thread.
+    constexpr std::size_t max_cached = static_cast<std::size_t>(CHJSON_TLS_LONG_NUMBER_SCRATCH_MAX);
+    if (need > max_cached) return nullptr;
+
+    // Grow to next power-of-two for amortized behavior.
+    std::size_t new_cap = chjson_round_up_pow2(need);
+    if (new_cap > max_cached) new_cap = max_cached;
+
+    char* nb = static_cast<char*>(chjson_allocate(new_cap, alignof(char)));
+    if (buf) {
+      chjson_deallocate(buf, cap, alignof(char));
+    }
+    buf = nb;
+    cap = new_cap;
+    return buf;
+  }
+};
+
+inline chjson_long_number_scratch& long_number_scratch() {
+  thread_local chjson_long_number_scratch s;
+  return s;
+}
+
 struct number_value {
   // Keep both: integers preserve round-trip and allow fast integer APIs.
   // If `is_int == false`, use `d`.
@@ -747,12 +791,20 @@ inline double parse_double(const char* first, const char* last) {
   }
 
   // Long token fallback: avoid std::string heap allocation.
-  // Allocate a temporary NUL-terminated buffer from chjson internal allocator.
-  char* tmp = static_cast<char*>(detail::chjson_allocate(len + 1, alignof(char)));
+  // Prefer a reusable TLS scratch buffer (bounded) to avoid repeated alloc/free.
+  const std::size_t need = len + 1;
+  if (char* tmp = detail::long_number_scratch().ensure(need)) {
+    if (len != 0) std::memcpy(tmp, first, len);
+    tmp[len] = '\0';
+    return std::strtod(tmp, nullptr);
+  }
+
+  // One-shot fallback for extremely large tokens.
+  char* tmp = static_cast<char*>(detail::chjson_allocate(need, alignof(char)));
   if (len != 0) std::memcpy(tmp, first, len);
   tmp[len] = '\0';
   const double v = std::strtod(tmp, nullptr);
-  detail::chjson_deallocate(tmp, len + 1, alignof(char));
+  detail::chjson_deallocate(tmp, need, alignof(char));
   return v;
 }
 
@@ -795,11 +847,19 @@ inline double parse_double(std::string_view token) {
 
   // Long token fallback: avoid std::string heap allocation.
   const std::size_t len = token.size();
-  char* tmp = static_cast<char*>(detail::chjson_allocate(len + 1, alignof(char)));
+  const std::size_t need = len + 1;
+  if (char* tmp = detail::long_number_scratch().ensure(need)) {
+    if (len != 0) std::memcpy(tmp, token.data(), len);
+    tmp[len] = '\0';
+    return std::strtod(tmp, nullptr);
+  }
+
+  // One-shot fallback for extremely large tokens.
+  char* tmp = static_cast<char*>(detail::chjson_allocate(need, alignof(char)));
   if (len != 0) std::memcpy(tmp, token.data(), len);
   tmp[len] = '\0';
   const double v = std::strtod(tmp, nullptr);
-  detail::chjson_deallocate(tmp, len + 1, alignof(char));
+  detail::chjson_deallocate(tmp, need, alignof(char));
   return v;
 }
 
