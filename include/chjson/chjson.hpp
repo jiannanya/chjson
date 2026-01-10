@@ -5,6 +5,7 @@
 
 #include <cassert>
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <charconv>
 #include <cstdint>
@@ -124,6 +125,14 @@
 // This only affects the initial top-level span scan (used to decide MT splitting).
 #ifndef CHJSON_PARSE_MT_SCAN_SIMD
   #define CHJSON_PARSE_MT_SCAN_SIMD 0
+#endif
+
+// Config: use chjson internal allocator for chjson-owned heap allocations.
+// This does NOT replace user allocations (e.g. std::string/std::vector in the legacy DOM).
+// It targets hot internal allocations: arena blocks, MT-parse backing/resources, and
+// owned number token storage.
+#ifndef CHJSON_USE_INTERNAL_ALLOCATOR
+  #define CHJSON_USE_INTERNAL_ALLOCATOR 1
 #endif
 
 #if CHJSON_USE_CHFLOAT
@@ -286,6 +295,280 @@ inline bool parse_u4(std::string_view s, std::size_t& i, std::uint32_t& out_cp) 
 
 inline bool is_digit(char c) noexcept { return c >= '0' && c <= '9'; }
 
+// -----------------------------
+// Internal allocator (mimalloc-inspired)
+// -----------------------------
+// Design goals (for chjson internal usage):
+// - Very fast for small, frequent allocations.
+// - Thread-local fast path (no atomics) with occasional global refill/drain.
+// - No per-allocation headers; deallocate requires the size+alignment (known at call sites).
+// - Large allocations fall back to aligned ::operator new/delete.
+//
+// This allocator is intentionally minimal and only used where chjson knows the size.
+// It is NOT a general-purpose replacement for global new/delete.
+
+inline constexpr bool chjson_is_pow2(std::size_t x) noexcept {
+  return x != 0 && (x & (x - 1)) == 0;
+}
+
+inline std::size_t chjson_round_up_pow2(std::size_t x) noexcept {
+  // Round up to next power-of-two, with a minimum of 8.
+  if (x <= 8) return 8;
+  --x;
+  x |= x >> 1;
+  x |= x >> 2;
+  x |= x >> 4;
+  x |= x >> 8;
+  x |= x >> 16;
+#if SIZE_MAX > 0xFFFFFFFFu
+  x |= x >> 32;
+#endif
+  return x + 1;
+}
+
+struct chjson_internal_allocator {
+  static constexpr std::size_t k_small_min = 8;
+  static constexpr std::size_t k_small_max = 4096;
+  static constexpr std::size_t k_page_size = 64u * 1024u;
+  static constexpr std::size_t k_page_align = 64u; // used only for alignment math; page allocation itself is unaligned
+  static constexpr unsigned k_num_classes = 10; // 8..4096 (powers of two)
+  static constexpr unsigned k_local_flush_threshold = 256;
+  static constexpr unsigned k_local_flush_batch = 128;
+
+  // One global per size class.
+  inline static std::atomic<void*> g_free[k_num_classes];
+  inline static std::atomic<void*> g_pages{nullptr};
+
+  // One TLS per size class.
+  inline static thread_local void* tls_free[k_num_classes];
+  inline static thread_local unsigned tls_count[k_num_classes];
+
+  static unsigned size_to_class(std::size_t size_pow2) noexcept {
+    // size_pow2 in {8,16,...,4096}
+    unsigned idx = 0;
+    std::size_t v = size_pow2;
+    while (v > k_small_min) {
+      v >>= 1;
+      ++idx;
+    }
+    return idx;
+  }
+
+  static void push_global(unsigned idx, void* p) noexcept {
+    void* head = g_free[idx].load(std::memory_order_relaxed);
+    do {
+      *reinterpret_cast<void**>(p) = head;
+    } while (!g_free[idx].compare_exchange_weak(head, p, std::memory_order_release, std::memory_order_relaxed));
+  }
+
+  static void push_global_list(unsigned idx, void* list_head) noexcept {
+    if (!list_head) return;
+    // Find tail.
+    void* tail = list_head;
+    while (void* next = *reinterpret_cast<void**>(tail)) tail = next;
+
+    void* head = g_free[idx].load(std::memory_order_relaxed);
+    do {
+      *reinterpret_cast<void**>(tail) = head;
+    } while (!g_free[idx].compare_exchange_weak(head, list_head, std::memory_order_release, std::memory_order_relaxed));
+  }
+
+  static void* pop_local(unsigned idx) noexcept {
+    void* p = tls_free[idx];
+    if (!p) return nullptr;
+    tls_free[idx] = *reinterpret_cast<void**>(p);
+    --tls_count[idx];
+    return p;
+  }
+
+  static void push_local(unsigned idx, void* p) noexcept {
+    *reinterpret_cast<void**>(p) = tls_free[idx];
+    tls_free[idx] = p;
+    ++tls_count[idx];
+
+    if (tls_count[idx] > k_local_flush_threshold) {
+      // Detach a small batch and publish to global.
+      void* batch = tls_free[idx];
+      void* cur = batch;
+      unsigned n = 1;
+      while (cur && n < k_local_flush_batch) {
+        cur = *reinterpret_cast<void**>(cur);
+        ++n;
+      }
+      if (cur) {
+        void* rest = *reinterpret_cast<void**>(cur);
+        *reinterpret_cast<void**>(cur) = nullptr;
+        tls_free[idx] = rest;
+        tls_count[idx] -= n;
+        push_global_list(idx, batch);
+      }
+    }
+  }
+
+  static void push_local_noflush(unsigned idx, void* p) noexcept {
+    *reinterpret_cast<void**>(p) = tls_free[idx];
+    tls_free[idx] = p;
+    ++tls_count[idx];
+  }
+
+  static void refill_from_global(unsigned idx) noexcept {
+    void* list = g_free[idx].exchange(nullptr, std::memory_order_acquire);
+    if (!list) return;
+    // Count and prepend.
+    unsigned n = 0;
+    void* tail = list;
+    while (void* next = *reinterpret_cast<void**>(tail)) {
+      tail = next;
+      ++n;
+    }
+    ++n;
+    *reinterpret_cast<void**>(tail) = tls_free[idx];
+    tls_free[idx] = list;
+    tls_count[idx] += n;
+  }
+
+  static void alloc_new_page_for_class(unsigned idx, std::size_t block_size) {
+    // Allocate a fresh page and carve it into blocks for this size class.
+    void* page = ::operator new(k_page_size);
+
+    // Track pages for optional cleanup at exit.
+    void* pages_head = g_pages.load(std::memory_order_relaxed);
+    do {
+      *reinterpret_cast<void**>(page) = pages_head;
+    } while (!g_pages.compare_exchange_weak(pages_head, page, std::memory_order_release, std::memory_order_relaxed));
+
+    std::byte* p = reinterpret_cast<std::byte*>(page);
+    std::byte* start = p + sizeof(void*);
+    // Align start to block_size.
+    const std::uintptr_t s = reinterpret_cast<std::uintptr_t>(start);
+    const std::uintptr_t aligned = (s + (block_size - 1)) & ~(static_cast<std::uintptr_t>(block_size) - 1u);
+    start = reinterpret_cast<std::byte*>(aligned);
+    std::size_t avail = k_page_size - static_cast<std::size_t>(start - p);
+    const std::size_t count = avail / block_size;
+    if (count == 0) {
+      throw std::bad_alloc();
+    }
+
+    // Push all blocks onto TLS free list.
+    for (std::size_t i = 0; i < count; ++i) {
+      void* b = start + i * block_size;
+      push_local_noflush(idx, b);
+    }
+  }
+
+  static void* allocate(std::size_t bytes, std::size_t alignment) {
+    if (bytes == 0) bytes = 1;
+    if (alignment == 0) alignment = alignof(std::max_align_t);
+    if (!chjson_is_pow2(alignment)) throw std::bad_alloc();
+
+#if CHJSON_USE_INTERNAL_ALLOCATOR
+    std::size_t need = bytes < alignment ? alignment : bytes;
+    if (need <= k_small_max) {
+      const std::size_t block = chjson_round_up_pow2(need);
+      const unsigned idx = size_to_class(block);
+      if (void* p = pop_local(idx)) return p;
+      refill_from_global(idx);
+      if (void* p = pop_local(idx)) return p;
+      alloc_new_page_for_class(idx, block);
+      if (void* p = pop_local(idx)) return p;
+      throw std::bad_alloc();
+    }
+#endif
+
+    // Large fallback.
+    if (alignment <= alignof(std::max_align_t)) {
+      return ::operator new(bytes);
+    }
+
+    // Portable aligned allocation fallback (stores original pointer just before aligned block).
+    const std::size_t over = bytes + alignment + sizeof(void*);
+    void* raw = ::operator new(over);
+    std::uintptr_t p = reinterpret_cast<std::uintptr_t>(raw) + sizeof(void*);
+    std::uintptr_t aligned = (p + (alignment - 1)) & ~(static_cast<std::uintptr_t>(alignment) - 1u);
+    void* out = reinterpret_cast<void*>(aligned);
+    *(reinterpret_cast<void**>(out) - 1) = raw;
+    return out;
+  }
+
+  static void deallocate(void* p, std::size_t bytes, std::size_t alignment) noexcept {
+    if (!p) return;
+    if (bytes == 0) bytes = 1;
+    if (alignment == 0) alignment = alignof(std::max_align_t);
+    if (!chjson_is_pow2(alignment)) {
+      // Should never happen in chjson; avoid UB.
+      ::operator delete(p);
+      return;
+    }
+
+#if CHJSON_USE_INTERNAL_ALLOCATOR
+    std::size_t need = bytes < alignment ? alignment : bytes;
+    if (need <= k_small_max) {
+      const std::size_t block = chjson_round_up_pow2(need);
+      const unsigned idx = size_to_class(block);
+      push_local(idx, p);
+      return;
+    }
+#endif
+
+    if (alignment <= alignof(std::max_align_t)) {
+      ::operator delete(p);
+      return;
+    }
+
+    void* raw = *(reinterpret_cast<void**>(p) - 1);
+    ::operator delete(raw);
+  }
+
+  ~chjson_internal_allocator() noexcept {
+    // Best-effort cleanup of pages allocated by the small-object pools.
+    // This runs at program exit; it does not attempt to synchronize with
+    // concurrent allocations.
+    void* page = g_pages.exchange(nullptr, std::memory_order_acquire);
+    while (page) {
+      void* next = *reinterpret_cast<void**>(page);
+      ::operator delete(page);
+      page = next;
+    }
+  }
+};
+
+// One program-wide allocator state (single instance across TUs).
+inline chjson_internal_allocator g_chjson_internal_allocator_state;
+
+inline void* chjson_allocate(std::size_t bytes, std::size_t alignment) {
+  (void)g_chjson_internal_allocator_state;
+  return chjson_internal_allocator::allocate(bytes, alignment);
+}
+
+inline void chjson_deallocate(void* p, std::size_t bytes, std::size_t alignment) noexcept {
+  (void)g_chjson_internal_allocator_state;
+  chjson_internal_allocator::deallocate(p, bytes, alignment);
+}
+
+template <class T>
+inline T* chjson_allocate_n(std::size_t n) {
+  if (n == 0) return nullptr;
+  const std::size_t bytes = sizeof(T) * n;
+  return static_cast<T*>(chjson_allocate(bytes, alignof(T)));
+}
+
+template <class T>
+inline void chjson_deallocate_n(T* p, std::size_t n) noexcept {
+  if (!p) return;
+  const std::size_t bytes = sizeof(T) * n;
+  chjson_deallocate(static_cast<void*>(p), bytes, alignof(T));
+}
+
+struct chjson_sized_byte_deleter {
+  std::size_t size{0};
+  void operator()(std::byte* p) const noexcept {
+    if (!p) return;
+    chjson_deallocate(p, size, alignof(std::max_align_t));
+  }
+};
+
+using chjson_byte_ptr = std::unique_ptr<std::byte, chjson_sized_byte_deleter>;
+
 struct number_value {
   // Keep both: integers preserve round-trip and allow fast integer APIs.
   // If `is_int == false`, use `d`.
@@ -321,7 +604,7 @@ struct owned_number_value {
     if (other.raw_len == 0) return;
     if (other.raw_is_heap) {
       raw_is_heap = true;
-      raw_heap = new char[raw_len];
+      raw_heap = static_cast<char*>(chjson_allocate(static_cast<std::size_t>(raw_len), alignof(char)));
       std::memcpy(raw_heap, other.raw_heap, raw_len);
       return;
     }
@@ -342,7 +625,7 @@ struct owned_number_value {
     }
     if (other.raw_is_heap) {
       raw_is_heap = true;
-      raw_heap = new char[raw_len];
+      raw_heap = static_cast<char*>(chjson_allocate(static_cast<std::size_t>(raw_len), alignof(char)));
       std::memcpy(raw_heap, other.raw_heap, raw_len);
       return *this;
     }
@@ -399,7 +682,7 @@ struct owned_number_value {
 
   void clear_raw() noexcept {
     if (raw_is_heap) {
-      delete[] raw_heap;
+      chjson_deallocate(raw_heap, static_cast<std::size_t>(raw_len), alignof(char));
     }
     raw_is_heap = false;
     raw_len = 0;
@@ -424,7 +707,7 @@ struct owned_number_value {
 
     raw_is_heap = true;
     raw_len = static_cast<std::uint32_t>(token.size());
-    raw_heap = new char[raw_len];
+    raw_heap = static_cast<char*>(chjson_allocate(static_cast<std::size_t>(raw_len), alignof(char)));
     std::memcpy(raw_heap, token.data(), token.size());
   }
 };
@@ -2171,14 +2454,17 @@ private:
     const std::byte* data() const noexcept { return reinterpret_cast<const std::byte*>(this + 1); }
 
     static block* create(std::size_t block_size) {
-      block* nb = static_cast<block*>(::operator new(sizeof(block) + block_size));
+      block* nb = static_cast<block*>(detail::chjson_allocate(sizeof(block) + block_size, alignof(block)));
       nb->size = block_size;
       nb->used = 0;
       nb->next = nullptr;
       return nb;
     }
 
-    static void destroy(block* b) noexcept { ::operator delete(b); }
+    static void destroy(block* b) noexcept {
+      if (!b) return;
+      detail::chjson_deallocate(b, sizeof(block) + b->size, alignof(block));
+    }
   };
 
   block* head_{nullptr};
@@ -2645,7 +2931,7 @@ inline pmr::arena_resource& document_arena_stash() {
 }
 
 struct mt_parse_tls_cache {
-  std::unique_ptr<std::byte[]> backing;
+  detail::chjson_byte_ptr backing;
   std::size_t backing_size{0};
 
   std::pmr::monotonic_buffer_resource* resources{nullptr};
@@ -2654,7 +2940,8 @@ struct mt_parse_tls_cache {
   ~mt_parse_tls_cache() noexcept {
     if (resources != nullptr) {
       for (unsigned i = 0; i < resources_count; ++i) resources[i].~monotonic_buffer_resource();
-      ::operator delete[](resources);
+      detail::chjson_deallocate(resources, sizeof(std::pmr::monotonic_buffer_resource) * static_cast<std::size_t>(resources_count),
+                                alignof(std::pmr::monotonic_buffer_resource));
     }
   }
 };
@@ -2757,7 +3044,9 @@ public:
           if (mt_stash.resources_count < n) {
             if (mt_stash.resources != nullptr) {
               for (unsigned i = 0; i < mt_stash.resources_count; ++i) mt_stash.resources[i].~monotonic_buffer_resource();
-              ::operator delete[](mt_stash.resources);
+              detail::chjson_deallocate(mt_stash.resources,
+                                        sizeof(std::pmr::monotonic_buffer_resource) * static_cast<std::size_t>(mt_stash.resources_count),
+                                        alignof(std::pmr::monotonic_buffer_resource));
               mt_stash.resources = nullptr;
               mt_stash.resources_count = 0;
             }
@@ -2826,12 +3115,13 @@ private:
       for (unsigned i = 0; i < count; ++i) {
         p[i].~monotonic_buffer_resource();
       }
-      ::operator delete[](p);
+      detail::chjson_deallocate(p, sizeof(std::pmr::monotonic_buffer_resource) * static_cast<std::size_t>(count),
+                                alignof(std::pmr::monotonic_buffer_resource));
     }
   };
 
   std::unique_ptr<std::pmr::monotonic_buffer_resource, mt_parse_resources_deleter> mt_parse_resources_;
-  std::unique_ptr<std::byte[]> mt_parse_backing_;
+  detail::chjson_byte_ptr mt_parse_backing_{nullptr, detail::chjson_sized_byte_deleter{0}};
   std::size_t mt_parse_backing_size_{0};
 
   friend document_parse_result parse(std::string_view json, parse_options opt);
@@ -4981,7 +5271,9 @@ inline document_parse_result parse(std::string_view json, parse_options opt) {
 
           // Reuse MT backing/resources if possible to avoid per-parse allocations.
           if (!r.doc.mt_parse_backing_ || r.doc.mt_parse_backing_size_ < backing) {
-            r.doc.mt_parse_backing_.reset(new std::byte[backing]);
+            r.doc.mt_parse_backing_.reset();
+            r.doc.mt_parse_backing_ = detail::chjson_byte_ptr(static_cast<std::byte*>(detail::chjson_allocate(backing, alignof(std::max_align_t))),
+                                                             detail::chjson_sized_byte_deleter{backing});
             r.doc.mt_parse_backing_size_ = backing;
           }
 
@@ -4989,7 +5281,8 @@ inline document_parse_result parse(std::string_view json, parse_options opt) {
           if (r.doc.mt_parse_resources_) res_cap = r.doc.mt_parse_resources_.get_deleter().count;
           if (res_cap < used) {
             auto* raw = static_cast<std::pmr::monotonic_buffer_resource*>(
-                ::operator new[](sizeof(std::pmr::monotonic_buffer_resource) * static_cast<std::size_t>(used)));
+                detail::chjson_allocate(sizeof(std::pmr::monotonic_buffer_resource) * static_cast<std::size_t>(used),
+                                        alignof(std::pmr::monotonic_buffer_resource)));
             r.doc.mt_parse_resources_ = decltype(r.doc.mt_parse_resources_)(raw, document::mt_parse_resources_deleter{used});
             res_cap = used;
           }
