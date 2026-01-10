@@ -3702,23 +3702,41 @@ struct view_parser {
     }
 
     while (true) {
+      detail::skip_ws(buf, size, i);
       sv_value elem = parse_value(depth, e);
       if (e) return nullptr;
       if (out.u.a.size == out.u.a.cap) reserve(out.u.a.size + 1u);
       out.u.a.data[out.u.a.size++] = elem;
 
-      detail::skip_ws(buf, size, i);
       if (i >= size) {
         set_error(e, error_code::unexpected_eof);
         return nullptr;
       }
-      const char c = buf[i++];
+
+      char c = buf[i];
       if (c == ',') {
-        detail::skip_ws(buf, size, i);
+        ++i;
         continue;
       }
-      if (c == ']') return out;
-      set_error(e, error_code::expected_comma_or_end, i - 1);
+      if (c == ']') {
+        ++i;
+        return out;
+      }
+
+      if (static_cast<unsigned char>(c) <= static_cast<unsigned char>(' ')) {
+        detail::skip_ws(buf, size, i);
+        if (i >= size) {
+          set_error(e, error_code::unexpected_eof);
+          return nullptr;
+        }
+        c = buf[i++];
+        if (c == ',') continue;
+        if (c == ']') return out;
+        set_error(e, error_code::expected_comma_or_end, i - 1);
+        return nullptr;
+      }
+
+      set_error(e, error_code::expected_comma_or_end, i);
       return nullptr;
     }
   }
@@ -3753,6 +3771,7 @@ struct view_parser {
     }
 
     while (true) {
+      detail::skip_ws(buf, size, i);
       if (i >= size) {
         set_error(e, error_code::unexpected_eof);
         return nullptr;
@@ -3765,14 +3784,23 @@ struct view_parser {
       std::string_view key;
       if (!parse_string(key, e)) return nullptr;
 
-      detail::skip_ws(buf, size, i);
+      // Common case: no whitespace before ':'
       if (i >= size) {
         set_error(e, error_code::unexpected_eof);
         return nullptr;
       }
       if (buf[i] != ':') {
-        set_error(e, error_code::expected_colon);
-        return nullptr;
+        if (static_cast<unsigned char>(buf[i]) <= static_cast<unsigned char>(' ')) {
+          detail::skip_ws(buf, size, i);
+          if (i >= size) {
+            set_error(e, error_code::unexpected_eof);
+            return nullptr;
+          }
+        }
+        if (buf[i] != ':') {
+          set_error(e, error_code::expected_colon);
+          return nullptr;
+        }
       }
       ++i;
 
@@ -3783,18 +3811,35 @@ struct view_parser {
       new (&out.u.o.data[out.u.o.size]) sv_member{key, std::move(v)};
       ++out.u.o.size;
 
-      detail::skip_ws(buf, size, i);
       if (i >= size) {
         set_error(e, error_code::unexpected_eof);
         return nullptr;
       }
-      const char c = buf[i++];
+
+      char c = buf[i];
       if (c == ',') {
-        detail::skip_ws(buf, size, i);
+        ++i;
         continue;
       }
-      if (c == '}') return out;
-      set_error(e, error_code::expected_comma_or_end, i - 1);
+      if (c == '}') {
+        ++i;
+        return out;
+      }
+
+      if (static_cast<unsigned char>(c) <= static_cast<unsigned char>(' ')) {
+        detail::skip_ws(buf, size, i);
+        if (i >= size) {
+          set_error(e, error_code::unexpected_eof);
+          return nullptr;
+        }
+        c = buf[i++];
+        if (c == ',') continue;
+        if (c == '}') return out;
+        set_error(e, error_code::expected_comma_or_end, i - 1);
+        return nullptr;
+      }
+
+      set_error(e, error_code::expected_comma_or_end, i);
       return nullptr;
     }
   }
@@ -4174,15 +4219,35 @@ struct owning_view_parser {
       if (e) return nullptr;
       out.array_push_back(mr, std::move(elem));
 
-      detail::skip_ws(buf, size, i);
       if (i >= size) {
         set_error(e, error_code::unexpected_eof);
         return nullptr;
       }
-      const char c = buf[i++];
-      if (c == ',') continue;
-      if (c == ']') return out;
-      set_error(e, error_code::expected_comma_or_end, i - 1);
+
+      char c = buf[i];
+      if (c == ',') {
+        ++i;
+        continue;
+      }
+      if (c == ']') {
+        ++i;
+        return out;
+      }
+
+      if (static_cast<unsigned char>(c) <= static_cast<unsigned char>(' ')) {
+        detail::skip_ws(buf, size, i);
+        if (i >= size) {
+          set_error(e, error_code::unexpected_eof);
+          return nullptr;
+        }
+        c = buf[i++];
+        if (c == ',') continue;
+        if (c == ']') return out;
+        set_error(e, error_code::expected_comma_or_end, i - 1);
+        return nullptr;
+      }
+
+      set_error(e, error_code::expected_comma_or_end, i);
       return nullptr;
     }
   }
@@ -4214,14 +4279,22 @@ struct owning_view_parser {
       std::string_view key;
       if (!parse_string(key, e)) return nullptr;
 
-      detail::skip_ws(buf, size, i);
       if (i >= size) {
         set_error(e, error_code::unexpected_eof);
         return nullptr;
       }
       if (buf[i] != ':') {
-        set_error(e, error_code::expected_colon);
-        return nullptr;
+        if (static_cast<unsigned char>(buf[i]) <= static_cast<unsigned char>(' ')) {
+          detail::skip_ws(buf, size, i);
+          if (i >= size) {
+            set_error(e, error_code::unexpected_eof);
+            return nullptr;
+          }
+        }
+        if (buf[i] != ':') {
+          set_error(e, error_code::expected_colon);
+          return nullptr;
+        }
       }
       ++i;
 
@@ -4230,15 +4303,35 @@ struct owning_view_parser {
       if (e) return nullptr;
       out.object_emplace_back(mr, key, std::move(v));
 
-      detail::skip_ws(buf, size, i);
       if (i >= size) {
         set_error(e, error_code::unexpected_eof);
         return nullptr;
       }
-      const char c = buf[i++];
-      if (c == ',') continue;
-      if (c == '}') return out;
-      set_error(e, error_code::expected_comma_or_end, i - 1);
+
+      char c = buf[i];
+      if (c == ',') {
+        ++i;
+        continue;
+      }
+      if (c == '}') {
+        ++i;
+        return out;
+      }
+
+      if (static_cast<unsigned char>(c) <= static_cast<unsigned char>(' ')) {
+        detail::skip_ws(buf, size, i);
+        if (i >= size) {
+          set_error(e, error_code::unexpected_eof);
+          return nullptr;
+        }
+        c = buf[i++];
+        if (c == ',') continue;
+        if (c == '}') return out;
+        set_error(e, error_code::expected_comma_or_end, i - 1);
+        return nullptr;
+      }
+
+      set_error(e, error_code::expected_comma_or_end, i);
       return nullptr;
     }
   }
@@ -4465,15 +4558,35 @@ struct no_string_parser {
       if (out.u.a.size == out.u.a.cap) reserve(out.u.a.size + 1u);
       out.u.a.data[out.u.a.size++] = elem;
 
-      detail::skip_ws(buf, size, i);
       if (i >= size) {
         set_error(e, error_code::unexpected_eof);
         return nullptr;
       }
-      const char c = buf[i++];
-      if (c == ',') continue;
-      if (c == ']') return out;
-      set_error(e, error_code::expected_comma_or_end, i - 1);
+
+      char c = buf[i];
+      if (c == ',') {
+        ++i;
+        continue;
+      }
+      if (c == ']') {
+        ++i;
+        return out;
+      }
+
+      if (static_cast<unsigned char>(c) <= static_cast<unsigned char>(' ')) {
+        detail::skip_ws(buf, size, i);
+        if (i >= size) {
+          set_error(e, error_code::unexpected_eof);
+          return nullptr;
+        }
+        c = buf[i++];
+        if (c == ',') continue;
+        if (c == ']') return out;
+        set_error(e, error_code::expected_comma_or_end, i - 1);
+        return nullptr;
+      }
+
+      set_error(e, error_code::expected_comma_or_end, i);
       return nullptr;
     }
   }
@@ -4900,15 +5013,35 @@ struct insitu_parser {
       if (out.u.a.size == out.u.a.cap) reserve(out.u.a.size + 1u);
       out.u.a.data[out.u.a.size++] = elem;
 
-      detail::skip_ws(buf, size, i);
       if (i >= size) {
         set_error(e, error_code::unexpected_eof);
         return nullptr;
       }
-      const char c = buf[i++];
-      if (c == ',') continue;
-      if (c == ']') return out;
-      set_error(e, error_code::expected_comma_or_end, i - 1);
+
+      char c = buf[i];
+      if (c == ',') {
+        ++i;
+        continue;
+      }
+      if (c == ']') {
+        ++i;
+        return out;
+      }
+
+      if (static_cast<unsigned char>(c) <= static_cast<unsigned char>(' ')) {
+        detail::skip_ws(buf, size, i);
+        if (i >= size) {
+          set_error(e, error_code::unexpected_eof);
+          return nullptr;
+        }
+        c = buf[i++];
+        if (c == ',') continue;
+        if (c == ']') return out;
+        set_error(e, error_code::expected_comma_or_end, i - 1);
+        return nullptr;
+      }
+
+      set_error(e, error_code::expected_comma_or_end, i);
       return nullptr;
     }
   }
@@ -4956,14 +5089,22 @@ struct insitu_parser {
       std::string_view key;
       if (!parse_string(key, e)) return nullptr;
 
-      detail::skip_ws(buf, size, i);
       if (i >= size) {
         set_error(e, error_code::unexpected_eof);
         return nullptr;
       }
       if (buf[i] != ':') {
-        set_error(e, error_code::expected_colon);
-        return nullptr;
+        if (static_cast<unsigned char>(buf[i]) <= static_cast<unsigned char>(' ')) {
+          detail::skip_ws(buf, size, i);
+          if (i >= size) {
+            set_error(e, error_code::unexpected_eof);
+            return nullptr;
+          }
+        }
+        if (buf[i] != ':') {
+          set_error(e, error_code::expected_colon);
+          return nullptr;
+        }
       }
       ++i;
 
@@ -4974,15 +5115,35 @@ struct insitu_parser {
       new (&out.u.o.data[out.u.o.size]) sv_member{key, std::move(v)};
       ++out.u.o.size;
 
-      detail::skip_ws(buf, size, i);
       if (i >= size) {
         set_error(e, error_code::unexpected_eof);
         return nullptr;
       }
-      const char c = buf[i++];
-      if (c == ',') continue;
-      if (c == '}') return out;
-      set_error(e, error_code::expected_comma_or_end, i - 1);
+
+      char c = buf[i];
+      if (c == ',') {
+        ++i;
+        continue;
+      }
+      if (c == '}') {
+        ++i;
+        return out;
+      }
+
+      if (static_cast<unsigned char>(c) <= static_cast<unsigned char>(' ')) {
+        detail::skip_ws(buf, size, i);
+        if (i >= size) {
+          set_error(e, error_code::unexpected_eof);
+          return nullptr;
+        }
+        c = buf[i++];
+        if (c == ',') continue;
+        if (c == '}') return out;
+        set_error(e, error_code::expected_comma_or_end, i - 1);
+        return nullptr;
+      }
+
+      set_error(e, error_code::expected_comma_or_end, i);
       return nullptr;
     }
   }
@@ -5698,15 +5859,35 @@ inline document_parse_result parse(std::string_view json, parse_options opt) {
               if (e) return nullptr;
               out.array_push_back(mr, std::move(elem));
 
-              detail::skip_ws(buf, size, i);
               if (i >= size) {
                 set_error(e, error_code::unexpected_eof);
                 return nullptr;
               }
-              const char c = buf[i++];
-              if (c == ',') continue;
-              if (c == ']') return out;
-              set_error(e, error_code::expected_comma_or_end, i - 1);
+
+              char c = buf[i];
+              if (c == ',') {
+                ++i;
+                continue;
+              }
+              if (c == ']') {
+                ++i;
+                return out;
+              }
+
+              if (static_cast<unsigned char>(c) <= static_cast<unsigned char>(' ')) {
+                detail::skip_ws(buf, size, i);
+                if (i >= size) {
+                  set_error(e, error_code::unexpected_eof);
+                  return nullptr;
+                }
+                c = buf[i++];
+                if (c == ',') continue;
+                if (c == ']') return out;
+                set_error(e, error_code::expected_comma_or_end, i - 1);
+                return nullptr;
+              }
+
+              set_error(e, error_code::expected_comma_or_end, i);
               return nullptr;
             }
           }
@@ -5737,14 +5918,22 @@ inline document_parse_result parse(std::string_view json, parse_options opt) {
               std::string_view key;
               if (!parse_string(key, e)) return nullptr;
 
-              detail::skip_ws(buf, size, i);
               if (i >= size) {
                 set_error(e, error_code::unexpected_eof);
                 return nullptr;
               }
               if (buf[i] != ':') {
-                set_error(e, error_code::expected_colon);
-                return nullptr;
+                if (static_cast<unsigned char>(buf[i]) <= static_cast<unsigned char>(' ')) {
+                  detail::skip_ws(buf, size, i);
+                  if (i >= size) {
+                    set_error(e, error_code::unexpected_eof);
+                    return nullptr;
+                  }
+                }
+                if (buf[i] != ':') {
+                  set_error(e, error_code::expected_colon);
+                  return nullptr;
+                }
               }
               ++i;
 
@@ -5753,15 +5942,35 @@ inline document_parse_result parse(std::string_view json, parse_options opt) {
               if (e) return nullptr;
               out.object_emplace_back(mr, key, std::move(v));
 
-              detail::skip_ws(buf, size, i);
               if (i >= size) {
                 set_error(e, error_code::unexpected_eof);
                 return nullptr;
               }
-              const char c = buf[i++];
-              if (c == ',') continue;
-              if (c == '}') return out;
-              set_error(e, error_code::expected_comma_or_end, i - 1);
+
+              char c = buf[i];
+              if (c == ',') {
+                ++i;
+                continue;
+              }
+              if (c == '}') {
+                ++i;
+                return out;
+              }
+
+              if (static_cast<unsigned char>(c) <= static_cast<unsigned char>(' ')) {
+                detail::skip_ws(buf, size, i);
+                if (i >= size) {
+                  set_error(e, error_code::unexpected_eof);
+                  return nullptr;
+                }
+                c = buf[i++];
+                if (c == ',') continue;
+                if (c == '}') return out;
+                set_error(e, error_code::expected_comma_or_end, i - 1);
+                return nullptr;
+              }
+
+              set_error(e, error_code::expected_comma_or_end, i);
               return nullptr;
             }
           }
@@ -5832,12 +6041,29 @@ inline document_parse_result parse(std::string_view json, parse_options opt) {
                     err_abs[t] = b + err.offset;
                     return;
                   }
-                  detail::skip_ws(p.buf, p.size, p.i);
-                  if (p.i >= p.size || p.buf[p.i] != ':') {
-                    errs[t].code = error_code::expected_colon;
+
+                  if (p.i >= p.size) {
+                    errs[t].code = error_code::unexpected_eof;
                     errs[t].offset = p.i;
                     err_abs[t] = b + p.i;
                     return;
+                  }
+                  if (p.buf[p.i] != ':') {
+                    if (static_cast<unsigned char>(p.buf[p.i]) <= static_cast<unsigned char>(' ')) {
+                      detail::skip_ws(p.buf, p.size, p.i);
+                      if (p.i >= p.size) {
+                        errs[t].code = error_code::unexpected_eof;
+                        errs[t].offset = p.i;
+                        err_abs[t] = b + p.i;
+                        return;
+                      }
+                    }
+                    if (p.buf[p.i] != ':') {
+                      errs[t].code = error_code::expected_colon;
+                      errs[t].offset = p.i;
+                      err_abs[t] = b + p.i;
+                      return;
+                    }
                   }
                   ++p.i;
                   detail::skip_ws(p.buf, p.size, p.i);
