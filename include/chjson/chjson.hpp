@@ -745,7 +745,15 @@ inline double parse_double(const char* first, const char* last) {
     buf[len] = '\0';
     return std::strtod(buf, nullptr);
   }
-  return std::strtod(std::string(first, len).c_str(), nullptr);
+
+  // Long token fallback: avoid std::string heap allocation.
+  // Allocate a temporary NUL-terminated buffer from chjson internal allocator.
+  char* tmp = static_cast<char*>(detail::chjson_allocate(len + 1, alignof(char)));
+  if (len != 0) std::memcpy(tmp, first, len);
+  tmp[len] = '\0';
+  const double v = std::strtod(tmp, nullptr);
+  detail::chjson_deallocate(tmp, len + 1, alignof(char));
+  return v;
 }
 
 inline double parse_double(std::string_view token) {
@@ -784,7 +792,15 @@ inline double parse_double(std::string_view token) {
     buf[token.size()] = '\0';
     return std::strtod(buf, nullptr);
   }
-  return std::strtod(std::string(token).c_str(), nullptr);
+
+  // Long token fallback: avoid std::string heap allocation.
+  const std::size_t len = token.size();
+  char* tmp = static_cast<char*>(detail::chjson_allocate(len + 1, alignof(char)));
+  if (len != 0) std::memcpy(tmp, token.data(), len);
+  tmp[len] = '\0';
+  const double v = std::strtod(tmp, nullptr);
+  detail::chjson_deallocate(tmp, len + 1, alignof(char));
+  return v;
 }
 
 inline bool parse_number(const char* buf, std::size_t size, std::size_t& i, number_value& out, bool parse_fp = true) {
