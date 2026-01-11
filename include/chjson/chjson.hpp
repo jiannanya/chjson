@@ -30,6 +30,9 @@
 #include <string_view>
 #include <thread>
 #include <future>
+#include <mutex>
+#include <condition_variable>
+#include <deque>
 #include <type_traits>
 #include <utility>
 #include <variant>
@@ -1873,10 +1876,76 @@ inline void dump_indent(std::string& out, int indent) {
 
 inline unsigned effective_threads(unsigned max_threads) noexcept {
   if (max_threads == 0) {
-    const unsigned hc = std::thread::hardware_concurrency();
-    return hc == 0 ? 1u : hc;
+    static const unsigned hc = []() noexcept {
+      const unsigned v = std::thread::hardware_concurrency();
+      return v == 0 ? 1u : v;
+    }();
+    return hc;
   }
   return max_threads;
+}
+
+class thread_pool {
+public:
+  explicit thread_pool(unsigned threads) {
+    if (threads == 0) threads = 1;
+    workers_.reserve(threads);
+    for (unsigned i = 0; i < threads; ++i) {
+      workers_.emplace_back([this]() { worker_loop(); });
+    }
+  }
+
+  thread_pool(const thread_pool&) = delete;
+  thread_pool& operator=(const thread_pool&) = delete;
+
+  ~thread_pool() {
+    {
+      std::lock_guard<std::mutex> lk(m_);
+      stop_ = true;
+    }
+    cv_.notify_all();
+    for (auto& t : workers_) {
+      if (t.joinable()) t.join();
+    }
+  }
+
+  template <class Fn>
+  std::future<void> submit(Fn&& fn) {
+    std::packaged_task<void()> task(std::forward<Fn>(fn));
+    std::future<void> fut = task.get_future();
+    {
+      std::lock_guard<std::mutex> lk(m_);
+      q_.emplace_back(std::move(task));
+    }
+    cv_.notify_one();
+    return fut;
+  }
+
+private:
+  void worker_loop() {
+    for (;;) {
+      std::packaged_task<void()> job;
+      {
+        std::unique_lock<std::mutex> lk(m_);
+        cv_.wait(lk, [this]() { return stop_ || !q_.empty(); });
+        if (stop_ && q_.empty()) return;
+        job = std::move(q_.front());
+        q_.pop_front();
+      }
+      job();
+    }
+  }
+
+  std::mutex m_;
+  std::condition_variable cv_;
+  std::deque<std::packaged_task<void()>> q_;
+  std::vector<std::thread> workers_;
+  bool stop_{false};
+};
+
+inline thread_pool& mt_pool() {
+  static thread_pool pool(effective_threads(0));
+  return pool;
 }
 
 inline void maybe_reserve_small_aware(std::string& out, std::size_t cap) {
@@ -1896,9 +1965,13 @@ inline void dump_compact_iter(std::string& out, const value& root) {
     const value* v{nullptr};
     std::size_t idx{0};
   };
-  // Non-recursive traversal with a fixed-size stack to avoid per-call heap allocs.
-  // Depth is bounded by parser max-depth; keep a generous safety margin.
-  frame stack[512];
+  // Non-recursive traversal. Keep the on-stack buffer <4KB to avoid __chkstk
+  // probing overhead on Windows. Grow to heap only for very deep nesting.
+  constexpr std::size_t k_small_cap = 240;
+  frame small[k_small_cap];
+  internal_array<frame> heap;
+  frame* stack = small;
+  std::size_t cap = k_small_cap;
   std::size_t sp = 0;
   stack[sp++] = frame{&root, 0};
 
@@ -1942,6 +2015,13 @@ inline void dump_compact_iter(std::string& out, const value& root) {
         }
         if (f.idx > 0) out.push_back(',');
         const value* child = &a[f.idx++];
+        if (sp == cap) {
+          const std::size_t new_cap = cap * 2;
+          heap = internal_array<frame>(new_cap);
+          for (std::size_t j = 0; j < cap; ++j) heap[j] = stack[j];
+          stack = heap.get();
+          cap = new_cap;
+        }
         stack[sp++] = frame{child, 0};
         break;
       }
@@ -1964,6 +2044,13 @@ inline void dump_compact_iter(std::string& out, const value& root) {
         const auto& kv = o[f.idx++];
         dump_escaped(out, kv.first);
         out.push_back(':');
+        if (sp == cap) {
+          const std::size_t new_cap = cap * 2;
+          heap = internal_array<frame>(new_cap);
+          for (std::size_t j = 0; j < cap; ++j) heap[j] = stack[j];
+          stack = heap.get();
+          cap = new_cap;
+        }
         stack[sp++] = frame{&kv.second, 0};
         break;
       }
@@ -2035,7 +2122,13 @@ inline void dump_to(std::string& out, const value& v, bool pretty = false, int i
       const value* v{nullptr};
       std::size_t idx{0};
     };
-    frame stack[512];
+    // Keep the on-stack buffer <4KB to avoid __chkstk probing overhead on Windows.
+    // Grow to heap only for very deep nesting.
+    constexpr std::size_t k_small_cap = 240;
+    frame small[k_small_cap];
+    detail::internal_array<frame> heap;
+    frame* stack = small;
+    std::size_t cap = k_small_cap;
     std::size_t sp = 0;
     stack[sp++] = frame{&v, 0};
 
@@ -2114,6 +2207,13 @@ inline void dump_to(std::string& out, const value& v, bool pretty = false, int i
               break;
             }
             default:
+              if (sp == cap) {
+                const std::size_t new_cap = cap * 2;
+                heap = detail::internal_array<frame>(new_cap);
+                for (std::size_t j = 0; j < cap; ++j) heap[j] = stack[j];
+                stack = heap.get();
+                cap = new_cap;
+              }
               stack[sp++] = frame{&elem, 0};
               break;
           }
@@ -2165,6 +2265,13 @@ inline void dump_to(std::string& out, const value& v, bool pretty = false, int i
               break;
             }
             default:
+              if (sp == cap) {
+                const std::size_t new_cap = cap * 2;
+                heap = detail::internal_array<frame>(new_cap);
+                for (std::size_t j = 0; j < cap; ++j) heap[j] = stack[j];
+                stack = heap.get();
+                cap = new_cap;
+              }
               stack[sp++] = frame{&vv, 0};
               break;
           }
@@ -2212,9 +2319,38 @@ inline std::string dump(const value& v, bool pretty = false) {
     }
   }
 
-  // Default dump() is single-threaded for stable latency/throughput.
-  // Use dump_mt() explicitly when parallel dumping is desired.
-  dump_to(out, v, pretty, 0);
+  // Heuristic default dump():
+  // - Keep small/medium dumps single-threaded (lower overhead, more stable).
+  // - Enable pooled MT dump only when it is likely to pay off.
+  bool use_mt = false;
+  constexpr std::size_t k_mt_min_items = 256;
+  constexpr std::size_t k_mt_min_bytes = 512u;
+  if (detail::effective_threads(0) > 1) {
+    if (v.type() == value::kind::array) {
+      const auto& a = v.as_array();
+      if (a.size() >= k_mt_min_items) {
+        const std::size_t est = (hint != 0) ? hint : detail::estimate_dump_reserve(v, pretty);
+        use_mt = (est >= k_mt_min_bytes);
+      }
+    } else if (v.type() == value::kind::object) {
+      const auto& o = v.as_object();
+      if (o.size() >= k_mt_min_items) {
+        const std::size_t est = (hint != 0) ? hint : detail::estimate_dump_reserve(v, pretty);
+        use_mt = (est >= k_mt_min_bytes);
+      }
+    }
+  }
+
+  if (!use_mt) {
+    dump_to(out, v, pretty, 0);
+  } else {
+    dump_mt_options opt;
+    opt.pretty = pretty;
+    opt.max_threads = 0;
+    opt.min_parallel_items = k_mt_min_items;
+    opt.max_parallel_depth = 1;
+    dump_to_mt(out, v, opt);
+  }
 
   constexpr std::size_t max_hint = 16u * 1024u * 1024u;
   const std::size_t sz = out.size();
@@ -2239,28 +2375,15 @@ inline void parallel_for_chunks(std::size_t n, unsigned threads, Fn&& fn) {
   const std::size_t base = n / threads;
   const std::size_t rem = n % threads;
 
-  internal_array<std::thread> thr(threads);
-  internal_array<std::exception_ptr> ep(threads);
+  internal_array<std::future<void>> fut(threads);
   std::size_t begin = 0;
   for (unsigned t = 0; t < threads; ++t) {
     const std::size_t len = base + (t < rem ? 1u : 0u);
     const std::size_t end = begin + len;
-    ep[t] = nullptr;
-    thr[t] = std::thread([&, t, begin, end]() {
-      try {
-        fn(begin, end);
-      } catch (...) {
-        ep[t] = std::current_exception();
-      }
-    });
+    fut[t] = mt_pool().submit([&, begin, end]() { fn(begin, end); });
     begin = end;
   }
-  for (unsigned t = 0; t < threads; ++t) {
-    if (thr[t].joinable()) thr[t].join();
-  }
-  for (unsigned t = 0; t < threads; ++t) {
-    if (ep[t]) std::rethrow_exception(ep[t]);
-  }
+  for (unsigned t = 0; t < threads; ++t) fut[t].get();
 }
 
 inline bool should_parallelize_container(std::size_t items, unsigned depth, const dump_mt_options& opt, unsigned threads) noexcept {
@@ -2296,35 +2419,24 @@ inline void dump_array_pretty_mt(std::string& out, const value::array& a, int in
     const std::size_t n = a.size();
     const std::size_t base = n / used;
     const std::size_t rem = n % used;
-    internal_array<std::thread> thr(used);
-    internal_array<std::exception_ptr> ep(used);
+    internal_array<std::future<void>> fut(used);
     std::size_t begin = 0;
     for (unsigned t = 0; t < used; ++t) {
       const std::size_t len = base + (t < rem ? 1u : 0u);
       const std::size_t end = begin + len;
-      ep[t] = nullptr;
-      thr[t] = std::thread([&, t, begin, end]() {
-        try {
-          std::string buf;
-          for (std::size_t i = begin; i < end; ++i) {
-            dump_indent(buf, indent + 2);
-            dump_to(buf, a[i], /*pretty=*/true, indent + 2);
-            if (i + 1 != a.size()) buf.push_back(',');
-            buf.push_back('\n');
-          }
-          chunks[t] = std::move(buf);
-        } catch (...) {
-          ep[t] = std::current_exception();
+      fut[t] = mt_pool().submit([&, t, begin, end]() {
+        std::string buf;
+        for (std::size_t i = begin; i < end; ++i) {
+          dump_indent(buf, indent + 2);
+          dump_to(buf, a[i], /*pretty=*/true, indent + 2);
+          if (i + 1 != a.size()) buf.push_back(',');
+          buf.push_back('\n');
         }
+        chunks[t] = std::move(buf);
       });
       begin = end;
     }
-    for (unsigned t = 0; t < used; ++t) {
-      if (thr[t].joinable()) thr[t].join();
-    }
-    for (unsigned t = 0; t < used; ++t) {
-      if (ep[t]) std::rethrow_exception(ep[t]);
-    }
+    for (unsigned t = 0; t < used; ++t) fut[t].get();
   }
 
   for (unsigned t = 0; t < used; ++t) out.append(chunks[t]);
@@ -2361,37 +2473,26 @@ inline void dump_object_pretty_mt(std::string& out, const value::object& o, int 
     const std::size_t n = o.size();
     const std::size_t base = n / used;
     const std::size_t rem = n % used;
-    internal_array<std::thread> thr(used);
-    internal_array<std::exception_ptr> ep(used);
+    internal_array<std::future<void>> fut(used);
     std::size_t begin = 0;
     for (unsigned t = 0; t < used; ++t) {
       const std::size_t len = base + (t < rem ? 1u : 0u);
       const std::size_t end = begin + len;
-      ep[t] = nullptr;
-      thr[t] = std::thread([&, t, begin, end]() {
-        try {
-          std::string buf;
-          for (std::size_t i = begin; i < end; ++i) {
-            dump_indent(buf, indent + 2);
-            dump_escaped(buf, o[i].first);
-            buf.append(": ", 2);
-            dump_to(buf, o[i].second, /*pretty=*/true, indent + 2);
-            if (i + 1 != o.size()) buf.push_back(',');
-            buf.push_back('\n');
-          }
-          chunks[t] = std::move(buf);
-        } catch (...) {
-          ep[t] = std::current_exception();
+      fut[t] = mt_pool().submit([&, t, begin, end]() {
+        std::string buf;
+        for (std::size_t i = begin; i < end; ++i) {
+          dump_indent(buf, indent + 2);
+          dump_escaped(buf, o[i].first);
+          buf.append(": ", 2);
+          dump_to(buf, o[i].second, /*pretty=*/true, indent + 2);
+          if (i + 1 != o.size()) buf.push_back(',');
+          buf.push_back('\n');
         }
+        chunks[t] = std::move(buf);
       });
       begin = end;
     }
-    for (unsigned t = 0; t < used; ++t) {
-      if (thr[t].joinable()) thr[t].join();
-    }
-    for (unsigned t = 0; t < used; ++t) {
-      if (ep[t]) std::rethrow_exception(ep[t]);
-    }
+    for (unsigned t = 0; t < used; ++t) fut[t].get();
   }
 
   for (unsigned t = 0; t < used; ++t) out.append(chunks[t]);
@@ -2441,33 +2542,22 @@ inline void dump_to_mt(std::string& out, const value& v, dump_mt_options opt = {
         const std::size_t n = a.size();
         const std::size_t base = n / used;
         const std::size_t rem = n % used;
-        detail::internal_array<std::thread> thr(used);
-        detail::internal_array<std::exception_ptr> ep(used);
+        detail::internal_array<std::future<void>> fut(used);
         std::size_t begin = 0;
         for (unsigned t = 0; t < used; ++t) {
           const std::size_t len = base + (t < rem ? 1u : 0u);
           const std::size_t end = begin + len;
-          ep[t] = nullptr;
-          thr[t] = std::thread([&, t, begin, end]() {
-            try {
-              std::string buf;
-              for (std::size_t i = begin; i < end; ++i) {
-                if (i != begin) buf.push_back(',');
-                dump_to(buf, a[i], /*pretty=*/false, 0);
-              }
-              chunks[t] = std::move(buf);
-            } catch (...) {
-              ep[t] = std::current_exception();
+          fut[t] = detail::mt_pool().submit([&, t, begin, end]() {
+            std::string buf;
+            for (std::size_t i = begin; i < end; ++i) {
+              if (i != begin) buf.push_back(',');
+              dump_to(buf, a[i], /*pretty=*/false, 0);
             }
+            chunks[t] = std::move(buf);
           });
           begin = end;
         }
-        for (unsigned t = 0; t < used; ++t) {
-          if (thr[t].joinable()) thr[t].join();
-        }
-        for (unsigned t = 0; t < used; ++t) {
-          if (ep[t]) std::rethrow_exception(ep[t]);
-        }
+        for (unsigned t = 0; t < used; ++t) fut[t].get();
 
         out.push_back('[');
         bool first = true;
@@ -2488,35 +2578,24 @@ inline void dump_to_mt(std::string& out, const value& v, dump_mt_options opt = {
         const std::size_t n = o.size();
         const std::size_t base = n / used;
         const std::size_t rem = n % used;
-        detail::internal_array<std::thread> thr(used);
-        detail::internal_array<std::exception_ptr> ep(used);
+        detail::internal_array<std::future<void>> fut(used);
         std::size_t begin = 0;
         for (unsigned t = 0; t < used; ++t) {
           const std::size_t len = base + (t < rem ? 1u : 0u);
           const std::size_t end = begin + len;
-          ep[t] = nullptr;
-          thr[t] = std::thread([&, t, begin, end]() {
-            try {
-              std::string buf;
-              for (std::size_t i = begin; i < end; ++i) {
-                if (i != begin) buf.push_back(',');
-                detail::dump_escaped(buf, o[i].first);
-                buf.push_back(':');
-                dump_to(buf, o[i].second, /*pretty=*/false, 0);
-              }
-              chunks[t] = std::move(buf);
-            } catch (...) {
-              ep[t] = std::current_exception();
+          fut[t] = detail::mt_pool().submit([&, t, begin, end]() {
+            std::string buf;
+            for (std::size_t i = begin; i < end; ++i) {
+              if (i != begin) buf.push_back(',');
+              detail::dump_escaped(buf, o[i].first);
+              buf.push_back(':');
+              dump_to(buf, o[i].second, /*pretty=*/false, 0);
             }
+            chunks[t] = std::move(buf);
           });
           begin = end;
         }
-        for (unsigned t = 0; t < used; ++t) {
-          if (thr[t].joinable()) thr[t].join();
-        }
-        for (unsigned t = 0; t < used; ++t) {
-          if (ep[t]) std::rethrow_exception(ep[t]);
-        }
+        for (unsigned t = 0; t < used; ++t) fut[t].get();
 
         out.push_back('{');
         bool first = true;
@@ -2905,14 +2984,14 @@ struct sv_value {
   static constexpr std::size_t k_tag_offset = 20;
 
   kind type() const noexcept {
-    std::uint32_t t = 0;
-    std::memcpy(&t, reinterpret_cast<const std::byte*>(&u) + k_tag_offset, sizeof(t));
-    return static_cast<kind>(static_cast<std::uint8_t>(t));
+    // Store kind in padding; load a single byte (hot).
+    const auto* p = reinterpret_cast<const unsigned char*>(reinterpret_cast<const std::byte*>(&u) + k_tag_offset);
+    return static_cast<kind>(*p);
   }
 
   void set_kind(kind kk) noexcept {
-    const std::uint32_t t = static_cast<std::uint32_t>(static_cast<std::uint8_t>(kk));
-    std::memcpy(reinterpret_cast<std::byte*>(&u) + k_tag_offset, &t, sizeof(t));
+    auto* p = reinterpret_cast<unsigned char*>(reinterpret_cast<std::byte*>(&u) + k_tag_offset);
+    *p = static_cast<unsigned char>(kk);
   }
 
   sv_value() noexcept {
@@ -6322,19 +6401,97 @@ inline void dump_to(std::string& out, const sv_value& v, bool pretty = false, in
   };
 
   if (!pretty) {
+    // Tiny-payload fast path:
+    // - Array of objects whose members are all scalars (the benchmark payload shape)
+    // - Object whose members are all scalars
+    // Avoids stack-machine overhead and repeated kind checks.
+    auto dump_shallow_scalar = [&](const sv_value& x) -> bool {
+      switch (x.type()) {
+        case sv_value::kind::null:
+          out.append("null", 4);
+          return true;
+        case sv_value::kind::boolean:
+          if (x.as_bool()) out.append("true", 4);
+          else out.append("false", 5);
+          return true;
+        case sv_value::kind::number:
+          dump_number(x.u.num);
+          return true;
+        case sv_value::kind::string:
+          detail::dump_escaped(out, x.as_string_view());
+          return true;
+        default:
+          return false;
+      }
+    };
+
+    auto dump_shallow_object_of_scalars = [&](const sv_value& obj) -> bool {
+      if (obj.type() != sv_value::kind::object) return false;
+      const sv_member* data = obj.u.o.data;
+      const std::uint32_t n = obj.u.o.size;
+      out.push_back('{');
+      if (n == 0) {
+        out.push_back('}');
+        return true;
+      }
+      for (std::uint32_t i = 0; i < n; ++i) {
+        if (i) out.push_back(',');
+        detail::dump_escaped(out, data[i].first);
+        out.push_back(':');
+        if (!dump_shallow_scalar(data[i].second)) return false;
+      }
+      out.push_back('}');
+      return true;
+    };
+
+    auto try_dump_shallow = [&]() -> bool {
+      const auto tk = v.type();
+      if (tk == sv_value::kind::object) {
+        return dump_shallow_object_of_scalars(v);
+      }
+      if (tk != sv_value::kind::array) return false;
+
+      const sv_value* data = v.u.a.data;
+      const std::uint32_t n = v.u.a.size;
+      out.push_back('[');
+      if (n == 0) {
+        out.push_back(']');
+        return true;
+      }
+      for (std::uint32_t i = 0; i < n; ++i) {
+        if (i) out.push_back(',');
+        const sv_value& e = data[i];
+        if (dump_shallow_scalar(e)) continue;
+        if (!dump_shallow_object_of_scalars(e)) return false;
+      }
+      out.push_back(']');
+      return true;
+    };
+
+    const std::size_t shallow_mark = out.size();
+    if (try_dump_shallow()) return;
+    out.resize(shallow_mark);
+
     struct frame {
       const sv_value* v{nullptr};
-      std::size_t idx{0};
+      std::uint32_t idx{0};
+      sv_value::kind k{sv_value::kind::null};
     };
-    frame stack[512];
+    // Keep the on-stack buffer <4KB to avoid __chkstk probing overhead on Windows.
+    // Grow to heap only for very deep nesting.
+    constexpr std::size_t k_small_cap = 240;
+    frame small[k_small_cap];
+    detail::internal_array<frame> heap;
+    frame* stack = small;
+    std::size_t cap = k_small_cap;
     std::size_t sp = 0;
-    stack[sp++] = frame{&v, 0};
+    stack[sp++] = frame{&v, 0u, v.type()};
 
     while (sp != 0) {
       frame& f = stack[sp - 1];
       const sv_value& cur = *f.v;
 
-      switch (cur.type()) {
+      switch (f.k) {
         case sv_value::kind::null:
           out.append("null", 4);
           --sp;
@@ -6353,23 +6510,24 @@ inline void dump_to(std::string& out, const sv_value& v, bool pretty = false, in
           --sp;
           break;
         case sv_value::kind::array: {
-          const auto& a = cur.as_array();
+          const sv_value* data = cur.u.a.data;
+          const std::uint32_t n = cur.u.a.size;
           if (f.idx == 0) {
             out.push_back('[');
-            if (a.empty()) {
+            if (n == 0) {
               out.push_back(']');
               --sp;
               break;
             }
           }
-          if (f.idx == a.size()) {
+          if (f.idx == n) {
             out.push_back(']');
             --sp;
             break;
           }
           if (f.idx > 0) out.push_back(',');
           // Inline scalars to avoid extra stack frames.
-          const sv_value& elem = a[f.idx++];
+          const sv_value& elem = data[f.idx++];
           switch (elem.type()) {
             case sv_value::kind::null:
               out.append("null", 4);
@@ -6385,28 +6543,36 @@ inline void dump_to(std::string& out, const sv_value& v, bool pretty = false, in
               detail::dump_escaped(out, elem.as_string_view());
               break;
             default:
-              stack[sp++] = frame{&elem, 0};
+              if (sp == cap) {
+                const std::size_t new_cap = cap * 2;
+                heap = detail::internal_array<frame>(new_cap);
+                for (std::size_t j = 0; j < cap; ++j) heap[j] = stack[j];
+                stack = heap.get();
+                cap = new_cap;
+              }
+              stack[sp++] = frame{&elem, 0u, elem.type()};
               break;
           }
           break;
         }
         case sv_value::kind::object: {
-          const auto& o = cur.as_object();
+          const sv_member* data = cur.u.o.data;
+          const std::uint32_t n = cur.u.o.size;
           if (f.idx == 0) {
             out.push_back('{');
-            if (o.empty()) {
+            if (n == 0) {
               out.push_back('}');
               --sp;
               break;
             }
           }
-          if (f.idx == o.size()) {
+          if (f.idx == n) {
             out.push_back('}');
             --sp;
             break;
           }
           if (f.idx > 0) out.push_back(',');
-          const auto& kv = o[f.idx++];
+          const sv_member& kv = data[f.idx++];
           detail::dump_escaped(out, kv.first);
           out.push_back(':');
           // Inline scalars to avoid extra stack frames.
@@ -6425,7 +6591,14 @@ inline void dump_to(std::string& out, const sv_value& v, bool pretty = false, in
               detail::dump_escaped(out, kv.second.as_string_view());
               break;
             default:
-              stack[sp++] = frame{&kv.second, 0};
+              if (sp == cap) {
+                const std::size_t new_cap = cap * 2;
+                heap = detail::internal_array<frame>(new_cap);
+                for (std::size_t j = 0; j < cap; ++j) heap[j] = stack[j];
+                stack = heap.get();
+                cap = new_cap;
+              }
+              stack[sp++] = frame{&kv.second, 0u, kv.second.type()};
               break;
           }
           break;
@@ -6550,9 +6723,36 @@ inline std::string dump(const sv_value& v, bool pretty = false) {
     }
   }
 
-  // Default dump() is single-threaded for stable latency/throughput.
-  // Use dump_mt() explicitly when parallel dumping is desired.
-  dump_to(out, v, pretty, 0);
+  // Heuristic default dump():
+  // - Keep small/medium dumps single-threaded.
+  // - Enable pooled MT dump only when it is likely to pay off.
+  bool use_mt = false;
+  constexpr std::size_t k_mt_min_items = 1024;
+  constexpr std::size_t k_mt_min_bytes = 256u * 1024u;
+  if (detail::effective_threads(0) > 1) {
+    if (v.type() == sv_value::kind::array) {
+      if (v.u.a.size >= k_mt_min_items) {
+        const std::size_t est = (hint != 0) ? hint : detail::estimate_dump_reserve(v, pretty);
+        use_mt = (est >= k_mt_min_bytes);
+      }
+    } else if (v.type() == sv_value::kind::object) {
+      if (v.u.o.size >= k_mt_min_items) {
+        const std::size_t est = (hint != 0) ? hint : detail::estimate_dump_reserve(v, pretty);
+        use_mt = (est >= k_mt_min_bytes);
+      }
+    }
+  }
+
+  if (!use_mt) {
+    dump_to(out, v, pretty, 0);
+  } else {
+    dump_mt_options opt;
+    opt.pretty = pretty;
+    opt.max_threads = 0;
+    opt.min_parallel_items = k_mt_min_items;
+    opt.max_parallel_depth = 1;
+    dump_to_mt(out, v, opt);
+  }
 
   constexpr std::size_t max_hint = 16u * 1024u * 1024u;
   const std::size_t sz = out.size();
@@ -6614,7 +6814,7 @@ inline void dump_to_mt(std::string& out, const sv_value& v, dump_mt_options opt 
             for (unsigned t = 0; t < used; ++t) {
               const std::size_t len = base + (t < rem ? 1u : 0u);
               const std::size_t end = begin + len;
-              ctx.fut[t] = std::async(std::launch::async, [&, t, begin, end]() {
+              ctx.fut[t] = detail::mt_pool().submit([&, t, begin, end]() {
                 std::string& buf = ctx.chunks[t];
                 buf.clear();
                 buf.reserve((end - begin) * 80u);
@@ -6650,7 +6850,7 @@ inline void dump_to_mt(std::string& out, const sv_value& v, dump_mt_options opt 
             for (unsigned t = 0; t < used; ++t) {
               const std::size_t len = base + (t < rem ? 1u : 0u);
               const std::size_t end = begin + len;
-              ctx.fut[t] = std::async(std::launch::async, [&, t, begin, end]() {
+              ctx.fut[t] = detail::mt_pool().submit([&, t, begin, end]() {
                 std::string& buf = ctx.chunks[t];
                 buf.clear();
                 buf.reserve((end - begin) * 96u);
@@ -6713,7 +6913,7 @@ inline void dump_to_mt(std::string& out, const sv_value& v, dump_mt_options opt 
         for (unsigned t = 0; t < used; ++t) {
           const std::size_t len = base + (t < rem ? 1u : 0u);
           const std::size_t end = begin + len;
-          ctx.fut[t] = std::async(std::launch::async, [&, t, begin, end]() {
+          ctx.fut[t] = detail::mt_pool().submit([&, t, begin, end]() {
             std::string& buf = ctx.chunks[t];
             buf.clear();
             buf.reserve((end - begin) * 96u);
@@ -6765,7 +6965,7 @@ inline void dump_to_mt(std::string& out, const sv_value& v, dump_mt_options opt 
         for (unsigned t = 0; t < used; ++t) {
           const std::size_t len = base + (t < rem ? 1u : 0u);
           const std::size_t end = begin + len;
-          ctx.fut[t] = std::async(std::launch::async, [&, t, begin, end]() {
+          ctx.fut[t] = detail::mt_pool().submit([&, t, begin, end]() {
             std::string& buf = ctx.chunks[t];
             buf.clear();
             buf.reserve((end - begin) * 128u);

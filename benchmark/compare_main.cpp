@@ -296,6 +296,12 @@ bench_result bench_chjson_dump_dom(std::string_view json, std::size_t iters) {
     std::exit(1);
   }
 
+  // Warm-up: stabilize tiny-payload measurements (code paging/branching/allocator).
+  {
+    auto out = chjson::dump(r.doc.root());
+    do_not_optimize(out.size());
+  }
+
   const auto t0 = clock_type::now();
   std::size_t bytes = 0;
   for (std::size_t i = 0; i < iters; ++i) {
@@ -444,6 +450,14 @@ bench_result bench_rapidjson_dump(std::string_view json_text, std::size_t iters)
     std::exit(1);
   }
 
+  // Warm-up: stabilize tiny-payload measurements.
+  {
+    StringBuffer sb;
+    Writer<StringBuffer> w(sb);
+    d.Accept(w);
+    do_not_optimize(sb.GetSize());
+  }
+
   const auto t0 = clock_type::now();
   std::size_t bytes = 0;
   for (std::size_t i = 0; i < iters; ++i) {
@@ -454,7 +468,7 @@ bench_result bench_rapidjson_dump(std::string_view json_text, std::size_t iters)
     do_not_optimize(sb.GetSize());
   }
   const auto t1 = clock_type::now();
-  return {std::chrono::duration<double>(t1 - t0).count(), bytes};
+  return {std::chrono::duration<double>(t1 - t0).count(), bytes}; 
 }
 
 } // namespace
