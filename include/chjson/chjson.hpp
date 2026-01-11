@@ -826,6 +826,7 @@ struct owned_number_value {
 
 inline double parse_double(const char* first, const char* last) {
   const std::size_t len = static_cast<std::size_t>(last - first);
+
   // Fast path: chfloat.
 #if CHJSON_HAS_CHFLOAT
   {
@@ -951,32 +952,18 @@ inline bool parse_number(const char* buf, std::size_t size, std::size_t& i, numb
 
   const std::size_t digits_begin = p;
 
-  // Integer accumulation while scanning digits (one pass for integers).
-  // We still need the full token span for float parsing fallback.
-  std::uint64_t acc = 0;
-  bool overflow = false;
-
+  // First, scan the token to determine whether it is an integer or float.
+  // For floats, avoid doing integer accumulation/overflow tracking while scanning.
   if (buf[p] == '0') {
-    acc = 0;
     ++p;
     if (p < size && is_digit(buf[p])) return false;
   } else {
     const char c0 = buf[p];
     if (c0 < '1' || c0 > '9') return false;
-    acc = static_cast<std::uint64_t>(c0 - '0');
     ++p;
-    while (p < size && is_digit(buf[p])) {
-      const std::uint64_t d = static_cast<std::uint64_t>(buf[p] - '0');
-      if (!overflow) {
-        if (acc > (std::numeric_limits<std::uint64_t>::max() - d) / 10u) {
-          overflow = true;
-        } else {
-          acc = acc * 10u + d;
-        }
-      }
-      ++p;
-    }
+    while (p < size && is_digit(buf[p])) ++p;
   }
+  const std::size_t digits_end = p;
 
   bool is_int = true;
   if (p < size && buf[p] == '.') {
@@ -1007,6 +994,20 @@ inline bool parse_number(const char* buf, std::size_t size, std::size_t& i, numb
     out.is_int = false;
     if (parse_fp) out.d = parse_double(token_first, token_last);
     return true;
+  }
+
+  // Integer: compute value with overflow tracking (second pass over digits only).
+  std::uint64_t acc = 0;
+  bool overflow = false;
+  for (std::size_t k = digits_begin; k < digits_end; ++k) {
+    const std::uint64_t d = static_cast<std::uint64_t>(buf[k] - '0');
+    if (!overflow) {
+      if (acc > (std::numeric_limits<std::uint64_t>::max() - d) / 10u) {
+        overflow = true;
+      } else {
+        acc = acc * 10u + d;
+      }
+    }
   }
 
   if (overflow) {
@@ -2949,6 +2950,28 @@ struct sv_number_value {
   }
 };
 
+namespace detail {
+
+// Slow path for sv_value::as_double*(): parse raw token and cache the resulting double.
+// Kept out-of-line to keep hot numeric access small and more optimizer-friendly.
+#if defined(_MSC_VER)
+__declspec(noinline)
+#elif defined(__clang__) || defined(__GNUC__)
+__attribute__((noinline))
+#endif
+inline double parse_double_and_cache(const sv_number_value& n) noexcept {
+  const std::uint32_t flags = n.raw_size_flags;
+  const std::uint32_t raw_n = flags & sv_number_value::k_size_mask;
+  if (n.raw_data != nullptr && raw_n != 0) {
+    n.set_double_value(detail::parse_double(std::string_view(n.raw_data, raw_n)));
+    n.set_has_double(true);
+    return n.double_value();
+  }
+  return n.double_value();
+}
+
+} // namespace detail
+
 struct sv_value;
 struct sv_member;
 struct sv_array_view;
@@ -3106,13 +3129,7 @@ struct sv_value {
     const std::uint32_t flags = n.raw_size_flags;
     if ((flags & sv_number_value::k_has_double) != 0) return n.double_value();
     if ((flags & sv_number_value::k_is_int) != 0) return static_cast<double>(n.int_value());
-    const std::uint32_t raw_n = flags & sv_number_value::k_size_mask;
-    if (n.raw_data != nullptr && raw_n != 0) {
-      n.set_double_value(detail::parse_double(std::string_view(n.raw_data, raw_n)));
-      n.set_has_double(true);
-      return n.double_value();
-    }
-    return n.double_value();
+    return detail::parse_double_and_cache(n);
   }
 
   // Fast path: assumes this value is a number.
@@ -3122,13 +3139,7 @@ struct sv_value {
     const std::uint32_t flags = n.raw_size_flags;
     if ((flags & sv_number_value::k_has_double) != 0) return n.double_value();
     if ((flags & sv_number_value::k_is_int) != 0) return static_cast<double>(n.int_value());
-    const std::uint32_t raw_n = flags & sv_number_value::k_size_mask;
-    if (n.raw_data != nullptr && raw_n != 0) {
-      n.set_double_value(detail::parse_double(std::string_view(n.raw_data, raw_n)));
-      n.set_has_double(true);
-      return n.double_value();
-    }
-    return n.double_value();
+    return detail::parse_double_and_cache(n);
   }
 
   std::string_view as_string_view() const {
@@ -4564,13 +4575,21 @@ struct no_string_parser {
   std::size_t i{0};
   parse_options opt;
 
-  std::string_view copy_number_token(std::string_view token) {
-    // This fast path does not keep a backing buffer, so we must materialize
-    // non-integer number tokens into the arena to preserve dump() round-trips.
+  char* backing{nullptr};
+
+  void ensure_backing() {
+    if (backing != nullptr) return;
     auto* mr = doc->resource();
-    char* dst = static_cast<char*>(mr->allocate(token.size(), alignof(char)));
-    if (!token.empty()) std::memcpy(dst, token.data(), token.size());
-    return std::string_view(dst, token.size());
+    backing = static_cast<char*>(mr->allocate(size, alignof(char)));
+    if (size != 0) std::memcpy(backing, buf, size);
+  }
+
+  std::string_view number_token_view(std::size_t start, std::size_t len) {
+    // This parser does not keep `document.buffer_`, but we still want round-trip
+    // dump() semantics for float tokens without doing per-token allocations.
+    // Allocate + copy the full input into the arena once and create views into it.
+    ensure_backing();
+    return std::string_view(backing + start, len);
   }
 
   error run_inplace(document& d, std::string_view json) {
@@ -4581,6 +4600,7 @@ struct no_string_parser {
     buf = json.data();
     size = json.size();
     i = 0;
+    backing = nullptr;
 
     error err;
     detail::skip_ws(buf, size, i);
@@ -4628,7 +4648,7 @@ struct no_string_parser {
             return nullptr;
           }
           if (num.is_int) return sv_value::integer(num.i);
-          const std::string_view tok = copy_number_token(std::string_view(buf + start, i - start));
+          const std::string_view tok = number_token_view(start, i - start);
           return sv_value::number_token_with_double(tok, num.d);
         }
         set_error(e, error_code::invalid_value);
@@ -4719,7 +4739,7 @@ struct no_string_parser {
             dst->u.num.set_is_int(true);
             dst->u.num.set_has_double(false);
           } else {
-            const std::string_view tok = copy_number_token(std::string_view(buf + start, i - start));
+            const std::string_view tok = number_token_view(start, i - start);
             dst->u.num = {};
             dst->set_kind(sv_value::kind::number);
             dst->u.num.raw_data = nullptr;
@@ -5479,13 +5499,355 @@ inline document_parse_result parse(std::string_view json, parse_options opt) {
 
   // Fast path: if the input contains no strings (no '"'), we don't need to keep
   // a backing buffer for string_view lifetimes. Parsing from the read-only input
-  // avoids a full memcpy, which dominates Parse+sum(numbers).
+  // avoids a full memcpy. However, for float-heavy, number-dense inputs, the
+  // no-string parser must materialize raw number tokens into the arena (no
+  // backing buffer), which can be slower than keeping a single backing buffer
+  // and storing token views into it.
   if (CHJSON_PARSE_DOM_NO_STRING_FASTPATH && json.size() != 0 &&
       std::memchr(json.data(), '"', json.size()) == nullptr) {
-    r.doc.arena().reserve_bytes(estimate_arena_reserve(json.size(), /*no_strings=*/true));
-    no_string_parser p;
-    p.opt = opt;
-    r.err = p.run_inplace(r.doc, json);
+    // Heuristic: for float-heavy no-string inputs above a modest size, prefer
+    // keeping a backing buffer so number tokens can be views into that single
+    // copy (instead of per-token arena materialization).
+    bool fp_heavy = false;
+    {
+      const std::size_t probe = (json.size() < 4096u) ? json.size() : 4096u;
+      const void* dot = std::memchr(json.data(), '.', probe);
+      const void* e1 = std::memchr(json.data(), 'e', probe);
+      const void* e2 = std::memchr(json.data(), 'E', probe);
+      fp_heavy = (dot != nullptr) || (e1 != nullptr) || (e2 != nullptr);
+    }
+
+    // For very large float-heavy inputs, it is typically faster to keep a backing
+    // buffer (raw number tokens become views into that single copy).
+    // For small/medium inputs, allocating/storing a backing buffer inside `document`
+    // can be slower than the no-string path due to per-parse heap allocation.
+    constexpr std::size_t kFpBackedMinBytes = 16u * 1024u * 1024u;
+    const bool prefer_backing_buffer = fp_heavy && (json.size() >= kFpBackedMinBytes);
+
+    if (!prefer_backing_buffer) {
+      r.doc.arena().reserve_bytes(estimate_arena_reserve(json.size(), /*no_strings=*/true));
+      no_string_parser p;
+      p.opt = opt;
+      r.err = p.run_inplace(r.doc, json);
+      return r;
+    }
+
+    // For float-heavy no-string inputs where we keep a backing buffer, additionally
+    // parse top-level numbers-only arrays with a dedicated fast path.
+    {
+      const unsigned threads = detail::effective_threads(0);
+      std::size_t top_i = 0;
+      detail::skip_ws(json, top_i);
+      if (top_i < json.size() && json[top_i] == '[') {
+        // Prepare document backing buffer.
+        r.doc.reserve_buffer(json.size());
+        r.doc.root() = sv_value(nullptr);
+        r.doc.arena().clear();
+        r.doc.buffer_.resize(json.size());
+        char* dst = r.doc.buffer_.data();
+        if (json.size() != 0) std::memcpy(dst, json.data(), json.size());
+
+        const std::string_view src(dst, json.size());
+        auto set_err_abs = [&](error_code code, std::size_t abs_off) {
+          r.err.code = code;
+          r.err.offset = abs_off;
+          detail::update_line_col(src, abs_off, r.err.line, r.err.column);
+        };
+
+        // Find closing bracket and validate trailing text if required.
+        std::size_t inner_begin = top_i + 1;
+        detail::skip_ws(src, inner_begin);
+        std::size_t close_pos = src.size();
+        // Scan backwards to find the top-level ']'. (No strings in this mode.)
+        {
+          std::size_t j = src.size();
+          while (j > inner_begin) {
+            const char c = src[j - 1];
+            if (!detail::is_ws(c)) {
+              if (c != ']') {
+                set_err_abs(error_code::unexpected_eof, src.size());
+                return r;
+              }
+              close_pos = j - 1;
+              break;
+            }
+            --j;
+          }
+          if (close_pos == src.size()) {
+            set_err_abs(error_code::unexpected_eof, src.size());
+            return r;
+          }
+        }
+        std::size_t after = close_pos + 1;
+        detail::skip_ws(src, after);
+        if (opt.require_eof && after != src.size()) {
+          set_err_abs(error_code::trailing_characters, after);
+          return r;
+        }
+
+        // Empty array.
+        if (inner_begin >= close_pos) {
+          sv_value root = sv_value::make_array(r.doc.resource());
+          r.doc.root() = root;
+          r.err = {};
+          return r;
+        }
+
+        auto is_num_start = [](char c) noexcept { return c == '-' || (c >= '0' && c <= '9'); };
+
+        // Quick check: if the first non-ws element is not a number, bail to normal parser.
+        std::size_t probe = inner_begin;
+        detail::skip_ws(src, probe);
+        if (probe < close_pos && is_num_start(src[probe])) {
+          const bool do_parallel = (threads > 1) && (json.size() >= (32u * 1024u * 1024u));
+
+          if (do_parallel) {
+            // Parallel plan: split [inner_begin, close_pos) by commas.
+            const unsigned used = threads;
+            struct chunk {
+              std::size_t b{0};
+              std::size_t e{0};
+              std::size_t count{0};
+            };
+            std::vector<chunk> chunks(used);
+            const std::size_t inner_len = close_pos - inner_begin;
+
+            auto fix_begin = [&](std::size_t b, std::size_t e) -> std::size_t {
+              if (b <= inner_begin) return inner_begin;
+              // Move forward to after next comma.
+              for (std::size_t k = b; k < e; ++k) {
+                if (src[k] == ',') return k + 1;
+              }
+              return e;
+            };
+            auto fix_end = [&](std::size_t b, std::size_t e) -> std::size_t {
+              if (e >= close_pos) return close_pos;
+              // Move backward to before previous comma.
+              std::size_t k = e;
+              while (k > b) {
+                if (src[k - 1] == ',') return k - 1;
+                --k;
+              }
+              return b;
+            };
+
+            for (unsigned t = 0; t < used; ++t) {
+              const std::size_t raw_b = inner_begin + (inner_len * static_cast<std::size_t>(t)) / used;
+              const std::size_t raw_e = inner_begin + (inner_len * static_cast<std::size_t>(t + 1)) / used;
+              std::size_t b = raw_b;
+              std::size_t e = raw_e;
+              if (t != 0) b = fix_begin(b, close_pos);
+              if (t + 1 != used) e = fix_end(b, e);
+              if (e > close_pos) e = close_pos;
+              if (b > e) b = e;
+              chunks[t].b = b;
+              chunks[t].e = e;
+            }
+
+            // Count commas in each chunk to get element counts.
+            for (unsigned t = 0; t < used; ++t) {
+              const std::size_t b = chunks[t].b;
+              const std::size_t e = chunks[t].e;
+              if (b >= e) {
+                chunks[t].count = 0;
+                continue;
+              }
+              // If chunk is only whitespace, count=0.
+              std::size_t p2 = b;
+              detail::skip_ws(src, p2);
+              if (p2 >= e) {
+                chunks[t].count = 0;
+                continue;
+              }
+              std::size_t c = 1;
+              for (std::size_t k = p2; k < e; ++k) {
+                if (src[k] == ',') ++c;
+              }
+              chunks[t].count = c;
+            }
+
+            std::vector<std::size_t> prefix(used + 1, 0);
+            for (unsigned t = 0; t < used; ++t) prefix[t + 1] = prefix[t] + chunks[t].count;
+            const std::size_t total = prefix[used];
+            if (total == 0) {
+              sv_value root = sv_value::make_array(r.doc.resource());
+              r.doc.root() = root;
+              r.err = {};
+              return r;
+            }
+
+            // Allocate root storage once.
+            sv_value root = sv_value::make_array(r.doc.resource());
+            root.array_reserve(r.doc.resource(), static_cast<std::uint32_t>(total));
+            root.u.a.size = static_cast<std::uint32_t>(total);
+            r.doc.root() = root;
+            sv_value* out = r.doc.root().u.a.data;
+
+            // Parse in parallel.
+            std::vector<std::future<error>> fut(used);
+            for (unsigned t = 0; t < used; ++t) {
+              fut[t] = std::async(std::launch::async, [&, t]() -> error {
+                const std::size_t b0 = chunks[t].b;
+                const std::size_t e0 = chunks[t].e;
+                if (chunks[t].count == 0 || b0 >= e0) return {};
+                std::size_t pos = b0;
+                std::size_t out_i = prefix[t];
+                while (pos < e0) {
+                  detail::skip_ws(src, pos);
+                  if (pos >= e0) break;
+                  if (!is_num_start(src[pos])) {
+                    error e;
+                    e.code = error_code::invalid_number;
+                    e.offset = pos;
+                    detail::update_line_col(src, e.offset, e.line, e.column);
+                    return e;
+                  }
+                  detail::number_value num;
+                  const std::size_t start = pos;
+                  if (!detail::parse_number(dst, src.size(), pos, num, /*parse_fp=*/true)) {
+                    error e;
+                    e.code = error_code::invalid_number;
+                    e.offset = start;
+                    detail::update_line_col(src, e.offset, e.line, e.column);
+                    return e;
+                  }
+                  if (out_i >= total) {
+                    error e;
+                    e.code = error_code::invalid_value;
+                    e.offset = start;
+                    detail::update_line_col(src, e.offset, e.line, e.column);
+                    return e;
+                  }
+                  if (num.is_int) {
+                    out[out_i++] = sv_value::integer(num.i);
+                  } else {
+                    // Keep token view into backing buffer for round-trip dump.
+                    out[out_i++] = sv_value::number_token_with_double(std::string_view(dst + start, pos - start), num.d);
+                  }
+
+                  detail::skip_ws(src, pos);
+                  if (pos >= e0) break;
+                  if (src[pos] != ',') {
+                    error e;
+                    e.code = error_code::expected_comma_or_end;
+                    e.offset = pos;
+                    detail::update_line_col(src, e.offset, e.line, e.column);
+                    return e;
+                  }
+                  ++pos;
+                }
+                return {};
+              });
+            }
+
+            // Join + pick first error.
+            for (unsigned t = 0; t < used; ++t) {
+              const error e = fut[t].get();
+              if (e) {
+                r.err = e;
+                // Fall back to normal parse for correctness.
+                r.doc.root() = sv_value(nullptr);
+                r.doc.arena().clear();
+                r.doc.arena().reserve_bytes(estimate_arena_reserve(json.size(), /*no_strings=*/false));
+                insitu_parser p;
+                p.opt = opt;
+                r.err = p.run_inplace(r.doc);
+                return r;
+              }
+            }
+
+            r.err = {};
+            return r;
+          }
+
+          // Single-thread numbers-only array fast path (moderate-size inputs).
+          {
+            std::size_t total = 0;
+            {
+              std::size_t p2 = inner_begin;
+              detail::skip_ws(src, p2);
+              if (p2 < close_pos) {
+                total = 1;
+                for (std::size_t k = p2; k < close_pos; ++k) {
+                  if (src[k] == ',') ++total;
+                }
+              }
+            }
+
+            if (total == 0) {
+              sv_value root = sv_value::make_array(r.doc.resource());
+              r.doc.root() = root;
+              r.err = {};
+              return r;
+            }
+
+            sv_value root = sv_value::make_array(r.doc.resource());
+            root.array_reserve(r.doc.resource(), static_cast<std::uint32_t>(total));
+            root.u.a.size = static_cast<std::uint32_t>(total);
+            r.doc.root() = root;
+            sv_value* out = r.doc.root().u.a.data;
+
+            std::size_t pos = inner_begin;
+            std::size_t out_i = 0;
+            while (pos < close_pos) {
+              detail::skip_ws(src, pos);
+              if (pos >= close_pos) break;
+              if (!is_num_start(src[pos])) {
+                // Not a pure numbers-only array; fall back.
+                break;
+              }
+              detail::number_value num;
+              const std::size_t start = pos;
+              if (!detail::parse_number(dst, src.size(), pos, num, /*parse_fp=*/true)) {
+                break;
+              }
+              if (out_i >= total) {
+                break;
+              }
+              if (num.is_int) {
+                out[out_i++] = sv_value::integer(num.i);
+              } else {
+                out[out_i++] = sv_value::number_token_with_double(std::string_view(dst + start, pos - start), num.d);
+              }
+              detail::skip_ws(src, pos);
+              if (pos >= close_pos) break;
+              if (src[pos] != ',') {
+                // Not a pure numbers-only array; fall back.
+                break;
+              }
+              ++pos;
+            }
+
+            if (out_i == total) {
+              r.err = {};
+              return r;
+            }
+
+            // Fall back to normal parse for correctness.
+            r.doc.root() = sv_value(nullptr);
+            r.doc.arena().clear();
+            r.doc.arena().reserve_bytes(estimate_arena_reserve(json.size(), /*no_strings=*/false));
+            insitu_parser p;
+            p.opt = opt;
+            r.err = p.run_inplace(r.doc);
+            return r;
+          }
+        }
+      }
+    }
+
+    // Backing-buffer single-thread fallback (covers moderate-size float-heavy inputs).
+    r.doc.reserve_buffer(json.size());
+    r.doc.root() = sv_value(nullptr);
+    r.doc.arena().clear();
+    r.doc.buffer_.resize(json.size());
+    if (json.size() != 0) std::memcpy(r.doc.buffer_.data(), json.data(), json.size());
+    r.doc.arena().reserve_bytes(estimate_arena_reserve(json.size(), /*no_strings=*/false));
+    {
+      insitu_parser p;
+      p.opt = opt;
+      r.err = p.run_inplace(r.doc);
+    }
     return r;
   }
 
