@@ -246,6 +246,7 @@ Notes:
 
 - Object member order is preserved; `find()` returns the **first** matching key if duplicates exist.
 - `object_emplace_back()` stores the key as a `std::string_view`; if you build DOM values programmatically, ensure the key storage outlives the DOM (or store/copy it into the arena yourself).
+- For non-integer numbers stored as raw tokens, `as_double()` parses the token lazily on first call and caches the resulting `double` inside the value for subsequent calls. `as_double_unchecked()` has the same caching behavior but skips type checking.
 
 ### 2) Fully owning DOM: `value` (legacy / convenient construction)
 
