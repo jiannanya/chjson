@@ -1,6 +1,6 @@
 # chjson
 
-A high performance **C++17** JSON library.
+A super high performance **C++17** JSON library.
 
 Design goals:
 
@@ -76,6 +76,24 @@ Include:
 
 `chjson` provides multiple parse entry points depending on the lifetime/ownership model you want.
 
+### Which parse API should I use?
+
+- Use `parse()` when you want the recommended default: an owning `document` with good all-around performance.
+  - It may use MT parsing for large top-level arrays/objects.
+  - If the input contains no strings (no `"`), it may take a no-string fast path (see below).
+- Use `parse_in_situ()` when you can provide a mutable `std::string` buffer and want maximum throughput.
+  - This can be the fastest mode because it avoids copying strings/keys and can decode escapes in-place.
+  - Many `string_view`s will point into `document::buffer()`.
+- Use `parse_view()` when you want a non-mutating parse and can guarantee the source buffer outlives the parsed `view_document`.
+  - Unescaped strings/keys may be zero-copy `string_view`s into the source.
+- Use `parse_owning_view()` when you have read-only input but still need an owning `document`, and you want to avoid copying the full JSON text.
+  - Strings/keys are copied into the arena; `document::buffer()` is not used.
+
+Notes about numbers:
+
+- `sv_value` may preserve the raw token for non-integer numbers to enable exact round-trip `dump()` and lazy `double` parsing.
+- When parsing inputs with no strings, `parse()` can still preserve float tokens efficiently by allocating + copying the full input into the arena at most once (on-demand) and storing token views into that backing.
+
 ### Primary API: `parse()` (owning `document`)
 
 ```cpp
@@ -99,6 +117,12 @@ What it does:
 
 - Parses into an arena-backed DOM (`sv_value`) stored inside an owning `document`.
 - By default, `document` owns a backing buffer, so many strings/keys can be returned as `std::string_view`.
+  - Note: `document::buffer()` is an implementation detail of the chosen parse path. In particular, `parse_owning_view()` (and `parse()` when it takes the no-string fast path) may produce a valid owning DOM without storing the full original JSON text in `document::buffer()`.
+- For inputs that contain **no `"` characters** (i.e. there are no JSON strings at all), `parse()` may use a **no-string fast path**:
+  - It parses from the read-only input without storing `document::buffer()`.
+  - Numbers are parsed eagerly into `int64_t` / `double`.
+  - For non-integer numbers, `chjson` preserves the original raw token for exact round-trip dumping. To do that efficiently, the parser may allocate + copy the full input **once** into the arena on-demand and store number token views into that backing.
+  - For very large float-heavy inputs, `parse()` may prefer keeping a backing buffer (so number tokens can be views into the single buffer copy).
 - For large top-level arrays/objects, `parse()` may use a multithreaded path (see [Configuration macros](#configuration-macros)).
 
 ### In-situ parse: `parse_in_situ()`
@@ -344,17 +368,27 @@ All macros must be defined **before** including `<chjson/chjson.hpp>`.
 - `CHJSON_USE_TLS_PARSE_CACHE` (default `1`)
 - `CHJSON_TLS_PARSE_BUFFER_MAX` (default `4 MiB`)
 - `CHJSON_TLS_PARSE_ARENA_MAX` (default `16 MiB`)
+- `CHJSON_PARSE_DOM_ARENA_RESERVE_MAX` (default `16 MiB`)
 - `CHJSON_TLS_PARSE_MT_BACKING_MAX` (default `16 MiB`)
 - `CHJSON_TLS_PARSE_MT_RESOURCES_MAX` (default `64`)
+
+These caches primarily target workloads that call `chjson::parse()` repeatedly in a tight loop.
 
 ### Parse(dom) fast paths / MT thresholds
 
 - `CHJSON_PARSE_DOM_NO_STRING_FASTPATH` (default `1`)
-  - Enables a special fast path for inputs with **no `"` characters**.
+  - Enables a special fast path for inputs with **no `"` characters** (no JSON strings).
 - `CHJSON_PARSE_MT_MIN_BYTES` (default `256 KiB`)
 - `CHJSON_PARSE_MT_MIN_SPANS` (default `64`)
-- `CHJSON_PARSE_MT_MIN_AVG_SPAN_BYTES` (default `4 KiB`)
+- `CHJSON_PARSE_MT_MIN_AVG_SPAN_BYTES` (default `2 KiB`)
 - `CHJSON_PARSE_MT_SCAN_SIMD` (default `0`)
+
+### Internal allocation / number scratch
+
+- `CHJSON_USE_INTERNAL_ALLOCATOR` (default `1`)
+  - Enables an internal sized allocator for some hot internal allocations (arena blocks, MT-parse backing/resources, and some owned number storage).
+- `CHJSON_TLS_LONG_NUMBER_SCRATCH_MAX` (default `256 KiB`)
+  - Caps the per-thread scratch buffer used for parsing very long floating-point tokens (NUL-termination workaround for `strtod`).
 
 ---
 
@@ -396,6 +430,9 @@ int main() {
   auto r = chjson::parse(json);
   if (r.err) return 1;
 
+  // Note: `parse()` may choose different internal strategies; do not assume
+  // `r.doc.buffer()` always contains the full original JSON text.
+
   const chjson::sv_value& root = r.doc.root();
   const chjson::sv_value* a = root.find("a");
   if (a && a->is_array()) {
@@ -421,7 +458,8 @@ int main() {
   auto r = chjson::parse_in_situ(std::move(json));
   if (r.err) return 1;
 
-  // Many string_views point into r.doc.buffer().
+  // In-situ parsing is the most common mode where many string_views point into
+  // `r.doc.buffer()` (because the input buffer is owned and mutated in-place).
   std::string_view buf = r.doc.buffer();
   (void)buf;
 
