@@ -689,27 +689,28 @@ struct number_value {
 struct owned_number_value {
   // For non-integers, keep the original token for fast dump and lazy double parse.
   // If raw token is empty, use `d`.
-  bool is_int{false};
   std::int64_t i{0};
-  mutable bool has_double{false};
   mutable double d{0.0};
 
   // Compact small-string storage for raw number tokens.
   // Avoids heap allocations for common tokens without bloating value size.
   static constexpr std::size_t kInlineRawCap = 32;
 
-  std::uint32_t raw_len{0};
-  bool raw_is_heap{false};
   union {
     char raw_inline[kInlineRawCap];
     char* raw_heap;
   };
 
+  // Keep small fields at the end to minimize padding.
+  std::uint32_t raw_len{0};
+  bool is_int{false};
+  mutable bool has_double{false};
+  bool raw_is_heap{false};
+
   owned_number_value() noexcept : raw_inline{} {}
 
   owned_number_value(const owned_number_value& other)
-      : is_int(other.is_int), i(other.i), has_double(other.has_double), d(other.d), raw_len(other.raw_len), raw_is_heap(false),
-        raw_inline{} {
+      : i(other.i), d(other.d), raw_inline{}, raw_len(other.raw_len), is_int(other.is_int), has_double(other.has_double), raw_is_heap(false) {
     if (other.raw_len == 0) return;
     if (other.raw_is_heap) {
       raw_is_heap = true;
@@ -744,8 +745,7 @@ struct owned_number_value {
   }
 
   owned_number_value(owned_number_value&& other) noexcept
-      : is_int(other.is_int), i(other.i), has_double(other.has_double), d(other.d), raw_len(other.raw_len), raw_is_heap(other.raw_is_heap),
-        raw_inline{} {
+      : i(other.i), d(other.d), raw_inline{}, raw_len(other.raw_len), is_int(other.is_int), has_double(other.has_double), raw_is_heap(other.raw_is_heap) {
     if (raw_len == 0) {
       raw_is_heap = false;
       return;
@@ -2702,6 +2702,9 @@ private:
 struct sv_raw_view {
   const char* data;
   std::uint32_t size;
+  std::uint32_t _pad0;
+  std::uint32_t _pad1;
+  std::uint32_t _tag;
 };
 
 struct sv_number_value {
@@ -2720,6 +2723,7 @@ struct sv_number_value {
   mutable std::uint64_t payload;
   const char* raw_data;
   mutable std::uint32_t raw_size_flags;
+  std::uint32_t _tag;
 
   std::int64_t int_value() const noexcept {
     std::int64_t x;
@@ -2778,15 +2782,18 @@ struct sv_value {
     sv_value* data;
     std::uint32_t size;
     std::uint32_t cap;
+    std::uint32_t _pad;
+    std::uint32_t _tag;
   };
 
   struct object_data {
     sv_member* data;
     std::uint32_t size;
     std::uint32_t cap;
+    std::uint32_t _pad;
+    std::uint32_t _tag;
   };
 
-  kind k{kind::null};
   union {
     bool b;
     sv_number_value num;
@@ -2795,54 +2802,79 @@ struct sv_value {
     object_data o;
   } u;
 
-  sv_value() noexcept : k(kind::null) { u.a = {}; }
-  sv_value(std::nullptr_t) noexcept : k(kind::null) { u.a = {}; }
-  explicit sv_value(bool vb) : k(kind::boolean) { u.b = vb; }
-  explicit sv_value(std::string_view vs) : k(kind::string) {
-    u.s = {vs.data(), static_cast<std::uint32_t>(vs.size())};
+  static constexpr std::size_t k_tag_offset = 20;
+
+  kind type() const noexcept {
+    std::uint32_t t = 0;
+    std::memcpy(&t, reinterpret_cast<const std::byte*>(&u) + k_tag_offset, sizeof(t));
+    return static_cast<kind>(static_cast<std::uint8_t>(t));
+  }
+
+  void set_kind(kind kk) noexcept {
+    const std::uint32_t t = static_cast<std::uint32_t>(static_cast<std::uint8_t>(kk));
+    std::memcpy(reinterpret_cast<std::byte*>(&u) + k_tag_offset, &t, sizeof(t));
+  }
+
+  sv_value() noexcept {
+    u.a = {};
+    set_kind(kind::null);
+  }
+  sv_value(std::nullptr_t) noexcept {
+    u.a = {};
+    set_kind(kind::null);
+  }
+  explicit sv_value(bool vb) {
+    u.a = {};
+    u.b = vb;
+    set_kind(kind::boolean);
+  }
+  explicit sv_value(std::string_view vs) {
+    u.s = {};
+    u.s.data = vs.data();
+    u.s.size = static_cast<std::uint32_t>(vs.size());
+    set_kind(kind::string);
   }
 
   static sv_value make_array(std::pmr::memory_resource*) {
     sv_value v;
-    v.k = kind::array;
     v.u.a = {};
+    v.set_kind(kind::array);
     return v;
   }
 
   static sv_value make_object(std::pmr::memory_resource*) {
     sv_value v;
-    v.k = kind::object;
     v.u.o = {};
+    v.set_kind(kind::object);
     return v;
   }
 
   static sv_value integer(std::int64_t vi) {
     sv_value v;
-    v.k = kind::number;
     v.u.num = {};
     v.u.num.set_int_value(vi);
     v.u.num.raw_data = nullptr;
     v.u.num.raw_size_flags = 0;
     v.u.num.set_is_int(true);
     v.u.num.set_has_double(false);
+    v.set_kind(kind::number);
     return v;
   }
 
   static sv_value number(double vd) {
     sv_value v;
-    v.k = kind::number;
     v.u.num = {};
     v.u.num.set_double_value(vd);
     v.u.num.raw_data = nullptr;
     v.u.num.raw_size_flags = 0;
     v.u.num.set_is_int(false);
     v.u.num.set_has_double(true);
+    v.set_kind(kind::number);
     return v;
   }
 
   static sv_value number_token(std::string_view token) {
     sv_value v;
-    v.k = kind::number;
     v.u.num = {};
     v.u.num.raw_data = nullptr;
     v.u.num.raw_size_flags = 0;
@@ -2850,12 +2882,12 @@ struct sv_value {
     v.u.num.set_has_double(false);
     v.u.num.set_raw_span(token.data(), static_cast<std::uint32_t>(token.size()));
     v.u.num.payload = 0;
+    v.set_kind(kind::number);
     return v;
   }
 
   static sv_value number_token_with_double(std::string_view token, double vd) {
     sv_value v;
-    v.k = kind::number;
     v.u.num = {};
     v.u.num.raw_data = nullptr;
     v.u.num.raw_size_flags = 0;
@@ -2863,17 +2895,16 @@ struct sv_value {
     v.u.num.set_has_double(true);
     v.u.num.set_raw_span(token.data(), static_cast<std::uint32_t>(token.size()));
     v.u.num.set_double_value(vd);
+    v.set_kind(kind::number);
     return v;
   }
 
-  kind type() const noexcept { return k; }
-
-  bool is_null() const noexcept { return k == kind::null; }
-  bool is_bool() const noexcept { return k == kind::boolean; }
-  bool is_number() const noexcept { return k == kind::number; }
-  bool is_string() const noexcept { return k == kind::string; }
-  bool is_array() const noexcept { return k == kind::array; }
-  bool is_object() const noexcept { return k == kind::object; }
+  bool is_null() const noexcept { return type() == kind::null; }
+  bool is_bool() const noexcept { return type() == kind::boolean; }
+  bool is_number() const noexcept { return type() == kind::number; }
+  bool is_string() const noexcept { return type() == kind::string; }
+  bool is_array() const noexcept { return type() == kind::array; }
+  bool is_object() const noexcept { return type() == kind::object; }
 
   bool as_bool() const {
     if (!is_bool()) throw std::runtime_error("chjson: not bool");
@@ -2966,6 +2997,9 @@ struct sv_member {
   std::string_view first{};
   sv_value second{nullptr};
 };
+
+static_assert(sizeof(void*) != 8 || sizeof(sv_value) == 24, "expected compact sv_value on 64-bit");
+static_assert(sizeof(void*) != 8 || sizeof(sv_member) == 40, "expected compact sv_member on 64-bit");
 
 struct sv_array_view {
   const sv_value* data{nullptr};
@@ -3599,8 +3633,8 @@ struct view_parser {
     ++i; // '['
     detail::skip_ws(buf, size, i);
     sv_value out;
-    out.k = sv_value::kind::array;
     out.u.a = {};
+    out.set_kind(sv_value::kind::array);
 
     auto* mr = doc->resource();
     auto reserve = [&](std::uint32_t want) {
@@ -3745,8 +3779,8 @@ struct view_parser {
     ++i; // '{'
     detail::skip_ws(buf, size, i);
     sv_value out;
-    out.k = sv_value::kind::object;
     out.u.o = {};
+    out.set_kind(sv_value::kind::object);
 
     auto* mr = doc->resource();
     auto reserve = [&](std::uint32_t want) {
@@ -4441,8 +4475,8 @@ struct no_string_parser {
     ++i; // '['
     detail::skip_ws(buf, size, i);
     sv_value out;
-    out.k = sv_value::kind::array;
     out.u.a = {};
+    out.set_kind(sv_value::kind::array);
 
     auto* mr = doc->resource();
     auto reserve = [&](std::uint32_t want) {
@@ -4497,9 +4531,9 @@ struct no_string_parser {
           }
           if (out.u.a.size == out.u.a.cap) reserve(out.u.a.size + 1u);
           sv_value* dst = &out.u.a.data[out.u.a.size++];
-          dst->k = sv_value::kind::number;
           if (num.is_int) {
             dst->u.num = {};
+            dst->set_kind(sv_value::kind::number);
             dst->u.num.raw_data = nullptr;
             dst->u.num.raw_size_flags = 0;
             dst->u.num.set_int_value(num.i);
@@ -4508,6 +4542,7 @@ struct no_string_parser {
           } else {
             const std::string_view tok = copy_number_token(std::string_view(buf + start, i - start));
             dst->u.num = {};
+            dst->set_kind(sv_value::kind::number);
             dst->u.num.raw_data = nullptr;
             dst->u.num.raw_size_flags = 0;
             dst->u.num.set_is_int(false);
@@ -4609,8 +4644,8 @@ struct no_string_parser {
     }
     ++i; // '}'
     sv_value out;
-    out.k = sv_value::kind::object;
     out.u.o = {};
+    out.set_kind(sv_value::kind::object);
     return out;
   }
 };
@@ -4911,8 +4946,8 @@ struct insitu_parser {
     ++i; // '['
     detail::skip_ws(buf, size, i);
     sv_value out;
-    out.k = sv_value::kind::array;
     out.u.a = {};
+    out.set_kind(sv_value::kind::array);
 
     auto* mr = doc->resource();
     auto reserve = [&](std::uint32_t want) {
@@ -5050,8 +5085,8 @@ struct insitu_parser {
     ++i; // '{'
     detail::skip_ws(buf, size, i);
     sv_value out;
-    out.k = sv_value::kind::object;
     out.u.o = {};
+    out.set_kind(sv_value::kind::object);
 
     auto* mr = doc->resource();
     auto reserve = [&](std::uint32_t want) {
