@@ -1677,6 +1677,16 @@ inline std::size_t find_first_escape(std::string_view s) noexcept {
   const char* p = s.data();
   const std::size_t n = s.size();
 
+  // Very small strings are common in object keys; avoid SSE setup overhead.
+  if (n < 16) {
+    for (std::size_t i = 0; i < n; ++i) {
+      const unsigned char uc = static_cast<unsigned char>(p[i]);
+      const char c = p[i];
+      if (c == '"' || c == '\\' || uc <= 0x1F) return i;
+    }
+    return n;
+  }
+
 #if defined(_M_X64) || defined(__SSE2__)
   const __m128i q = _mm_set1_epi8('"');
   const __m128i bs = _mm_set1_epi8('\\');
@@ -1867,6 +1877,14 @@ inline unsigned effective_threads(unsigned max_threads) noexcept {
     return hc == 0 ? 1u : hc;
   }
   return max_threads;
+}
+
+inline void maybe_reserve_small_aware(std::string& out, std::size_t cap) {
+  // Avoid forcing heap allocation for tiny outputs (SSO).
+  // For short strings / small objects and low iteration counts, an unconditional
+  // reserve() dominates runtime and makes throughput look terrible.
+  constexpr std::size_t k_sso_friendly_threshold = 32;
+  if (cap > k_sso_friendly_threshold) out.reserve(cap);
 }
 
 } // namespace detail
@@ -2105,28 +2123,61 @@ inline void dump_to(std::string& out, const value& v, bool pretty = false, int i
 
 inline std::string dump(const value& v, bool pretty = false) {
   struct dump_reserve_hints {
-    std::size_t compact{256};
-    std::size_t pretty{256};
+    std::size_t compact{0};
+    std::size_t pretty{0};
   };
   thread_local dump_reserve_hints hints;
 
   std::string out;
   std::size_t& hint = pretty ? hints.pretty : hints.compact;
-  out.reserve(hint);
 
-  // Default dump(): use the MT-aware dumper.
-  // It will only parallelize when the top-level container is large enough.
-  dump_mt_options opt;
-  opt.pretty = pretty;
-  opt.max_threads = 0;
-  opt.min_parallel_items = 1024;
-  opt.max_parallel_depth = 1;
-  dump_to_mt(out, v, opt);
+  if (hint != 0) {
+    detail::maybe_reserve_small_aware(out, hint);
+  } else {
+    // First call on this thread: avoid a full pre-traversal, but still prevent
+    // repeated realloc/copies for moderately sized containers.
+    constexpr std::size_t max_hint = 16u * 1024u * 1024u;
+    if (v.type() == value::kind::array) {
+      const auto& a = v.as_array();
+      if (a.size() >= 16) {
+        const std::size_t guess = std::min<std::size_t>(max_hint, a.size() * 64u + 2u);
+        detail::maybe_reserve_small_aware(out, guess);
+      }
+    } else if (v.type() == value::kind::object) {
+      const auto& o = v.as_object();
+      if (o.size() >= 16) {
+        const std::size_t guess = std::min<std::size_t>(max_hint, o.size() * 64u + 2u);
+        detail::maybe_reserve_small_aware(out, guess);
+      }
+    }
+  }
 
-  constexpr std::size_t min_hint = 256;
+  // Hybrid default dump():
+  // - Small values: single-threaded to avoid MT wrapper overhead.
+  // - Large top-level containers: MT-aware dump for maximum throughput.
+  bool use_mt = false;
+  if (v.type() == value::kind::array) {
+    const auto& a = v.as_array();
+    use_mt = (a.size() >= 1024);
+  } else if (v.type() == value::kind::object) {
+    const auto& o = v.as_object();
+    use_mt = (o.size() >= 1024);
+  }
+
+  if (!use_mt) {
+    dump_to(out, v, pretty, 0);
+  } else {
+    dump_mt_options opt;
+    opt.pretty = pretty;
+    opt.max_threads = 0;
+    opt.min_parallel_items = 1024;
+    opt.max_parallel_depth = 1;
+    dump_to_mt(out, v, opt);
+  }
+
   constexpr std::size_t max_hint = 16u * 1024u * 1024u;
   const std::size_t sz = out.size();
-  hint = (sz < min_hint) ? min_hint : (sz > max_hint ? max_hint : sz);
+  hint = (sz > max_hint) ? max_hint : sz;
   return out;
 }
 
@@ -2460,7 +2511,15 @@ inline void dump_to_mt(std::string& out, const value& v, dump_mt_options opt = {
 
 inline std::string dump_mt(const value& v, dump_mt_options opt = {}) {
   std::string out;
-  out.reserve(detail::estimate_dump_reserve(v, opt.pretty));
+  // Estimating reserve can cost as much as dumping for tiny values; only do it
+  // when it is likely to pay off (large containers).
+  if (v.type() == value::kind::array) {
+    const auto& a = v.as_array();
+    if (a.size() >= 32) detail::maybe_reserve_small_aware(out, detail::estimate_dump_reserve(v, opt.pretty));
+  } else if (v.type() == value::kind::object) {
+    const auto& o = v.as_object();
+    if (o.size() >= 32) detail::maybe_reserve_small_aware(out, detail::estimate_dump_reserve(v, opt.pretty));
+  }
   dump_to_mt(out, v, opt);
   return out;
 }
@@ -6289,7 +6348,25 @@ inline void dump_to(std::string& out, const sv_value& v, bool pretty = false, in
           const auto& kv = o[f.idx++];
           detail::dump_escaped(out, kv.first);
           out.push_back(':');
-          stack[sp++] = frame{&kv.second, 0};
+          // Inline scalars to avoid extra stack frames.
+          switch (kv.second.type()) {
+            case sv_value::kind::null:
+              out.append("null", 4);
+              break;
+            case sv_value::kind::boolean:
+              if (kv.second.as_bool()) out.append("true", 4);
+              else out.append("false", 5);
+              break;
+            case sv_value::kind::number:
+              dump_number(kv.second.u.num);
+              break;
+            case sv_value::kind::string:
+              detail::dump_escaped(out, kv.second.as_string_view());
+              break;
+            default:
+              stack[sp++] = frame{&kv.second, 0};
+              break;
+          }
           break;
         }
       }
@@ -6346,30 +6423,94 @@ inline void dump_to(std::string& out, const sv_value& v, bool pretty = false, in
 // Forward declaration: forced-mt dump() wrapper calls this.
 inline void dump_to_mt(std::string& out, const sv_value& v, dump_mt_options opt);
 
+namespace detail {
+
+inline std::size_t estimate_dump_reserve(const sv_value& v, bool pretty) {
+  (void)pretty;
+  switch (v.type()) {
+    case sv_value::kind::null: return 4;
+    case sv_value::kind::boolean: return 5;
+    case sv_value::kind::number: {
+      // int64 or token/double
+      return v.is_int() ? 24u : 32u;
+    }
+    case sv_value::kind::string:
+      return 2 + v.as_string_view().size();
+    case sv_value::kind::array: {
+      const auto& a = v.as_array();
+      std::size_t sum = 2; // [ ]
+      if (!a.empty()) sum += (a.size() - 1);
+      for (const auto& e : a) sum += estimate_dump_reserve(e, pretty);
+      return sum;
+    }
+    case sv_value::kind::object: {
+      const auto& o = v.as_object();
+      std::size_t sum = 2; // { }
+      if (!o.empty()) sum += (o.size() - 1);
+      for (auto kv : o) {
+        sum += 2 + kv.first.size();
+        sum += 1; // ':'
+        sum += estimate_dump_reserve(kv.second, pretty);
+      }
+      return sum;
+    }
+  }
+  return 256;
+}
+
+} // namespace detail
+
 inline std::string dump(const sv_value& v, bool pretty = false) {
   struct dump_reserve_hints {
-    std::size_t compact{256};
-    std::size_t pretty{256};
+    std::size_t compact{0};
+    std::size_t pretty{0};
   };
   thread_local dump_reserve_hints hints;
 
   std::string out;
   std::size_t& hint = pretty ? hints.pretty : hints.compact;
-  out.reserve(hint);
 
-  // Default dump(): use the MT-aware dumper.
-  // It will only parallelize when the top-level container is large enough.
-  dump_mt_options opt;
-  opt.pretty = pretty;
-  opt.max_threads = 0;
-  opt.min_parallel_items = 1024;
-  opt.max_parallel_depth = 1;
-  dump_to_mt(out, v, opt);
+  if (hint != 0) {
+    detail::maybe_reserve_small_aware(out, hint);
+  } else {
+    // Same heuristic as value-version.
+    constexpr std::size_t max_hint = 16u * 1024u * 1024u;
+    if (v.type() == sv_value::kind::array) {
+      if (v.u.a.size >= 16) {
+        const std::size_t guess = std::min<std::size_t>(max_hint, static_cast<std::size_t>(v.u.a.size) * 64u + 2u);
+        detail::maybe_reserve_small_aware(out, guess);
+      }
+    } else if (v.type() == sv_value::kind::object) {
+      if (v.u.o.size >= 16) {
+        const std::size_t guess = std::min<std::size_t>(max_hint, static_cast<std::size_t>(v.u.o.size) * 64u + 2u);
+        detail::maybe_reserve_small_aware(out, guess);
+      }
+    }
+  }
 
-  constexpr std::size_t min_hint = 256;
+  // Hybrid default dump(): small values single-threaded, large top-level
+  // containers use MT-aware dump.
+  bool use_mt = false;
+  if (v.type() == sv_value::kind::array) {
+    use_mt = (v.u.a.size >= 1024);
+  } else if (v.type() == sv_value::kind::object) {
+    use_mt = (v.u.o.size >= 1024);
+  }
+
+  if (!use_mt) {
+    dump_to(out, v, pretty, 0);
+  } else {
+    dump_mt_options opt;
+    opt.pretty = pretty;
+    opt.max_threads = 0;
+    opt.min_parallel_items = 1024;
+    opt.max_parallel_depth = 1;
+    dump_to_mt(out, v, opt);
+  }
+
   constexpr std::size_t max_hint = 16u * 1024u * 1024u;
   const std::size_t sz = out.size();
-  hint = (sz < min_hint) ? min_hint : (sz > max_hint ? max_hint : sz);
+  hint = (sz > max_hint) ? max_hint : sz;
   return out;
 }
 
@@ -6609,7 +6750,12 @@ inline void dump_to_mt(std::string& out, const sv_value& v, dump_mt_options opt 
 
 inline std::string dump_mt(const sv_value& v, dump_mt_options opt = {}) {
   std::string out;
-  out.reserve(256);
+  // Same rationale as value-version: avoid the estimator cost on tiny inputs.
+  if (v.type() == sv_value::kind::array) {
+    if (v.u.a.size >= 32) detail::maybe_reserve_small_aware(out, detail::estimate_dump_reserve(v, opt.pretty));
+  } else if (v.type() == sv_value::kind::object) {
+    if (v.u.o.size >= 32) detail::maybe_reserve_small_aware(out, detail::estimate_dump_reserve(v, opt.pretty));
+  }
   dump_to_mt(out, v, opt);
   return out;
 }

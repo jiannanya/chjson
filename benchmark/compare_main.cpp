@@ -516,6 +516,41 @@ int main(int argc, char** argv) {
     do_not_optimize(d.GetType());
   }
 
+  // Warm-up for dump (helps runs=1 represent steady-state behavior)
+  {
+    auto r = chjson::parse(payload);
+    auto out = chjson::dump(r.doc.root());
+    do_not_optimize(out.size());
+  }
+  {
+    auto j = nlohmann::json::parse(payload, nullptr, false, false);
+    std::string out = j.dump();
+    do_not_optimize(out.size());
+  }
+  {
+    Json::CharReaderBuilder builder;
+    Json::Value root;
+    std::string errs;
+    const std::unique_ptr<Json::CharReader> reader(builder.newCharReader());
+    (void)reader->parse(payload.data(), payload.data() + payload.size(), &root, &errs);
+    Json::StreamWriterBuilder wb;
+    wb["indentation"] = "";
+    wb["emitUTF8"] = true;
+    wb["useSpecialFloats"] = false;
+    wb["precision"] = 17;
+    wb["precisionType"] = "significant";
+    std::string out = Json::writeString(wb, root);
+    do_not_optimize(out.size());
+  }
+  {
+    rapidjson::Document d;
+    d.Parse(payload.data(), payload.size());
+    rapidjson::StringBuffer sb;
+    rapidjson::Writer<rapidjson::StringBuffer> w(sb);
+    d.Accept(w);
+    do_not_optimize(sb.GetSize());
+  }
+
   // Warm-up for number-heavy payload
   {
     auto r = chjson::parse(numbers_payload);
