@@ -1742,7 +1742,7 @@ inline void dump_escaped(std::string& out, std::string_view s) {
     out.push_back('"');
     return;
   }
-
+ 
   if (first > 0) out.append(data, first);
 
   std::size_t chunk_begin = first;
@@ -1908,11 +1908,12 @@ inline void dump_compact_iter(std::string& out, const value& root) {
 
     switch (v.type()) {
       case value::kind::null:
-        out += "null";
+        out.append("null", 4);
         --sp;
         break;
       case value::kind::boolean:
-        out += v.as_bool() ? "true" : "false";
+        if (v.as_bool()) out.append("true", 4);
+        else out.append("false", 5);
         --sp;
         break;
       case value::kind::number:
@@ -1977,10 +1978,11 @@ inline void dump_to_compact(std::string& out, const value& v);
 inline void dump_to_pretty(std::string& out, const value& v, int indent) {
   switch (v.type()) {
     case value::kind::null:
-      out += "null";
+      out.append("null", 4);
       return;
     case value::kind::boolean:
-      out += v.as_bool() ? "true" : "false";
+      if (v.as_bool()) out.append("true", 4);
+      else out.append("false", 5);
       return;
     case value::kind::number: {
       if (v.is_int()) detail::dump_int64(out, v.as_int());
@@ -2085,7 +2087,36 @@ inline void dump_to(std::string& out, const value& v, bool pretty = false, int i
             break;
           }
           if (f.idx > 0) out.push_back(',');
-          stack[sp++] = frame{&a[f.idx++], 0};
+          // Inline scalars to avoid extra stack frames.
+          const value& elem = a[f.idx++];
+          switch (elem.data_.index()) {
+            case 0:
+              out.append("null", 4);
+              break;
+            case 1:
+              if (std::get<bool>(elem.data_)) out.append("true", 4);
+              else out.append("false", 5);
+              break;
+            case 2: {
+              const auto& n = std::get<detail::owned_number_value>(elem.data_);
+              if (n.is_int) {
+                detail::dump_int64(out, n.i);
+              } else if (const auto tok = n.raw_token(); !tok.empty()) {
+                out.append(tok.data(), tok.size());
+              } else {
+                detail::dump_double(out, n.d);
+              }
+              break;
+            }
+            case 3: {
+              const auto& s = std::get<std::string>(elem.data_);
+              detail::dump_escaped(out, s);
+              break;
+            }
+            default:
+              stack[sp++] = frame{&elem, 0};
+              break;
+          }
           break;
         }
         case 5: { // object
@@ -2107,7 +2138,36 @@ inline void dump_to(std::string& out, const value& v, bool pretty = false, int i
           const auto& kv = o[f.idx++];
           detail::dump_escaped(out, kv.first);
           out.push_back(':');
-          stack[sp++] = frame{&kv.second, 0};
+          // Inline scalars to avoid extra stack frames.
+          const value& vv = kv.second;
+          switch (vv.data_.index()) {
+            case 0:
+              out.append("null", 4);
+              break;
+            case 1:
+              if (std::get<bool>(vv.data_)) out.append("true", 4);
+              else out.append("false", 5);
+              break;
+            case 2: {
+              const auto& n = std::get<detail::owned_number_value>(vv.data_);
+              if (n.is_int) {
+                detail::dump_int64(out, n.i);
+              } else if (const auto tok = n.raw_token(); !tok.empty()) {
+                out.append(tok.data(), tok.size());
+              } else {
+                detail::dump_double(out, n.d);
+              }
+              break;
+            }
+            case 3: {
+              const auto& s = std::get<std::string>(vv.data_);
+              detail::dump_escaped(out, s);
+              break;
+            }
+            default:
+              stack[sp++] = frame{&vv, 0};
+              break;
+          }
           break;
         }
         default:
@@ -2152,28 +2212,9 @@ inline std::string dump(const value& v, bool pretty = false) {
     }
   }
 
-  // Hybrid default dump():
-  // - Small values: single-threaded to avoid MT wrapper overhead.
-  // - Large top-level containers: MT-aware dump for maximum throughput.
-  bool use_mt = false;
-  if (v.type() == value::kind::array) {
-    const auto& a = v.as_array();
-    use_mt = (a.size() >= 1024);
-  } else if (v.type() == value::kind::object) {
-    const auto& o = v.as_object();
-    use_mt = (o.size() >= 1024);
-  }
-
-  if (!use_mt) {
-    dump_to(out, v, pretty, 0);
-  } else {
-    dump_mt_options opt;
-    opt.pretty = pretty;
-    opt.max_threads = 0;
-    opt.min_parallel_items = 1024;
-    opt.max_parallel_depth = 1;
-    dump_to_mt(out, v, opt);
-  }
+  // Default dump() is single-threaded for stable latency/throughput.
+  // Use dump_mt() explicitly when parallel dumping is desired.
+  dump_to(out, v, pretty, 0);
 
   constexpr std::size_t max_hint = 16u * 1024u * 1024u;
   const std::size_t sz = out.size();
@@ -6295,11 +6336,12 @@ inline void dump_to(std::string& out, const sv_value& v, bool pretty = false, in
 
       switch (cur.type()) {
         case sv_value::kind::null:
-          out += "null";
+          out.append("null", 4);
           --sp;
           break;
         case sv_value::kind::boolean:
-          out += cur.as_bool() ? "true" : "false";
+          if (cur.as_bool()) out.append("true", 4);
+          else out.append("false", 5);
           --sp;
           break;
         case sv_value::kind::number:
@@ -6326,7 +6368,26 @@ inline void dump_to(std::string& out, const sv_value& v, bool pretty = false, in
             break;
           }
           if (f.idx > 0) out.push_back(',');
-          stack[sp++] = frame{&a[f.idx++], 0};
+          // Inline scalars to avoid extra stack frames.
+          const sv_value& elem = a[f.idx++];
+          switch (elem.type()) {
+            case sv_value::kind::null:
+              out.append("null", 4);
+              break;
+            case sv_value::kind::boolean:
+              if (elem.as_bool()) out.append("true", 4);
+              else out.append("false", 5);
+              break;
+            case sv_value::kind::number:
+              dump_number(elem.u.num);
+              break;
+            case sv_value::kind::string:
+              detail::dump_escaped(out, elem.as_string_view());
+              break;
+            default:
+              stack[sp++] = frame{&elem, 0};
+              break;
+          }
           break;
         }
         case sv_value::kind::object: {
@@ -6376,10 +6437,11 @@ inline void dump_to(std::string& out, const sv_value& v, bool pretty = false, in
 
   switch (v.type()) {
     case sv_value::kind::null:
-      out += "null";
+      out.append("null", 4);
       return;
     case sv_value::kind::boolean:
-      out += v.as_bool() ? "true" : "false";
+      if (v.as_bool()) out.append("true", 4);
+      else out.append("false", 5);
       return;
     case sv_value::kind::number:
       dump_number(v.u.num);
@@ -6488,25 +6550,9 @@ inline std::string dump(const sv_value& v, bool pretty = false) {
     }
   }
 
-  // Hybrid default dump(): small values single-threaded, large top-level
-  // containers use MT-aware dump.
-  bool use_mt = false;
-  if (v.type() == sv_value::kind::array) {
-    use_mt = (v.u.a.size >= 1024);
-  } else if (v.type() == sv_value::kind::object) {
-    use_mt = (v.u.o.size >= 1024);
-  }
-
-  if (!use_mt) {
-    dump_to(out, v, pretty, 0);
-  } else {
-    dump_mt_options opt;
-    opt.pretty = pretty;
-    opt.max_threads = 0;
-    opt.min_parallel_items = 1024;
-    opt.max_parallel_depth = 1;
-    dump_to_mt(out, v, opt);
-  }
+  // Default dump() is single-threaded for stable latency/throughput.
+  // Use dump_mt() explicitly when parallel dumping is desired.
+  dump_to(out, v, pretty, 0);
 
   constexpr std::size_t max_hint = 16u * 1024u * 1024u;
   const std::size_t sz = out.size();
