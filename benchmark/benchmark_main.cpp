@@ -12,13 +12,13 @@
 
 namespace {
 
-using clock_type = std::chrono::high_resolution_clock;
+using clock_type = std::chrono::steady_clock;
 
 template <class T>
 inline void do_not_optimize(const T& v) {
 #if defined(_MSC_VER)
-  volatile const char* p = reinterpret_cast<const char*>(&v);
-  (void)p;
+  const volatile unsigned char* p = reinterpret_cast<const unsigned char*>(&v);
+  (void)*p;
 #else
   asm volatile("" : : "g"(v) : "memory");
 #endif
@@ -59,6 +59,28 @@ std::string make_payload(std::size_t n_objects, std::size_t str_len) {
   return s;
 }
 
+std::string make_workload(std::string_view mode, std::size_t count, std::size_t str_len) {
+  if (mode == "objects") return make_payload(count, str_len);
+  if (mode == "scalar") return "123";
+  std::string out = "[";
+  for (std::size_t i = 0; i < count; ++i) {
+    if (i) out += ',';
+    if (mode == "integers") out += std::to_string(i);
+    else if (mode == "floats") out += (i % 2) ? "3.141592653589793" : "1.23456789e-10";
+    else if (mode == "strings") out += '"' + std::string(str_len, 'x') + '"';
+    else if (mode == "escaped_strings") out += "\"\\n" + std::string(str_len, 'x') + "\\u4F60\\u597D\"";
+    else if (mode == "utf8_strings") {
+      out += '"';
+      for (std::size_t j = 0; j < str_len / 6; ++j) out += "\xE4\xBD\xA0\xE5\xA5\xBD";
+      out += std::string(str_len % 6, 'x') + '"';
+    }
+    else if (mode == "empty") out += "{\"a\":[],\"b\":{}}";
+    else throw std::invalid_argument("unknown workload; use objects, integers, floats, strings, escaped_strings, utf8_strings, empty, or scalar");
+  }
+  out += ']';
+  return out;
+}
+
 struct bench_result {
   double seconds{0.0};
   std::size_t bytes{0};
@@ -83,6 +105,7 @@ bench_result bench_parse_dom(std::string_view json, std::size_t iters) {
   const auto t0 = clock_type::now();
   for (std::size_t i = 0; i < iters; ++i) {
     auto r = chjson::parse(json);
+    if (r.err) throw std::runtime_error("benchmark input did not parse");
     do_not_optimize(r.err.code);
     do_not_optimize(r.doc.root().type());
   }
@@ -103,6 +126,7 @@ bench_result bench_parse_insitu(std::string_view json, std::size_t iters, std::s
   const auto t0 = clock_type::now();
   for (std::size_t i = 0; i < iters; ++i) {
     auto err = chjson::parse_in_situ_into(doc, json);
+    if (err) throw std::runtime_error("benchmark input did not parse");
     do_not_optimize(err.code);
     do_not_optimize(doc.root().type());
   }
@@ -151,9 +175,28 @@ int main(int argc, char** argv) {
   if (argc >= 2) n_objects = static_cast<std::size_t>(std::stoull(argv[1]));
   if (argc >= 3) iters = static_cast<std::size_t>(std::stoull(argv[2]));
   if (argc >= 4) runs = static_cast<std::size_t>(std::stoull(argv[3]));
+  const std::string_view mode = argc >= 5 ? argv[4] : "objects";
+  if (argc >= 6) str_len = static_cast<std::size_t>(std::stoull(argv[5]));
+  if (iters == 0 || runs == 0) {
+    std::cerr << "iterations and runs must be positive\n";
+    return 2;
+  }
 
-  const std::string payload = make_payload(n_objects, str_len);
+  const std::string payload = make_workload(mode, n_objects, str_len);
+  std::cout << "workload: " << mode << "\n";
   std::cout << "payload bytes: " << payload.size() << "\n";
+
+  // A fresh thread has no inherited parse caches. Measure cold document storage
+  // separately from the reused arena below; neither is process RSS.
+  std::size_t cold_used = 0, cold_committed = 0;
+  std::thread measure([&] {
+    auto parsed = chjson::parse(payload);
+    if (parsed.err) std::abort();
+    cold_used = parsed.doc.arena().bytes_used();
+    cold_committed = parsed.doc.arena().bytes_committed();
+  });
+  measure.join();
+  std::cout << "cold arena used bytes: " << cold_used << ", committed bytes: " << cold_committed << '\n';
 
   // Warm-up
   {

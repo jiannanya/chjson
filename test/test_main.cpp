@@ -8,6 +8,7 @@ void test_structure();
 void test_errors();
 void test_dom();
 void test_random();
+void test_regressions();
 
 int main() {
   test_numbers();
@@ -16,6 +17,7 @@ int main() {
   test_errors();
   test_dom();
   test_random();
+  test_regressions();
 
   std::cout << "chjson tests passed\n";
   return 0;

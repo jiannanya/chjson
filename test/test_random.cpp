@@ -155,5 +155,28 @@ void test_random() {
     auto pr2 = parse_value(s2);
     CHJSON_CHECK(!pr2.err);
     CHJSON_CHECK(s2 == dump(pr2.val));
+
+    // The arena-backed modes must agree with the owning reference DOM too.
+    auto dom = parse(s);
+    auto view = parse_view(s);
+    auto own = parse_owning_view(s);
+    auto insitu = parse_in_situ(s);
+    CHJSON_CHECK(!dom.err && !view.err && !own.err && !insitu.err);
+    CHJSON_CHECK(dump(dom.doc.root()) == s2);
+    CHJSON_CHECK(dump(view.doc.root()) == s2);
+    CHJSON_CHECK(dump(own.doc.root()) == s2);
+    CHJSON_CHECK(dump(insitu.doc.root()) == s2);
+
+    // Deterministic mutation fuzzing exercises invalid inputs and recovery.
+    if (!s.empty()) {
+      std::string mutated = s;
+      const char mutations[] = {0, '"', '\\', '}', ']', ',', ':', '\n', '/', '0', static_cast<char>(0xFF)};
+      mutated[r.range(mutated.size())] = mutations[r.range(sizeof(mutations))];
+      const bool invalid = static_cast<bool>(parse_value(mutated).err);
+      CHJSON_CHECK(static_cast<bool>(parse(mutated).err) == invalid);
+      CHJSON_CHECK(static_cast<bool>(parse_view(mutated).err) == invalid);
+      CHJSON_CHECK(static_cast<bool>(parse_owning_view(mutated).err) == invalid);
+      CHJSON_CHECK(static_cast<bool>(parse_in_situ(mutated).err) == invalid);
+    }
   }
 }

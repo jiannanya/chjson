@@ -1,6 +1,6 @@
 # chjson
 
-A super high performance **C++17** JSON library.
+A header-only **C++17** JSON library with an arena-backed DOM, strict UTF-8 parsing, and optional parallel parsing/serialization.
 
 Design goals:
 
@@ -183,7 +183,7 @@ namespace chjson {
 }
 ```
 
-This is a throughput helper for parsing many independent JSON documents concurrently.
+This is a throughput helper for parsing many independent JSON documents concurrently. Workers are reused through a shared thread pool. Parsing within a pool worker runs serially to avoid nested waits and extra worker creation. Scheduling failures may throw; all already-started tasks finish before the call exits.
 
 ---
 
@@ -223,7 +223,7 @@ namespace chjson {
     bool is_int() const noexcept;
     std::int64_t as_int() const;
     double as_double() const;
-    double as_double_unchecked() const noexcept; // UB if not number
+    double as_double_unchecked() const; // UB if not number; allocation failures may throw
 
     std::string_view as_string_view() const;
 
@@ -247,6 +247,25 @@ Notes:
 - Object member order is preserved; `find()` returns the **first** matching key if duplicates exist.
 - `object_emplace_back()` stores the key as a `std::string_view`; if you build DOM values programmatically, ensure the key storage outlives the DOM (or store/copy it into the arena yourself).
 - For non-integer numbers stored as raw tokens, `as_double()` parses the token lazily on first call and caches the resulting `double` inside the value for subsequent calls. `as_double_unchecked()` has the same caching behavior but skips type checking.
+
+
+### Storage reuse and explicit release
+
+Small arenas start at 1 KiB. Empty containers and scalar roots do not reserve container storage. Containers grow their last arena allocation in place when space is available; other growth retains the usual monotonic arena lifetime. Large flat numeric arrays are counted before allocation, avoiding abandoned growth buffers. Long string arrays reserve space for DOM elements separately from the input text.
+
+```cpp
+chjson::document doc;
+auto err = chjson::parse_in_situ_into(doc, R"({"items":[1,2,3]})");
+doc.clear();                 // invalidate the DOM, retain buffer/arena capacity
+doc.reset();                 // invalidate the DOM and release this document's storage
+chjson::release_thread_caches(); // release idle parse, number scratch, and MT dump caches on this thread
+```
+
+`release_thread_caches()` does not invalidate live documents, release another thread's caches, or stop the shared worker pool. With the experimental internal allocator enabled, pool pages still remain allocated until process exit. Allocator-level release does not guarantee an immediate reduction in process RSS.
+
+Parsed strings/keys and number tokens remain valid when an owning `document` is moved, including short inputs. The moved-from document has a null root and can be reused. `clear()`, `reset()`, reparsing, and backing-buffer reallocation invalidate existing views. A `view_document` still requires its original source to remain alive.
+
+Numbers stored as raw tokens cache their `double` conversion on access. Concurrent first-time numeric access to the same value requires external synchronization. `as_double()` and `as_double_unchecked()` may throw if an unusually long token needs scratch storage and allocation fails.
 
 ### 2) Fully owning DOM: `value` (legacy / convenient construction)
 
@@ -303,7 +322,7 @@ namespace chjson {
 
 ## Error handling
 
-Parsing never throws by default. All parse results include an error object:
+Syntax errors and allocation failures inside the public parse functions are returned through the error object. Exceptions from argument construction, allocation-dependent debug STL result construction, or OS thread creation can still propagate. Allocation failures report `out_of_memory` with offset 0, line 1, column 1. All parse results include an error object:
 
 ```cpp
 namespace chjson {
@@ -358,8 +377,8 @@ All macros must be defined **before** including `<chjson/chjson.hpp>`.
 
 ### Floating-point parsing backend
 
-- `CHJSON_USE_FROM_CHARS_DOUBLE` (default `0`)
-  - When set to `1`, prefers `std::from_chars` for doubles where supported.
+- `CHJSON_USE_FROM_CHARS_DOUBLE` (default `1`)
+  - When set to `1`, uses locale-independent, allocation-free `std::from_chars` after the optional chfloat backend. The fallback uses a private C numeric locale; changing the process locale does not change JSON number parsing.
 - `CHJSON_USE_CHFLOAT` (default `1`)
   - Uses the vendored `chfloat` backend when available (often faster on MSVC).
   - Back-compat alias: `CHJSON_USE_FAST_FLOAT`.
@@ -379,15 +398,19 @@ These caches primarily target workloads that call `chjson::parse()` repeatedly i
 
 - `CHJSON_PARSE_DOM_NO_STRING_FASTPATH` (default `1`)
   - Enables a special fast path for inputs with **no `"` characters** (no JSON strings).
-- `CHJSON_PARSE_MT_MIN_BYTES` (default `256 KiB`)
+- `CHJSON_PARSE_MT_MIN_BYTES` (default `1 MiB`)
 - `CHJSON_PARSE_MT_MIN_SPANS` (default `64`)
 - `CHJSON_PARSE_MT_MIN_AVG_SPAN_BYTES` (default `2 KiB`)
 - `CHJSON_PARSE_MT_SCAN_SIMD` (default `0`)
+  - If fixed worker slices remain too small after retrying, parsing falls back to the growable serial arena. A real allocation failure still reports `out_of_memory`.
+- `CHJSON_DUMP_MT_MIN_ITEMS` (default `1024`)
+- `CHJSON_DUMP_MT_MIN_BYTES` (default `1 MiB`)
+  - Both thresholds must be met for automatic parallel serialization. Explicit `dump_mt()` uses its own options.
 
 ### Internal allocation / number scratch
 
-- `CHJSON_USE_INTERNAL_ALLOCATOR` (default `1`)
-  - Enables an internal sized allocator for some hot internal allocations (arena blocks, MT-parse backing/resources, and some owned number storage).
+- `CHJSON_USE_INTERNAL_ALLOCATOR` (default `0`)
+  - Opts into the experimental sized page allocator. Its pages remain allocated until process exit. The default uses the system allocator plus bounded parse caches, so releasing documents/caches can return their storage to the system allocator.
 - `CHJSON_TLS_LONG_NUMBER_SCRATCH_MAX` (default `256 KiB`)
   - Caps the per-thread scratch buffer used for parsing very long floating-point tokens (NUL-termination workaround for `strtod`).
 
@@ -409,10 +432,33 @@ target_link_libraries(my_app PRIVATE chjson)
 Options:
 
 - `CHJSON_BUILD_TESTS` (default `ON`)
-- `CHJSON_BUILD_BENCHMARKS` (default `ON`)
-- `CHJSON_BUILD_COMPARE_BENCH` (default `ON`)
+- `CHJSON_BUILD_BENCHMARKS` (default `OFF`)
+- `CHJSON_BUILD_COMPARE_BENCH` (default `OFF`)
+- `CHJSON_BUILD_CONFIG_TESTS` (default `OFF`): additionally test disabled caches/fast path, the optional allocator/SIMD splitter, the C-locale number fallback, and deliberately small MT slices.
+- `CHJSON_ENABLE_SANITIZERS` (default `OFF`): ASan + UBSan on GCC/Clang, or ASan on MSVC.
+- `CHJSON_BASELINE_INCLUDE` (default empty): a previous version's include directory; builds `chjson_baseline_bench` from the same benchmark source and compiler/runtime flags.
 
 ---
+
+
+### Build and verify
+
+```sh
+cmake -S . -B build/release -DCMAKE_BUILD_TYPE=Release -DCHJSON_BUILD_BENCHMARKS=ON -DCHJSON_BUILD_CONFIG_TESTS=ON
+cmake --build build/release --config Release --parallel
+ctest --test-dir build/release -C Release --output-on-failure
+```
+
+For GCC/Clang on Linux, add `-DCHJSON_ENABLE_SANITIZERS=ON` in a separate Debug build. Tests cover every parse mode, UTF-8 boundaries, document moves, depth limits, raw number preservation, allocation failure injection, deep dumps, worker exceptions, deterministic round trips, and input mutations. The isolated OOM test disables MSVC iterator proxies because those debug-only STL allocations can occur inside `noexcept` operations.
+
+The benchmark accepts `count iterations runs workload [string_length]`. Workloads are `objects` (default), `integers`, `floats`, `strings`, `escaped_strings`, `utf8_strings`, `empty`, and `scalar`. Timings use the median of repeated runs; cold arena storage and reused arena storage are reported separately from throughput. Neither metric is process RSS or total memory, and MT backing storage is separate from the main arena.
+
+```sh
+./build/release/chjson_bench 20000 500 7 floats
+python benchmark/compare_baseline.py --baseline /path/to/baseline/chjson_bench --candidate /path/to/new/chjson_bench --output benchmark-results.json
+```
+
+Both comparison executables must contain the same benchmark source and use the same compiler, runtime library, and optimization flags. Set `-DCHJSON_BASELINE_INCLUDE=/path/to/old/include` to build `chjson_baseline_bench` alongside the current benchmark with matching flags. The comparison script records process failures as well as successful measurements. Use `--samples 3` to alternate multiple independent process pairs and take their median, `--extended` for Unicode, escapes and larger MT payloads, and optionally `--affinity-mask` to keep both processes on the same available logical CPUs. See the [second optimization report](OPTIMIZATION_ROUND2_REPORT.md) and [first optimization report](OPTIMIZATION_REPORT.md) for measured results and limitations.
 
 ## Examples
 

@@ -17,12 +17,16 @@
 #if defined(_M_X64) || defined(__SSE2__)
   #if defined(_MSC_VER)
     #include <intrin.h>
-  #endif 
+  #endif
   #include <immintrin.h>
 #endif
 #include <limits>
 #include <map>
 #include <memory_resource>
+#include <memory>
+#include <locale.h>
+#include <locale>
+#include <sstream>
 #include <new>
 #include <stdexcept>
 #include <system_error>
@@ -41,7 +45,7 @@
 // Config: floating-point parsing backend.
 // Override by defining CHJSON_USE_FROM_CHARS_DOUBLE to 0/1 before including this header.
 #ifndef CHJSON_USE_FROM_CHARS_DOUBLE
-  #define CHJSON_USE_FROM_CHARS_DOUBLE 0
+  #define CHJSON_USE_FROM_CHARS_DOUBLE 1
 #endif
 
 // Optional: use chfloat (vendored under chjson/another/chfloat) when available.
@@ -112,7 +116,7 @@
 //
 // Override these macros before including this header to tune for your workload.
 #ifndef CHJSON_PARSE_MT_MIN_BYTES
-  #define CHJSON_PARSE_MT_MIN_BYTES (256u * 1024u)
+  #define CHJSON_PARSE_MT_MIN_BYTES (1024u * 1024u)
 #endif
 
 #ifndef CHJSON_PARSE_MT_MIN_SPANS
@@ -130,12 +134,22 @@
   #define CHJSON_PARSE_MT_SCAN_SIMD 0
 #endif
 
+// Automatic dumping should amortize scheduling across a substantial payload.
+// Explicit dump_mt() keeps its caller-provided thresholds.
+#ifndef CHJSON_DUMP_MT_MIN_ITEMS
+  #define CHJSON_DUMP_MT_MIN_ITEMS 1024u
+#endif
+#ifndef CHJSON_DUMP_MT_MIN_BYTES
+  #define CHJSON_DUMP_MT_MIN_BYTES (1024u * 1024u)
+#endif
+
 // Config: use chjson internal allocator for chjson-owned heap allocations.
+// Disabled by default: the experimental page pool retains pages until process exit.
 // This does NOT replace user allocations (e.g. std::string/std::vector in the legacy DOM).
 // It targets hot internal allocations: arena blocks, MT-parse backing/resources, and
 // owned number token storage.
 #ifndef CHJSON_USE_INTERNAL_ALLOCATOR
-  #define CHJSON_USE_INTERNAL_ALLOCATOR 1
+  #define CHJSON_USE_INTERNAL_ALLOCATOR 0
 #endif
 
 // Max cached scratch capacity for long-number NUL-termination buffers (bytes, per thread).
@@ -300,6 +314,62 @@ inline bool parse_u4(std::string_view s, std::size_t& i, std::uint32_t& out_cp) 
   i += 4;
   out_cp = v;
   return true;
+}
+
+// Advance one well-formed UTF-8 scalar; reject overlong encodings and surrogates.
+inline bool consume_utf8(const char* data, std::size_t size, std::size_t& pos) noexcept {
+  const auto lead = static_cast<unsigned char>(data[pos]);
+  const unsigned length = lead >= 0xC2 && lead <= 0xDF ? 2u :
+                          lead >= 0xE0 && lead <= 0xEF ? 3u :
+                          lead >= 0xF0 && lead <= 0xF4 ? 4u : 0u;
+  if (!length || size - pos < length) return false;
+  const auto second = static_cast<unsigned char>(data[pos + 1]);
+  if ((lead == 0xE0 && second < 0xA0) || (lead == 0xED && second >= 0xA0) ||
+      (lead == 0xF0 && second < 0x90) || (lead == 0xF4 && second >= 0x90)) return false;
+  for (unsigned k = 1; k < length; ++k)
+    if ((static_cast<unsigned char>(data[pos + k]) & 0xC0) != 0x80) return false;
+  pos += length;
+  return true;
+}
+
+inline bool consume_utf8_run(const char* data, std::size_t size, std::size_t& pos) noexcept {
+  do {
+    if (!consume_utf8(data, size, pos)) return false;
+  } while (pos < size && static_cast<unsigned char>(data[pos]) >= 0x80);
+  return true;
+}
+
+// Find the next quote, escape, control byte or UTF-8 byte. Never read past size,
+// including when the input is a string_view without padding or a terminator.
+inline std::size_t scan_string_special(const char* data, std::size_t size, std::size_t pos) noexcept {
+#if defined(_M_X64) || defined(__SSE2__)
+  const __m128i quote = _mm_set1_epi8('"');
+  const __m128i slash = _mm_set1_epi8('\\');
+  const __m128i space = _mm_set1_epi8(0x20);
+  while (size - pos >= 16) {
+    const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(data + pos));
+    // Signed comparison includes both 0x00..0x1F and 0x80..0xFF in one mask.
+    const __m128i special = _mm_or_si128(_mm_cmplt_epi8(v, space),
+        _mm_or_si128(_mm_cmpeq_epi8(v, quote), _mm_cmpeq_epi8(v, slash)));
+    const unsigned mask = static_cast<unsigned>(_mm_movemask_epi8(special));
+    if (mask) {
+#if defined(_MSC_VER)
+      unsigned long bit;
+      _BitScanForward(&bit, mask);
+      return pos + bit;
+#else
+      return pos + static_cast<unsigned>(__builtin_ctz(mask));
+#endif
+    }
+    pos += 16;
+  }
+#endif
+  while (pos < size) {
+    const auto c = static_cast<unsigned char>(data[pos]);
+    if (c == '"' || c == '\\' || c < 0x20 || c >= 0x80) break;
+    ++pos;
+  }
+  return pos;
 }
 
 inline bool is_digit(char c) noexcept { return c >= '0' && c <= '9'; }
@@ -490,6 +560,8 @@ struct chjson_internal_allocator {
     }
 
     // Portable aligned allocation fallback (stores original pointer just before aligned block).
+    const auto max_size = (std::numeric_limits<std::size_t>::max)();
+    if (alignment > max_size - sizeof(void*) || bytes > max_size - alignment - sizeof(void*)) throw std::bad_alloc();
     const std::size_t over = bytes + alignment + sizeof(void*);
     void* raw = ::operator new(over);
     std::uintptr_t p = reinterpret_cast<std::uintptr_t>(raw) + sizeof(void*);
@@ -557,6 +629,7 @@ inline void chjson_deallocate(void* p, std::size_t bytes, std::size_t alignment)
 template <class T>
 inline T* chjson_allocate_n(std::size_t n) {
   if (n == 0) return nullptr;
+  if (n > (std::numeric_limits<std::size_t>::max)() / sizeof(T)) throw std::bad_alloc();
   const std::size_t bytes = sizeof(T) * n;
   return static_cast<T*>(chjson_allocate(bytes, alignof(T)));
 }
@@ -615,6 +688,25 @@ inline chjson_long_number_scratch& long_number_scratch() {
   thread_local chjson_long_number_scratch s;
   return s;
 }
+
+struct dump_mt_context {
+  std::vector<std::string> chunks;
+  std::vector<std::future<void>> futures;
+};
+inline dump_mt_context& dump_context_stash() {
+  thread_local dump_mt_context context;
+  return context;
+}
+
+template <class Futures>
+struct future_join_guard {
+  Futures& futures;
+  std::size_t count;
+  ~future_join_guard() {
+    for (std::size_t i = 0; i < count; ++i)
+      if (futures[i].valid()) futures[i].wait();
+  }
+};
 
 template <class T>
 class internal_array {
@@ -725,25 +817,10 @@ struct owned_number_value {
   }
 
   owned_number_value& operator=(const owned_number_value& other) {
-    if (this == &other) return *this;
-    clear_raw();
-    is_int = other.is_int;
-    i = other.i;
-    has_double = other.has_double;
-    d = other.d;
-    raw_len = other.raw_len;
-    if (other.raw_len == 0) {
-      raw_is_heap = false;
-      return *this;
+    if (this != &other) {
+      owned_number_value copy(other);
+      *this = std::move(copy);
     }
-    if (other.raw_is_heap) {
-      raw_is_heap = true;
-      raw_heap = static_cast<char*>(chjson_allocate(static_cast<std::size_t>(raw_len), alignof(char)));
-      std::memcpy(raw_heap, other.raw_heap, raw_len);
-      return *this;
-    }
-    raw_is_heap = false;
-    std::memcpy(raw_inline, other.raw_inline, raw_len);
     return *this;
   }
 
@@ -817,12 +894,40 @@ struct owned_number_value {
       return;
     }
 
-    raw_is_heap = true;
+    if (token.size() > (std::numeric_limits<std::uint32_t>::max)()) throw std::bad_alloc();
+    char* storage = static_cast<char*>(chjson_allocate(token.size(), alignof(char)));
+    std::memcpy(storage, token.data(), token.size());
+    raw_heap = storage;
     raw_len = static_cast<std::uint32_t>(token.size());
-    raw_heap = static_cast<char*>(chjson_allocate(static_cast<std::size_t>(raw_len), alignof(char)));
-    std::memcpy(raw_heap, token.data(), token.size());
+    raw_is_heap = true;
   }
 };
+
+inline double strtod_c_locale(const char* text) {
+#if defined(_WIN32)
+  struct c_locale {
+    _locale_t value{_create_locale(LC_NUMERIC, "C")};
+    ~c_locale() { if (value) _free_locale(value); }
+  };
+  static const c_locale locale;
+  if (!locale.value) throw std::bad_alloc();
+  return _strtod_l(text, nullptr, locale.value);
+#elif defined(__unix__) || defined(__APPLE__)
+  struct c_locale {
+    locale_t value{newlocale(LC_NUMERIC_MASK, "C", nullptr)};
+    ~c_locale() { if (value) freelocale(value); }
+  };
+  static const c_locale locale;
+  if (!locale.value) throw std::bad_alloc();
+  return strtod_l(text, nullptr, locale.value);
+#else
+  std::istringstream input(text);
+  input.imbue(std::locale::classic());
+  double result = 0.0;
+  input >> result;
+  return result;
+#endif
+}
 
 inline double parse_double(const char* first, const char* last) {
   const std::size_t len = static_cast<std::size_t>(last - first);
@@ -856,7 +961,7 @@ inline double parse_double(const char* first, const char* last) {
     char buf[kStackCap];
     if (len != 0) std::memcpy(buf, first, len);
     buf[len] = '\0';
-    return std::strtod(buf, nullptr);
+    return strtod_c_locale(buf);
   }
 
   // Long token fallback: avoid std::string heap allocation.
@@ -865,71 +970,22 @@ inline double parse_double(const char* first, const char* last) {
   if (char* tmp = detail::long_number_scratch().ensure(need)) {
     if (len != 0) std::memcpy(tmp, first, len);
     tmp[len] = '\0';
-    return std::strtod(tmp, nullptr);
+    return strtod_c_locale(tmp);
   }
 
   // One-shot fallback for extremely large tokens.
   char* tmp = static_cast<char*>(detail::chjson_allocate(need, alignof(char)));
+  const auto cleanup = [need](char* p) { detail::chjson_deallocate(p, need, alignof(char)); };
+  std::unique_ptr<char, decltype(cleanup)> storage(tmp, cleanup);
   if (len != 0) std::memcpy(tmp, first, len);
   tmp[len] = '\0';
-  const double v = std::strtod(tmp, nullptr);
-  detail::chjson_deallocate(tmp, need, alignof(char));
+  const double v = strtod_c_locale(tmp);
   return v;
 }
 
 inline double parse_double(std::string_view token) {
-  // Fast path: chfloat.
-#if CHJSON_HAS_CHFLOAT
-  {
-    double v = 0.0;
-    const char* first = token.data();
-    const char* last = token.data() + token.size();
-    auto r = chfloat::from_chars(first, last, v);
-    if (r.ec == chfloat::errc::ok && r.ptr == last) return v;
-  }
-#endif
-
-  // Backend choice:
-  // - strtod: often quite fast on MSVC/Windows and very robust.
-  // - from_chars: locale-free and allocation-free, but performance varies by STL.
-  // Enable from_chars explicitly if it benchmarks better for your toolchain.
-#if defined(CHJSON_USE_FROM_CHARS_DOUBLE) && CHJSON_USE_FROM_CHARS_DOUBLE
-#if defined(__cpp_lib_to_chars)
-  {
-    double v = 0.0;
-    const char* first = token.data();
-    const char* last = token.data() + token.size();
-    auto r = std::from_chars(first, last, v, std::chars_format::general);
-    if (r.ec == std::errc{} && r.ptr == last) return v;
-  }
-#endif
-#endif
-
-  // Fallback: token is not NUL-terminated; avoid heap alloc for typical short numbers.
-  constexpr std::size_t kStackCap = 128;
-  if (token.size() < kStackCap) {
-    char buf[kStackCap];
-    if (!token.empty()) std::memcpy(buf, token.data(), token.size());
-    buf[token.size()] = '\0';
-    return std::strtod(buf, nullptr);
-  }
-
-  // Long token fallback: avoid std::string heap allocation.
-  const std::size_t len = token.size();
-  const std::size_t need = len + 1;
-  if (char* tmp = detail::long_number_scratch().ensure(need)) {
-    if (len != 0) std::memcpy(tmp, token.data(), len);
-    tmp[len] = '\0';
-    return std::strtod(tmp, nullptr);
-  }
-
-  // One-shot fallback for extremely large tokens.
-  char* tmp = static_cast<char*>(detail::chjson_allocate(need, alignof(char)));
-  if (len != 0) std::memcpy(tmp, token.data(), len);
-  tmp[len] = '\0';
-  const double v = std::strtod(tmp, nullptr);
-  detail::chjson_deallocate(tmp, need, alignof(char));
-  return v;
+  if (token.empty()) return 0.0;
+  return parse_double(token.data(), token.data() + token.size());
 }
 
 inline bool parse_number(const char* buf, std::size_t size, std::size_t& i, number_value& out, bool parse_fp = true) {
@@ -1417,35 +1473,8 @@ struct parser {
     std::size_t chunk_begin = i;
 
     while (i < n) {
-#if defined(_M_X64) || defined(__SSE2__)
-      {
-        const __m128i q = _mm_set1_epi8('"');
-        const __m128i bs = _mm_set1_epi8('\\');
-        const __m128i k1f = _mm_set1_epi8(0x1F);
-        const __m128i zero = _mm_setzero_si128();
-        while (i + 16 <= n) {
-          const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(base + i));
-          const __m128i is_q = _mm_cmpeq_epi8(v, q);
-          const __m128i is_bs = _mm_cmpeq_epi8(v, bs);
-          const __m128i sub = _mm_subs_epu8(v, k1f);
-          const __m128i is_ctrl = _mm_cmpeq_epi8(sub, zero);
-          const __m128i any = _mm_or_si128(_mm_or_si128(is_q, is_bs), is_ctrl);
-          const int mask = _mm_movemask_epi8(any);
-          if (mask == 0) {
-            i += 16;
-            continue;
-          }
-#if defined(_MSC_VER)
-          unsigned long bit = 0;
-          _BitScanForward(&bit, static_cast<unsigned long>(mask));
-          i += static_cast<std::size_t>(bit);
-#else
-          i += static_cast<std::size_t>(__builtin_ctz(static_cast<unsigned>(mask)));
-#endif
-          break;
-        }
-      }
-#endif
+      i = detail::scan_string_special(base, n, i);
+      if (i >= n) break;
       const unsigned char uc = static_cast<unsigned char>(base[i]);
       const char c = base[i];
 
@@ -1516,7 +1545,14 @@ struct parser {
         return false;
       }
 
-      ++i;
+      if (uc >= 0x80) {
+        if (!detail::consume_utf8_run(base, n, i)) {
+          set_error(e, error_code::invalid_string, i);
+          return false;
+        }
+      } else {
+        ++i;
+      }
     }
 
     set_error(e, error_code::unexpected_eof, quote_pos);
@@ -1625,11 +1661,13 @@ struct parser {
   }
 };
 
-inline value_parse_result parse_value(std::string_view json, parse_options opt = {}) {
+inline value_parse_result parse_value(std::string_view json, parse_options opt = {}) try {
   parser p;
   p.s = json;
   p.opt = opt;
   return p.run();
+} catch (const std::bad_alloc&) {
+  return {value(nullptr), {error_code::out_of_memory}};
 }
 
 inline value parse_value_or_throw(std::string_view json, parse_options opt = {}) {
@@ -1746,7 +1784,7 @@ inline void dump_escaped(std::string& out, std::string_view s) {
     out.push_back('"');
     return;
   }
- 
+
   if (first > 0) out.append(data, first);
 
   std::size_t chunk_begin = first;
@@ -1875,7 +1913,10 @@ inline void dump_indent(std::string& out, int indent) {
   for (int i = 0; i < indent; ++i) out.push_back(' ');
 }
 
+inline thread_local bool in_pool_worker = false;
+
 inline unsigned effective_threads(unsigned max_threads) noexcept {
+  if (in_pool_worker) return 1; // Nested parallel work must not wait on the same pool.
   if (max_threads == 0) {
     static const unsigned hc = []() noexcept {
       const unsigned v = std::thread::hardware_concurrency();
@@ -1891,8 +1932,14 @@ public:
   explicit thread_pool(unsigned threads) {
     if (threads == 0) threads = 1;
     workers_.reserve(threads);
-    for (unsigned i = 0; i < threads; ++i) {
-      workers_.emplace_back([this]() { worker_loop(); });
+    try {
+      for (unsigned i = 0; i < threads; ++i)
+        workers_.emplace_back([this]() { worker_loop(); });
+    } catch (...) {
+      { std::lock_guard<std::mutex> lk(m_); stop_ = true; }
+      cv_.notify_all();
+      for (auto& worker : workers_) worker.join();
+      throw;
     }
   }
 
@@ -1924,6 +1971,7 @@ public:
 
 private:
   void worker_loop() {
+    in_pool_worker = true;
     for (;;) {
       std::packaged_task<void()> job;
       {
@@ -2018,8 +2066,9 @@ inline void dump_compact_iter(std::string& out, const value& root) {
         const value* child = &a[f.idx++];
         if (sp == cap) {
           const std::size_t new_cap = cap * 2;
-          heap = internal_array<frame>(new_cap);
-          for (std::size_t j = 0; j < cap; ++j) heap[j] = stack[j];
+          auto grown = internal_array<frame>(new_cap);
+          for (std::size_t j = 0; j < cap; ++j) grown[j] = stack[j];
+          heap = std::move(grown);
           stack = heap.get();
           cap = new_cap;
         }
@@ -2047,8 +2096,9 @@ inline void dump_compact_iter(std::string& out, const value& root) {
         out.push_back(':');
         if (sp == cap) {
           const std::size_t new_cap = cap * 2;
-          heap = internal_array<frame>(new_cap);
-          for (std::size_t j = 0; j < cap; ++j) heap[j] = stack[j];
+          auto grown = internal_array<frame>(new_cap);
+          for (std::size_t j = 0; j < cap; ++j) grown[j] = stack[j];
+          heap = std::move(grown);
           stack = heap.get();
           cap = new_cap;
         }
@@ -2210,8 +2260,9 @@ inline void dump_to(std::string& out, const value& v, bool pretty = false, int i
             default:
               if (sp == cap) {
                 const std::size_t new_cap = cap * 2;
-                heap = detail::internal_array<frame>(new_cap);
-                for (std::size_t j = 0; j < cap; ++j) heap[j] = stack[j];
+                auto grown = detail::internal_array<frame>(new_cap);
+                for (std::size_t j = 0; j < cap; ++j) grown[j] = stack[j];
+                heap = std::move(grown);
                 stack = heap.get();
                 cap = new_cap;
               }
@@ -2268,8 +2319,9 @@ inline void dump_to(std::string& out, const value& v, bool pretty = false, int i
             default:
               if (sp == cap) {
                 const std::size_t new_cap = cap * 2;
-                heap = detail::internal_array<frame>(new_cap);
-                for (std::size_t j = 0; j < cap; ++j) heap[j] = stack[j];
+                auto grown = detail::internal_array<frame>(new_cap);
+                for (std::size_t j = 0; j < cap; ++j) grown[j] = stack[j];
+                heap = std::move(grown);
                 stack = heap.get();
                 cap = new_cap;
               }
@@ -2293,11 +2345,20 @@ inline std::string dump(const value& v, bool pretty = false) {
   struct dump_reserve_hints {
     std::size_t compact{0};
     std::size_t pretty{0};
+    std::size_t compact_shape{0};
+    std::size_t pretty_shape{0};
   };
   thread_local dump_reserve_hints hints;
 
   std::string out;
   std::size_t& hint = pretty ? hints.pretty : hints.compact;
+  const std::size_t items = v.is_array() ? v.as_array().size() :
+                            v.is_object() ? v.as_object().size() :
+                            v.is_string() ? v.as_string().size() : 0;
+  const std::size_t shape = items * 8u + static_cast<std::size_t>(v.type());
+  auto& cached_shape = pretty ? hints.pretty_shape : hints.compact_shape;
+  if (shape != cached_shape) { hint = 0; cached_shape = shape; }
+
 
   if (hint != 0) {
     detail::maybe_reserve_small_aware(out, hint);
@@ -2324,8 +2385,8 @@ inline std::string dump(const value& v, bool pretty = false) {
   // - Keep small/medium dumps single-threaded (lower overhead, more stable).
   // - Enable pooled MT dump only when it is likely to pay off.
   bool use_mt = false;
-  constexpr std::size_t k_mt_min_items = 256;
-  constexpr std::size_t k_mt_min_bytes = 512u;
+  constexpr std::size_t k_mt_min_items = CHJSON_DUMP_MT_MIN_ITEMS;
+  constexpr std::size_t k_mt_min_bytes = CHJSON_DUMP_MT_MIN_BYTES;
   if (detail::effective_threads(0) > 1) {
     if (v.type() == value::kind::array) {
       const auto& a = v.as_array();
@@ -2367,16 +2428,18 @@ namespace detail {
 
 template <class Fn>
 inline void parallel_for_chunks(std::size_t n, unsigned threads, Fn&& fn) {
-  if (n == 0 || threads <= 1) {
+  if (n == 0 || threads <= 1 || in_pool_worker) {
     fn(0, n);
     return;
   }
-  if (threads > static_cast<unsigned>(n)) threads = static_cast<unsigned>(n);
+  if (static_cast<std::size_t>(threads) > n) threads = static_cast<unsigned>(n);
 
   const std::size_t base = n / threads;
   const std::size_t rem = n % threads;
 
   internal_array<std::future<void>> fut(threads);
+
+  detail::future_join_guard<decltype(fut)> join{fut, threads};
   std::size_t begin = 0;
   for (unsigned t = 0; t < threads; ++t) {
     const std::size_t len = base + (t < rem ? 1u : 0u);
@@ -2421,6 +2484,7 @@ inline void dump_array_pretty_mt(std::string& out, const value::array& a, int in
     const std::size_t base = n / used;
     const std::size_t rem = n % used;
     internal_array<std::future<void>> fut(used);
+    detail::future_join_guard<decltype(fut)> join{fut, used};
     std::size_t begin = 0;
     for (unsigned t = 0; t < used; ++t) {
       const std::size_t len = base + (t < rem ? 1u : 0u);
@@ -2475,6 +2539,7 @@ inline void dump_object_pretty_mt(std::string& out, const value::object& o, int 
     const std::size_t base = n / used;
     const std::size_t rem = n % used;
     internal_array<std::future<void>> fut(used);
+    detail::future_join_guard<decltype(fut)> join{fut, used};
     std::size_t begin = 0;
     for (unsigned t = 0; t < used; ++t) {
       const std::size_t len = base + (t < rem ? 1u : 0u);
@@ -2544,6 +2609,7 @@ inline void dump_to_mt(std::string& out, const value& v, dump_mt_options opt = {
         const std::size_t base = n / used;
         const std::size_t rem = n % used;
         detail::internal_array<std::future<void>> fut(used);
+        detail::future_join_guard<decltype(fut)> join{fut, used};
         std::size_t begin = 0;
         for (unsigned t = 0; t < used; ++t) {
           const std::size_t len = base + (t < rem ? 1u : 0u);
@@ -2580,6 +2646,7 @@ inline void dump_to_mt(std::string& out, const value& v, dump_mt_options opt = {
         const std::size_t base = n / used;
         const std::size_t rem = n % used;
         detail::internal_array<std::future<void>> fut(used);
+        detail::future_join_guard<decltype(fut)> join{fut, used};
         std::size_t begin = 0;
         for (unsigned t = 0; t < used; ++t) {
           const std::size_t len = base + (t < rem ? 1u : 0u);
@@ -2653,7 +2720,7 @@ namespace pmr {
 
 class arena_resource final : public std::pmr::memory_resource {
 public:
-  explicit arena_resource(std::size_t initial_block_size = 64 * 1024)
+  explicit arena_resource(std::size_t initial_block_size = 1024)
   : initial_block_size_(initial_block_size) {}
 
   arena_resource(const arena_resource&) = delete;
@@ -2752,6 +2819,14 @@ public:
     if (!current_) current_ = head_;
   }
 
+  bool try_expand(void* allocation, std::size_t old_bytes, std::size_t new_bytes) noexcept {
+    if (!current_ || !allocation || new_bytes < old_bytes || old_bytes > current_->used) return false;
+    auto* last = current_->data() + current_->used - old_bytes;
+    if (allocation != last || new_bytes - old_bytes > current_->size - current_->used) return false;
+    current_->used += new_bytes - old_bytes;
+    return true;
+  }
+
   void release() noexcept {
     block* b = head_;
     while (b) {
@@ -2775,7 +2850,8 @@ private:
     const std::byte* data() const noexcept { return reinterpret_cast<const std::byte*>(this + 1); }
 
     static block* create(std::size_t block_size) {
-      block* nb = static_cast<block*>(detail::chjson_allocate(sizeof(block) + block_size, alignof(block)));
+      if (block_size > (std::numeric_limits<std::size_t>::max)() - sizeof(block)) throw std::bad_alloc();
+      block* nb = new (detail::chjson_allocate(sizeof(block) + block_size, alignof(block))) block;
       nb->size = block_size;
       nb->used = 0;
       nb->next = nullptr;
@@ -2791,10 +2867,10 @@ private:
   block* head_{nullptr};
   block* tail_{nullptr};
   block* current_{nullptr};
-  std::size_t initial_block_size_{64 * 1024};
+  std::size_t initial_block_size_{1024};
   std::size_t next_block_size_{0};
 
-  static constexpr std::size_t k_default_initial_block_size = 64u * 1024u;
+  static constexpr std::size_t k_default_initial_block_size = 1024u;
   static constexpr std::size_t k_max_block_size = 32u * 1024u * 1024u;
 
   std::size_t min_block_size() const noexcept {
@@ -2835,7 +2911,7 @@ private:
       std::uintptr_t base = reinterpret_cast<std::uintptr_t>(b->data()) + b->used;
       std::uintptr_t aligned = (base + (alignment - 1)) & ~(static_cast<std::uintptr_t>(alignment) - 1u);
       const std::size_t padding = static_cast<std::size_t>(aligned - base);
-      if (b->used + padding + bytes <= b->size) {
+      if (padding <= b->size - b->used && bytes <= b->size - b->used - padding) {
         b->used += padding + bytes;
         return reinterpret_cast<void*>(aligned);
       }
@@ -2851,6 +2927,7 @@ private:
     }
 
     // Need a new block.
+    if (bytes > (std::numeric_limits<std::size_t>::max)() - alignment) throw std::bad_alloc();
     const std::size_t min_needed = bytes + alignment;
     const std::size_t block_size = new_block_size(min_needed);
 
@@ -2878,6 +2955,94 @@ private:
 };
 
 } // namespace pmr
+
+namespace detail {
+struct flat_array_info {
+  std::size_t items{0}; // Zero means nested, string-containing, or unterminated.
+  bool has_fp{false};
+};
+
+// Sizing pass only: the parser still validates every token and delimiter.
+// Stop at nested containers/strings so their commas cannot inflate root storage.
+inline flat_array_info inspect_flat_array(const char* data, std::size_t size, std::size_t pos) noexcept {
+  flat_array_info info{1, false};
+  while (pos < size) {
+#if defined(_M_X64) || defined(__SSE2__)
+    if (size - pos >= 16) {
+      const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(data + pos));
+      const __m128i brackets = _mm_or_si128(v, _mm_set1_epi8(0x20));
+      const __m128i stop = _mm_or_si128(_mm_cmpeq_epi8(v, _mm_set1_epi8('"')),
+          _mm_or_si128(_mm_cmpeq_epi8(brackets, _mm_set1_epi8('{')),
+                       _mm_cmpeq_epi8(brackets, _mm_set1_epi8('}'))));
+      if (_mm_movemask_epi8(stop) == 0) {
+        unsigned mask = static_cast<unsigned>(_mm_movemask_epi8(_mm_cmpeq_epi8(v, _mm_set1_epi8(','))));
+        // Portable population count; does not require SSE4/POPCNT support.
+        mask -= (mask >> 1) & 0x5555u;
+        mask = (mask & 0x3333u) + ((mask >> 2) & 0x3333u);
+        mask = (mask + (mask >> 4)) & 0x0F0Fu;
+        info.items += (mask + (mask >> 8)) & 0x1Fu;
+        if (!info.has_fp) {
+          const __m128i fp = _mm_or_si128(_mm_cmpeq_epi8(v, _mm_set1_epi8('.')),
+                                        _mm_cmpeq_epi8(brackets, _mm_set1_epi8('e')));
+          info.has_fp = _mm_movemask_epi8(fp) != 0;
+        }
+        pos += 16;
+        continue;
+      }
+    }
+#endif
+    const char c = data[pos++];
+    if (c == ']') return info;
+    if (c == '[' || c == '{' || c == '}' || c == '"') return {};
+    if (c == ',') ++info.items;
+    if (c == '.' || c == 'e' || c == 'E') info.has_fp = true;
+  }
+  return {};
+}
+
+inline std::size_t estimate_array_items(const char* data, std::size_t size, std::size_t pos) noexcept {
+  if (pos >= size) return 0;
+  const char first = data[pos];
+  if ((first == '-' || is_digit(first)) && size - pos >= 1024u) {
+    const auto flat = inspect_flat_array(data, size, pos);
+    if (flat.items) return flat.items;
+  }
+  std::size_t bytes_per_item = first == '-' || is_digit(first) ? 20u : 64u;
+  if (first == '"') {
+    const std::size_t probe = (std::min)(size - pos - 1, std::size_t{4096});
+    const auto* quote = static_cast<const char*>(std::memchr(data + pos + 1, '"', probe));
+    if (quote) bytes_per_item = (std::max)(bytes_per_item, static_cast<std::size_t>(quote - data - pos) + 2);
+  }
+  return (size - pos) / bytes_per_item;
+}
+
+inline std::uint32_t grow_capacity(std::uint32_t cap, std::uint32_t want) {
+  std::uint32_t next = cap ? cap : 4u;
+  while (next < want) {
+    const std::uint32_t step = next < 1024u ? next : next / 2u;
+    if (next > (std::numeric_limits<std::uint32_t>::max)() - step) return want;
+    next += step;
+  }
+  return next;
+}
+template <class T>
+inline T* grow_storage(std::pmr::memory_resource* mr, T* old, std::uint32_t size,
+                       std::uint32_t cap, std::uint32_t next) {
+  if (next > (std::numeric_limits<std::size_t>::max)() / sizeof(T)) throw std::bad_alloc();
+  const std::size_t bytes = sizeof(T) * static_cast<std::size_t>(next);
+  static_assert(std::is_trivially_copyable_v<T>, "arena storage requires trivial values");
+#if defined(__cpp_rtti) || defined(_CPPRTTI)
+  if (old) {
+    if (auto* arena = dynamic_cast<pmr::arena_resource*>(mr))
+      if (arena->try_expand(old, sizeof(T) * static_cast<std::size_t>(cap), bytes)) return old;
+  }
+#endif
+  auto* data = static_cast<T*>(mr->allocate(bytes, alignof(T)));
+  if (size) std::uninitialized_copy_n(old, size, data);
+  if (old) mr->deallocate(old, sizeof(T) * static_cast<std::size_t>(cap), alignof(T));
+  return data;
+}
+} // namespace detail
 
 struct sv_raw_view {
   const char* data;
@@ -2959,7 +3124,7 @@ __declspec(noinline)
 #elif defined(__clang__) || defined(__GNUC__)
 __attribute__((noinline))
 #endif
-inline double parse_double_and_cache(const sv_number_value& n) noexcept {
+inline double parse_double_and_cache(const sv_number_value& n) {
   const std::uint32_t flags = n.raw_size_flags;
   const std::uint32_t raw_n = flags & sv_number_value::k_size_mask;
   if (n.raw_data != nullptr && raw_n != 0) {
@@ -3030,7 +3195,9 @@ struct sv_value {
     u.b = vb;
     set_kind(kind::boolean);
   }
+  explicit sv_value(const char* vs) : sv_value(std::string_view(vs)) {}
   explicit sv_value(std::string_view vs) {
+    if (vs.size() > (std::numeric_limits<std::uint32_t>::max)()) throw std::bad_alloc();
     u.s = {};
     u.s.data = vs.data();
     u.s.size = static_cast<std::uint32_t>(vs.size());
@@ -3076,6 +3243,7 @@ struct sv_value {
   }
 
   static sv_value number_token(std::string_view token) {
+    if (token.size() > sv_number_value::k_size_mask) throw std::bad_alloc();
     sv_value v;
     v.u.num = {};
     v.u.num.raw_data = nullptr;
@@ -3089,6 +3257,7 @@ struct sv_value {
   }
 
   static sv_value number_token_with_double(std::string_view token, double vd) {
+    if (token.size() > sv_number_value::k_size_mask) throw std::bad_alloc();
     sv_value v;
     v.u.num = {};
     v.u.num.raw_data = nullptr;
@@ -3134,7 +3303,7 @@ struct sv_value {
 
   // Fast path: assumes this value is a number.
   // Undefined behavior if called when !is_number().
-  double as_double_unchecked() const noexcept {
+  double as_double_unchecked() const {
     const auto& n = u.num;
     const std::uint32_t flags = n.raw_size_flags;
     if ((flags & sv_number_value::k_has_double) != 0) return n.double_value();
@@ -3153,22 +3322,16 @@ struct sv_value {
   void array_reserve(std::pmr::memory_resource* mr, std::uint32_t new_cap) {
     if (!is_array()) throw std::runtime_error("chjson: not array");
     if (new_cap <= u.a.cap) return;
-    sv_value* nd = static_cast<sv_value*>(mr->allocate(sizeof(sv_value) * new_cap, alignof(sv_value)));
-    static_assert(std::is_trivially_copyable_v<sv_value>, "sv_value must be trivially copyable for memcpy relocation");
-    if (u.a.data != nullptr && u.a.size != 0) {
-      std::memcpy(nd, u.a.data, sizeof(sv_value) * u.a.size);
-    }
-    u.a.data = nd;
+    u.a.data = detail::grow_storage(mr, u.a.data, u.a.size, u.a.cap, new_cap);
     u.a.cap = new_cap;
   }
 
   void array_push_back(std::pmr::memory_resource* mr, sv_value&& v) {
     if (!is_array()) throw std::runtime_error("chjson: not array");
-    if (u.a.size == u.a.cap) {
-      const std::uint32_t next = u.a.cap ? (u.a.cap * 2u) : 8u;
-      array_reserve(mr, next);
-    }
-    new (&u.a.data[u.a.size]) sv_value(std::move(v));
+    const sv_value copy = v;
+    if (u.a.size == (std::numeric_limits<std::uint32_t>::max)()) throw std::bad_alloc();
+    if (u.a.size == u.a.cap) array_reserve(mr, detail::grow_capacity(u.a.cap, u.a.size + 1u));
+    new (&u.a.data[u.a.size]) sv_value(copy);
     ++u.a.size;
   }
 
@@ -3200,7 +3363,7 @@ struct sv_array_view {
   const sv_value& operator[](std::size_t idx) const { return data[idx]; }
 
   const sv_value* begin() const noexcept { return data; }
-  const sv_value* end() const noexcept { return data + n; }
+  const sv_value* end() const noexcept { return n ? data + n : data; }
 };
 
 struct sv_object_kv {
@@ -3228,7 +3391,7 @@ struct sv_object_view {
   };
 
   iterator begin() const { return iterator{data}; }
-  iterator end() const { return iterator{data + n}; }
+  iterator end() const { return iterator{n ? data + n : data}; }
 };
 
 inline sv_array_view sv_value::as_array() const {
@@ -3244,22 +3407,16 @@ inline sv_object_view sv_value::as_object() const {
 inline void sv_value::object_reserve(std::pmr::memory_resource* mr, std::uint32_t new_cap) {
   if (!is_object()) throw std::runtime_error("chjson: not object");
   if (new_cap <= u.o.cap) return;
-  sv_member* nm = static_cast<sv_member*>(mr->allocate(sizeof(sv_member) * new_cap, alignof(sv_member)));
-  static_assert(std::is_trivially_copyable_v<sv_member>, "sv_member must be trivially copyable for memcpy relocation");
-  if (u.o.data != nullptr && u.o.size != 0) {
-    std::memcpy(nm, u.o.data, sizeof(sv_member) * u.o.size);
-  }
-  u.o.data = nm;
+  u.o.data = detail::grow_storage(mr, u.o.data, u.o.size, u.o.cap, new_cap);
   u.o.cap = new_cap;
 }
 
 inline void sv_value::object_emplace_back(std::pmr::memory_resource* mr, std::string_view key, sv_value&& v) {
   if (!is_object()) throw std::runtime_error("chjson: not object");
-  if (u.o.size == u.o.cap) {
-    const std::uint32_t next = u.o.cap ? (u.o.cap * 2u) : 8u;
-    object_reserve(mr, next);
-  }
-  new (&u.o.data[u.o.size]) sv_member{key, std::move(v)};
+  const sv_value copy = v;
+  if (u.o.size == (std::numeric_limits<std::uint32_t>::max)()) throw std::bad_alloc();
+  if (u.o.size == u.o.cap) object_reserve(mr, detail::grow_capacity(u.o.cap, u.o.size + 1u));
+  new (&u.o.data[u.o.size]) sv_member{key, copy};
   ++u.o.size;
 }
 
@@ -3318,6 +3475,31 @@ inline mt_parse_tls_cache& document_mt_parse_stash() {
 #endif
 } // namespace detail
 
+// Releases idle caches owned by the calling thread. Live documents remain valid.
+inline void release_thread_caches() noexcept {
+  auto& dump = detail::dump_context_stash();
+  std::vector<std::string>{}.swap(dump.chunks);
+  std::vector<std::future<void>>{}.swap(dump.futures);
+#if CHJSON_USE_TLS_PARSE_CACHE
+  std::string{}.swap(detail::document_buffer_stash());
+  detail::document_arena_stash().reset();
+  auto& mt = detail::document_mt_parse_stash();
+  if (mt.resources) {
+    for (unsigned i = 0; i < mt.resources_count; ++i) mt.resources[i].~monotonic_buffer_resource();
+    detail::chjson_deallocate(mt.resources, sizeof(std::pmr::monotonic_buffer_resource) * mt.resources_count,
+                             alignof(std::pmr::monotonic_buffer_resource));
+    mt.resources = nullptr;
+    mt.resources_count = 0;
+  }
+  mt.backing.reset();
+  mt.backing_size = 0;
+#endif
+  auto& scratch = detail::long_number_scratch();
+  if (scratch.buf) detail::chjson_deallocate(scratch.buf, scratch.cap, alignof(char));
+  scratch.buf = nullptr;
+  scratch.cap = 0;
+}
+
 struct document_parse_result;
 
 class document {
@@ -3356,9 +3538,11 @@ public:
     }
   }
 #else
-  document() = default;
+  document() : mt_parse_resources_(nullptr, mt_parse_resources_deleter{}) {}
 #endif
-  explicit document(std::string json) : buffer_(std::move(json)), mt_parse_resources_(nullptr, mt_parse_resources_deleter{}) {}
+  explicit document(std::string json) : buffer_(std::move(json)), mt_parse_resources_(nullptr, mt_parse_resources_deleter{}) {
+    reserve_buffer(buffer_.size());
+  }
 
 #if CHJSON_USE_TLS_PARSE_CACHE
   ~document() noexcept {
@@ -3383,6 +3567,7 @@ public:
         auto& arena_stash = detail::document_arena_stash();
         if (arena_stash.bytes_committed() < committed) {
           arena_stash = std::move(arena_);
+          arena_stash.clear();
         }
       }
     }
@@ -3437,9 +3622,18 @@ public:
     mt_parse_backing_size_ = 0;
   }
 
+  // Release this document's storage immediately instead of retaining it for reuse.
+  void reset() noexcept {
+    clear();
+    arena_.reset();
+    std::string{}.swap(buffer_);
+  }
+
   // Replace the underlying buffer content (reusing capacity) and clear arena.
   void assign_buffer(std::string_view json) {
-    buffer_.assign(json.data(), json.size());
+    if (json.empty()) buffer_.clear();
+    else buffer_.assign(json.data(), json.size());
+    reserve_buffer(buffer_.size());
     clear();
   }
 
@@ -3448,13 +3642,32 @@ public:
   void clear_buffer() noexcept { buffer_.clear(); }
 
   // Ensure buffer capacity ahead of time (useful for benchmarks / repeated parsing).
-  void reserve_buffer(std::size_t n) { buffer_.reserve(n); }
+  void reserve_buffer(std::size_t n) {
+    // Views into an SSO string would dangle when the document is moved.
+    if (n != 0) buffer_.reserve((std::max)(n, sizeof(std::string)));
+  }
 
   document(const document&) = delete;
   document& operator=(const document&) = delete;
 
-  document(document&&) noexcept = default;
-  document& operator=(document&&) noexcept = default;
+  document(document&& other) noexcept
+    : arena_(std::move(other.arena_)), buffer_(std::move(other.buffer_)),
+      root_(std::exchange(other.root_, sv_value(nullptr))),
+      mt_parse_resources_(std::move(other.mt_parse_resources_)),
+      mt_parse_backing_(std::move(other.mt_parse_backing_)),
+      mt_parse_backing_size_(std::exchange(other.mt_parse_backing_size_, 0)) {}
+
+  document& operator=(document&& other) noexcept {
+    if (this == &other) return *this;
+    clear(); // Destroy resources before their backing allocation.
+    arena_ = std::move(other.arena_);
+    buffer_ = std::move(other.buffer_);
+    root_ = std::exchange(other.root_, sv_value(nullptr));
+    mt_parse_resources_ = std::move(other.mt_parse_resources_);
+    mt_parse_backing_ = std::move(other.mt_parse_backing_);
+    mt_parse_backing_size_ = std::exchange(other.mt_parse_backing_size_, 0);
+    return *this;
+  }
 
   std::string_view buffer() const noexcept { return std::string_view(buffer_.data(), buffer_.size()); }
   const sv_value& root() const noexcept { return root_; }
@@ -3489,7 +3702,7 @@ private:
   detail::chjson_byte_ptr mt_parse_backing_{nullptr, detail::chjson_sized_byte_deleter{0}};
   std::size_t mt_parse_backing_size_{0};
 
-  friend document_parse_result parse(std::string_view json, parse_options opt);
+  friend document_parse_result parse_large(std::string_view json, parse_options opt);
 
   friend struct insitu_parser;
 };
@@ -3652,47 +3865,9 @@ struct view_parser {
     ++i;
     const std::size_t start = i;
 
-    // Fast scan for unescaped strings.
-#if defined(_M_X64) || defined(__SSE2__)
-    {
-      const __m128i q = _mm_set1_epi8('"');
-      const __m128i bs = _mm_set1_epi8('\\');
-      const __m128i k1f = _mm_set1_epi8(0x1F);
-      const __m128i zero = _mm_setzero_si128();
-      while (i + 16 <= size) {
-        const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(buf + i));
-        const __m128i is_q = _mm_cmpeq_epi8(v, q);
-        const __m128i is_bs = _mm_cmpeq_epi8(v, bs);
-        const __m128i sub = _mm_subs_epu8(v, k1f);
-        const __m128i is_ctrl = _mm_cmpeq_epi8(sub, zero);
-        const __m128i any = _mm_or_si128(_mm_or_si128(is_q, is_bs), is_ctrl);
-        const int mask = _mm_movemask_epi8(any);
-        if (mask != 0) {
-#if defined(_MSC_VER)
-          unsigned long bit = 0;
-          _BitScanForward(&bit, static_cast<unsigned long>(mask));
-          i += static_cast<std::size_t>(bit);
-#else
-          i += static_cast<std::size_t>(__builtin_ctz(static_cast<unsigned>(mask)));
-#endif
-          const unsigned char uc = static_cast<unsigned char>(buf[i]);
-          const char c = buf[i];
-          if (c == '"') {
-            out = std::string_view(buf + start, i - start);
-            ++i;
-            return true;
-          }
-          if (c == '\\') break;
-          if (uc <= 0x1F) {
-            set_error(e, error_code::invalid_string, i);
-            return false;
-          }
-        }
-        i += 16;
-      }
-    }
-#endif
     while (i < size) {
+      i = detail::scan_string_special(buf, size, i);
+      if (i == size) break;
       const unsigned char uc = static_cast<unsigned char>(buf[i]);
       const char c = buf[i];
       if (c == '"') {
@@ -3705,16 +3880,37 @@ struct view_parser {
         set_error(e, error_code::invalid_string, i);
         return false;
       }
-      ++i;
+      if (uc >= 0x80) {
+        if (!detail::consume_utf8_run(buf, size, i)) {
+          set_error(e, error_code::invalid_string, i);
+          return false;
+        }
+      } else {
+        ++i;
+      }
     }
 
+    return parse_escaped_string(out, e, quote_pos, start);
+  }
+
+  bool parse_escaped_string(std::string_view& out, error& e,
+                              std::size_t quote_pos, std::size_t start) {
     // Escaped: two-pass.
     const std::size_t first_escape = i;
     std::size_t end_quote = std::numeric_limits<std::size_t>::max();
     {
       std::size_t scan = first_escape;
       while (scan < size) {
+        scan = detail::scan_string_special(buf, size, scan);
+        if (scan == size) break;
         const unsigned char uc = static_cast<unsigned char>(buf[scan]);
+        if (uc >= 0x80) {
+          if (!detail::consume_utf8_run(buf, size, scan)) {
+            set_error(e, error_code::invalid_string, scan);
+            return false;
+          }
+          continue;
+        }
         const char c = buf[scan++];
         if (c == '"') {
           end_quote = scan - 1;
@@ -3753,6 +3949,14 @@ struct view_parser {
     std::size_t rpos = start;
     std::size_t wpos = 0;
     while (rpos < end_quote) {
+      if (buf[rpos] != '\\') {
+        const auto* escape = static_cast<const char*>(std::memchr(buf + rpos, '\\', end_quote - rpos));
+        const std::size_t stop = escape ? static_cast<std::size_t>(escape - buf) : end_quote;
+        std::memcpy(dst + wpos, buf + rpos, stop - rpos);
+        wpos += stop - rpos;
+        rpos = stop;
+        if (rpos == end_quote) break;
+      }
       const unsigned char uc = static_cast<unsigned char>(buf[rpos]);
       const char c = buf[rpos++];
       if (c == '\\') {
@@ -3826,23 +4030,20 @@ struct view_parser {
     out.u.a = {};
     out.set_kind(sv_value::kind::array);
 
+    if (i < size && buf[i] == ']') {
+      ++i;
+      return out;
+    }
+    if (depth >= opt.max_depth) {
+      set_error(e, error_code::nesting_too_deep, i);
+      return nullptr;
+    }
+
     auto* mr = doc->resource();
     auto reserve = [&](std::uint32_t want) {
       if (want <= out.u.a.cap) return;
-      std::uint32_t new_cap = 0;
-      if (out.u.a.cap == 0) {
-        // First reserve: allocate exactly to avoid overshoot on huge arrays.
-        new_cap = want ? want : 1u;
-      } else {
-        new_cap = out.u.a.cap;
-        while (new_cap < want) new_cap = (new_cap < 1024u) ? (new_cap * 2u) : (new_cap + new_cap / 2u);
-      }
-      sv_value* new_data = static_cast<sv_value*>(mr->allocate(sizeof(sv_value) * new_cap, alignof(sv_value)));
-      if (out.u.a.data && out.u.a.size) {
-        std::memcpy(new_data, out.u.a.data, sizeof(sv_value) * out.u.a.size);
-      }
-      out.u.a.data = new_data;
-      out.u.a.cap = new_cap;
+      const auto next = out.u.a.cap ? detail::grow_capacity(out.u.a.cap, want) : (std::max)(4u, want);
+      out.array_reserve(mr, next);
     };
 
     auto is_num_start = [](char c) noexcept {
@@ -3853,8 +4054,7 @@ struct view_parser {
     // reserve using remaining/20 without the old 2M cap to avoid realloc+memcpy
     // and monotonic arena waste. For other arrays, keep a conservative cap.
     if (depth <= 1) {
-      const std::size_t remaining = (i < size) ? (size - i) : 0;
-      const std::size_t guess = remaining / 20u;
+      const std::size_t guess = detail::estimate_array_items(buf, size, i);
       if (guess >= 16) {
         constexpr std::size_t kCap = 2u * 1024u * 1024u;
         const bool starts_number = (i < size) && is_num_start(buf[i]);
@@ -3865,13 +4065,9 @@ struct view_parser {
         reserve(want);
       }
     } else {
-      reserve(16);
+      reserve(4);
     }
 
-    if (i < size && buf[i] == ']') {
-      ++i;
-      return out;
-    }
 
     // Fast path for number-only arrays (e.g. the numbers payload):
     // parse floats eagerly to avoid lazy conversion during sum.
@@ -3887,9 +4083,9 @@ struct view_parser {
           }
           if (out.u.a.size == out.u.a.cap) reserve(out.u.a.size + 1u);
           if (num.is_int) {
-            out.u.a.data[out.u.a.size++] = sv_value::integer(num.i);
+            new (out.u.a.data + out.u.a.size++) sv_value(sv_value::integer(num.i));
           } else {
-            out.u.a.data[out.u.a.size++] = sv_value::number_token_with_double(std::string_view(buf + start, i - start), num.d);
+            new (out.u.a.data + out.u.a.size++) sv_value(sv_value::number_token_with_double(std::string_view(buf + start, i - start), num.d));
           }
 
           if (i >= size) {
@@ -3972,27 +4168,22 @@ struct view_parser {
     out.u.o = {};
     out.set_kind(sv_value::kind::object);
 
-    auto* mr = doc->resource();
-    auto reserve = [&](std::uint32_t want) {
-      if (want <= out.u.o.cap) return;
-      std::uint32_t new_cap = out.u.o.cap ? out.u.o.cap : 1u;
-      while (new_cap < want) new_cap = (new_cap < 1024u) ? (new_cap * 2u) : (new_cap + new_cap / 2u);
-      sv_member* new_data = static_cast<sv_member*>(mr->allocate(sizeof(sv_member) * new_cap, alignof(sv_member)));
-      if (out.u.o.data && out.u.o.size) {
-        std::memcpy(new_data, out.u.o.data, sizeof(sv_member) * out.u.o.size);
-      }
-      out.u.o.data = new_data;
-      out.u.o.cap = new_cap;
-    };
-
-    // Many JSON objects are small and fixed-shape; reserving a few slots helps.
-    (void)depth;
-    reserve(8);
-
     if (i < size && buf[i] == '}') {
       ++i;
       return out;
     }
+
+    auto* mr = doc->resource();
+    auto reserve = [&](std::uint32_t want) {
+      if (want <= out.u.o.cap) return;
+      const auto next = out.u.o.cap ? detail::grow_capacity(out.u.o.cap, want) : (std::max)(4u, want);
+      out.object_reserve(mr, next);
+    };
+
+    // Many JSON objects are small and fixed-shape; reserving a few slots helps.
+    (void)depth;
+    reserve(4);
+
 
     while (true) {
       detail::skip_ws(buf, size, i);
@@ -4189,47 +4380,9 @@ struct owning_view_parser {
     ++i;
     const std::size_t start = i;
 
-    // Fast scan for unescaped strings.
-#if defined(_M_X64) || defined(__SSE2__)
-    {
-      const __m128i q = _mm_set1_epi8('"');
-      const __m128i bs = _mm_set1_epi8('\\');
-      const __m128i k1f = _mm_set1_epi8(0x1F);
-      const __m128i zero = _mm_setzero_si128();
-      while (i + 16 <= size) {
-        const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(buf + i));
-        const __m128i is_q = _mm_cmpeq_epi8(v, q);
-        const __m128i is_bs = _mm_cmpeq_epi8(v, bs);
-        const __m128i sub = _mm_subs_epu8(v, k1f);
-        const __m128i is_ctrl = _mm_cmpeq_epi8(sub, zero);
-        const __m128i any = _mm_or_si128(_mm_or_si128(is_q, is_bs), is_ctrl);
-        const int mask = _mm_movemask_epi8(any);
-        if (mask != 0) {
-#if defined(_MSC_VER)
-          unsigned long bit = 0;
-          _BitScanForward(&bit, static_cast<unsigned long>(mask));
-          i += static_cast<std::size_t>(bit);
-#else
-          i += static_cast<std::size_t>(__builtin_ctz(static_cast<unsigned>(mask)));
-#endif
-          const unsigned char uc = static_cast<unsigned char>(buf[i]);
-          const char c = buf[i];
-          if (c == '"') {
-            out = copy_span(buf + start, i - start);
-            ++i;
-            return true;
-          }
-          if (c == '\\') break;
-          if (uc <= 0x1F) {
-            set_error(e, error_code::invalid_string, i);
-            return false;
-          }
-        }
-        i += 16;
-      }
-    }
-#endif
     while (i < size) {
+      i = detail::scan_string_special(buf, size, i);
+      if (i == size) break;
       const unsigned char uc = static_cast<unsigned char>(buf[i]);
       const char c = buf[i];
       if (c == '"') {
@@ -4242,16 +4395,37 @@ struct owning_view_parser {
         set_error(e, error_code::invalid_string, i);
         return false;
       }
-      ++i;
+      if (uc >= 0x80) {
+        if (!detail::consume_utf8_run(buf, size, i)) {
+          set_error(e, error_code::invalid_string, i);
+          return false;
+        }
+      } else {
+        ++i;
+      }
     }
 
+    return parse_escaped_string(out, e, quote_pos, start);
+  }
+
+  bool parse_escaped_string(std::string_view& out, error& e,
+                              std::size_t quote_pos, std::size_t start) {
     // Escaped: two-pass decode into the arena.
     const std::size_t first_escape = i;
     std::size_t end_quote = std::numeric_limits<std::size_t>::max();
     {
       std::size_t scan = first_escape;
       while (scan < size) {
+        scan = detail::scan_string_special(buf, size, scan);
+        if (scan == size) break;
         const unsigned char uc = static_cast<unsigned char>(buf[scan]);
+        if (uc >= 0x80) {
+          if (!detail::consume_utf8_run(buf, size, scan)) {
+            set_error(e, error_code::invalid_string, scan);
+            return false;
+          }
+          continue;
+        }
         const char c = buf[scan++];
         if (c == '"') {
           end_quote = scan - 1;
@@ -4290,6 +4464,14 @@ struct owning_view_parser {
     std::size_t rpos = start;
     std::size_t wpos = 0;
     while (rpos < end_quote) {
+      if (buf[rpos] != '\\') {
+        const auto* escape = static_cast<const char*>(std::memchr(buf + rpos, '\\', end_quote - rpos));
+        const std::size_t stop = escape ? static_cast<std::size_t>(escape - buf) : end_quote;
+        std::memcpy(dst + wpos, buf + rpos, stop - rpos);
+        wpos += stop - rpos;
+        rpos = stop;
+        if (rpos == end_quote) break;
+      }
       const unsigned char uc = static_cast<unsigned char>(buf[rpos]);
       const char c = buf[rpos++];
       if (c == '\\') {
@@ -4361,14 +4543,21 @@ struct owning_view_parser {
     detail::skip_ws(buf, size, i);
     auto* mr = doc->resource();
     sv_value out = sv_value::make_array(mr);
+    if (i < size && buf[i] == ']') {
+      ++i;
+      return out;
+    }
+    if (depth >= opt.max_depth) {
+      set_error(e, error_code::nesting_too_deep, i);
+      return nullptr;
+    }
 
     auto is_num_start = [](char c) noexcept {
       return c == '-' || (c >= '0' && c <= '9');
     };
 
     if (depth <= 1) {
-      const std::size_t remaining = (i < size) ? (size - i) : 0;
-      const std::size_t guess = remaining / 20u;
+      const std::size_t guess = detail::estimate_array_items(buf, size, i);
       if (guess > 0) {
         constexpr std::size_t kCap = 2u * 1024u * 1024u;
         const bool starts_number = (i < size) && is_num_start(buf[i]);
@@ -4379,16 +4568,12 @@ struct owning_view_parser {
         out.array_reserve(mr, want);
       }
     } else {
-      out.array_reserve(mr, 16u);
+      out.array_reserve(mr, 4u);
     }
 
-    if (i < size && buf[i] == ']') {
-      ++i;
-      return out;
-    }
 
     // Fast path for number-only arrays (e.g. the numbers payload):
-    // eagerly parse floats (no raw token copying) so Parse+sum doesn't pay lazy conversion.
+    // Preserve tokens while eagerly parsing floats so Parse+sum avoids lazy conversion.
     {
       detail::skip_ws(buf, size, i);
       if (i < size && is_num_start(buf[i])) {
@@ -4402,7 +4587,7 @@ struct owning_view_parser {
           if (num.is_int) {
             out.array_push_back(mr, sv_value::integer(num.i));
           } else {
-            out.array_push_back(mr, sv_value::number(num.d));
+            out.array_push_back(mr, sv_value::number_token_with_double(copy_span(buf + start, i - start), num.d));
           }
 
           if (i >= size) {
@@ -4481,13 +4666,13 @@ struct owning_view_parser {
     detail::skip_ws(buf, size, i);
     auto* mr = doc->resource();
     sv_value out = sv_value::make_object(mr);
-    (void)depth;
-    out.object_reserve(mr, 8u);
-
     if (i < size && buf[i] == '}') {
       ++i;
       return out;
     }
+    (void)depth;
+    out.object_reserve(mr, 4u);
+
 
     while (true) {
       detail::skip_ws(buf, size, i);
@@ -4677,39 +4862,41 @@ struct no_string_parser {
     out.u.a = {};
     out.set_kind(sv_value::kind::array);
 
-    auto* mr = doc->resource();
-    auto reserve = [&](std::uint32_t want) {
-      if (want <= out.u.a.cap) return;
-      std::uint32_t new_cap = 0;
-      if (out.u.a.cap == 0) {
-        // First reserve: allocate exactly to avoid overshoot on huge arrays.
-        new_cap = want ? want : 1u;
-      } else {
-        new_cap = out.u.a.cap;
-        while (new_cap < want) new_cap = (new_cap < 1024u) ? (new_cap * 2u) : (new_cap + new_cap / 2u);
-      }
-      sv_value* new_data = static_cast<sv_value*>(mr->allocate(sizeof(sv_value) * new_cap, alignof(sv_value)));
-      if (out.u.a.data && out.u.a.size) {
-        std::memcpy(new_data, out.u.a.data, sizeof(sv_value) * out.u.a.size);
-      }
-      out.u.a.data = new_data;
-      out.u.a.cap = new_cap;
-    };
-
-    // For no-string inputs, large arrays are typically number-heavy; use a
-    // tighter per-element estimate than the generic /64 heuristic.
-    if (depth <= 1) {
-      const std::size_t remaining = (i < size) ? (size - i) : 0;
-      const std::size_t guess = remaining / 20u;
-      if (guess >= 16) reserve(static_cast<std::uint32_t>(std::min<std::size_t>(guess, 2u * 1024u * 1024u)));
-    } else {
-      reserve(16);
-    }
-
     if (i < size && buf[i] == ']') {
       ++i;
       return out;
     }
+    if (depth >= opt.max_depth) {
+      set_error(e, error_code::nesting_too_deep, i);
+      return nullptr;
+    }
+
+    auto* mr = doc->resource();
+    auto reserve = [&](std::uint32_t want) {
+      if (want <= out.u.a.cap) return;
+      const auto next = out.u.a.cap ? detail::grow_capacity(out.u.a.cap, want) : (std::max)(4u, want);
+      out.array_reserve(mr, next);
+    };
+
+    // Flat arrays can be sized exactly, including raw floating-point tokens.
+    // This avoids interleaving token allocations with abandoned array buffers.
+    if (depth <= 1) {
+      const std::size_t remaining = (i < size) ? (size - i) : 0;
+      const auto flat = remaining >= 1024u ? detail::inspect_flat_array(buf, size, i) : detail::flat_array_info{};
+      if (flat.items && flat.items <= (std::numeric_limits<std::uint32_t>::max)()) {
+        const std::size_t tokens = flat.has_fp ? size : 0;
+        if (flat.items > ((std::numeric_limits<std::size_t>::max)() - tokens) / sizeof(sv_value))
+          throw std::bad_alloc();
+        doc->arena().reserve_bytes(flat.items * sizeof(sv_value) + tokens);
+        reserve(static_cast<std::uint32_t>(flat.items));
+      } else {
+        const std::size_t guess = remaining / 20u;
+        if (guess >= 16) reserve(static_cast<std::uint32_t>(std::min<std::size_t>(guess, 2u * 1024u * 1024u)));
+      }
+    } else {
+      reserve(4);
+    }
+
 
     auto is_num_start = [](char c) noexcept {
       return c == '-' || (c >= '0' && c <= '9');
@@ -4731,23 +4918,10 @@ struct no_string_parser {
           if (out.u.a.size == out.u.a.cap) reserve(out.u.a.size + 1u);
           sv_value* dst = &out.u.a.data[out.u.a.size++];
           if (num.is_int) {
-            dst->u.num = {};
-            dst->set_kind(sv_value::kind::number);
-            dst->u.num.raw_data = nullptr;
-            dst->u.num.raw_size_flags = 0;
-            dst->u.num.set_int_value(num.i);
-            dst->u.num.set_is_int(true);
-            dst->u.num.set_has_double(false);
+            new (dst) sv_value(sv_value::integer(num.i));
           } else {
             const std::string_view tok = number_token_view(start, i - start);
-            dst->u.num = {};
-            dst->set_kind(sv_value::kind::number);
-            dst->u.num.raw_data = nullptr;
-            dst->u.num.raw_size_flags = 0;
-            dst->u.num.set_is_int(false);
-            dst->u.num.set_has_double(true);
-            dst->u.num.set_raw_span(tok.data(), static_cast<std::uint32_t>(tok.size()));
-            dst->u.num.set_double_value(num.d);
+            new (dst) sv_value(sv_value::number_token_with_double(tok, num.d));
           }
 
           if (i >= size) {
@@ -4849,16 +5023,23 @@ struct no_string_parser {
   }
 };
 
-inline view_document_parse_result parse_view(std::string_view json, parse_options opt = {}) {
+inline view_document_parse_result parse_view(std::string_view json, parse_options opt = {}) try {
   view_parser p;
   p.opt = opt;
   return p.run(json);
+} catch (const std::bad_alloc&) {
+  view_document_parse_result result;
+  result.err.code = error_code::out_of_memory;
+  return result;
 }
 
-inline error parse_view_into(view_document& d, std::string_view json, parse_options opt = {}) {
+inline error parse_view_into(view_document& d, std::string_view json, parse_options opt = {}) try {
   view_parser p;
   p.opt = opt;
   return p.run_inplace(d, json);
+} catch (const std::bad_alloc&) {
+  d.clear();
+  return {error_code::out_of_memory};
 }
 
 namespace detail {
@@ -4899,6 +5080,21 @@ struct insitu_parser {
   std::size_t size{0};
   std::size_t i{0};
   parse_options opt;
+  std::size_t line_scan_pos{0};
+  std::size_t source_line{1};
+  std::size_t source_column{1};
+
+  // Consume original bytes before escape decoding overwrites them. Error positions
+  // must refer to source newlines, not newlines introduced by decoding a string.
+  void track_position_to(std::size_t pos) {
+    while (line_scan_pos < pos) {
+      const auto* newline = static_cast<const char*>(std::memchr(buf + line_scan_pos, '\n', pos - line_scan_pos));
+      if (!newline) { source_column += pos - line_scan_pos; line_scan_pos = pos; break; }
+      line_scan_pos = static_cast<std::size_t>(newline - buf) + 1;
+      ++source_line;
+      source_column = 1;
+    }
+  }
 
   error run_inplace(document& d) {
     doc = &d;
@@ -4906,6 +5102,8 @@ struct insitu_parser {
     size = d.buffer_.size();
     s = d.buffer();
     i = 0;
+    line_scan_pos = 0;
+    source_line = source_column = 1;
 
     error err;
     detail::skip_ws(buf, size, i);
@@ -4929,6 +5127,8 @@ struct insitu_parser {
     size = doc->buffer_.size();
     s = doc->buffer();
     i = 0;
+    line_scan_pos = 0;
+    source_line = source_column = 1;
 
     detail::skip_ws(buf, size, i);
     doc->root_ = parse_value(0, r.err);
@@ -4946,7 +5146,17 @@ struct insitu_parser {
     if (e) return;
     e.code = code;
     e.offset = (at == std::numeric_limits<std::size_t>::max()) ? i : at;
-    detail::update_line_col(s, e.offset, e.line, e.column);
+    if (e.offset < line_scan_pos) {
+      // Unterminated strings report their opening quote. Position tracking may
+      // already have advanced past it before decoding a newline escape. The
+      // validated source prefix within a string contains no literal newlines.
+      e.line = source_line;
+      e.column = source_column - (line_scan_pos - e.offset);
+      return;
+    }
+    track_position_to(e.offset);
+    e.line = source_line;
+    e.column = source_column;
   }
 
   sv_value parse_value(std::size_t depth, error& e) {
@@ -5009,47 +5219,9 @@ struct insitu_parser {
     ++i;
     const std::size_t start = i;
 
-    // Fast scan for unescaped strings.
-#if defined(_M_X64) || defined(__SSE2__)
-    {
-      const __m128i q = _mm_set1_epi8('"');
-      const __m128i bs = _mm_set1_epi8('\\');
-      const __m128i k1f = _mm_set1_epi8(0x1F);
-      const __m128i zero = _mm_setzero_si128();
-      while (i + 16 <= size) {
-        const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(buf + i));
-        const __m128i is_q = _mm_cmpeq_epi8(v, q);
-        const __m128i is_bs = _mm_cmpeq_epi8(v, bs);
-        const __m128i sub = _mm_subs_epu8(v, k1f);
-        const __m128i is_ctrl = _mm_cmpeq_epi8(sub, zero);
-        const __m128i any = _mm_or_si128(_mm_or_si128(is_q, is_bs), is_ctrl);
-        const int mask = _mm_movemask_epi8(any);
-        if (mask != 0) {
-#if defined(_MSC_VER)
-          unsigned long bit = 0;
-          _BitScanForward(&bit, static_cast<unsigned long>(mask));
-          i += static_cast<std::size_t>(bit);
-#else
-          i += static_cast<std::size_t>(__builtin_ctz(static_cast<unsigned>(mask)));
-#endif
-          const unsigned char uc = static_cast<unsigned char>(buf[i]);
-          const char c = buf[i];
-          if (c == '"') {
-            out = std::string_view(buf + start, i - start);
-            ++i;
-            return true;
-          }
-          if (c == '\\') break;
-          if (uc <= 0x1F) {
-            set_error(e, error_code::invalid_string, i);
-            return false;
-          }
-        }
-        i += 16;
-      }
-    }
-#endif
     while (i < size) {
+      i = detail::scan_string_special(buf, size, i);
+      if (i == size) break;
       const unsigned char uc = static_cast<unsigned char>(buf[i]);
       const char c = buf[i];
       if (c == '"') {
@@ -5062,14 +5234,33 @@ struct insitu_parser {
         set_error(e, error_code::invalid_string, i);
         return false;
       }
-      ++i;
+      if (uc >= 0x80) {
+        if (!detail::consume_utf8_run(buf, size, i)) {
+          set_error(e, error_code::invalid_string, i);
+          return false;
+        }
+      } else {
+        ++i;
+      }
     }
 
+    return parse_escaped_string(out, e, quote_pos, start);
+  }
+
+  bool parse_escaped_string(std::string_view& out, error& e,
+                              std::size_t quote_pos, std::size_t start) {
     // Escaped: decode in place, always shrinking.
     // Prefix [start, i) is already in-place; begin writing at the first escape.
     std::size_t rpos = i;
     std::size_t wpos = i;
     while (rpos < size) {
+      const std::size_t stop = detail::scan_string_special(buf, size, rpos);
+      if (stop != rpos) {
+        std::memmove(buf + wpos, buf + rpos, stop - rpos);
+        wpos += stop - rpos;
+        rpos = stop;
+        if (rpos == size) break;
+      }
       const unsigned char uc = static_cast<unsigned char>(buf[rpos]);
       const char c = buf[rpos++];
       if (c == '"') {
@@ -5079,7 +5270,7 @@ struct insitu_parser {
       }
       if (c == '\\') {
         if (rpos >= size) {
-          set_error(e, error_code::unexpected_eof);
+          set_error(e, error_code::unexpected_eof, quote_pos);
           return false;
         }
         const char esc = buf[rpos++];
@@ -5089,7 +5280,7 @@ struct insitu_parser {
           case '/': buf[wpos++] = '/'; break;
           case 'b': buf[wpos++] = '\b'; break;
           case 'f': buf[wpos++] = '\f'; break;
-          case 'n': buf[wpos++] = '\n'; break;
+          case 'n': track_position_to(rpos); buf[wpos++] = '\n'; break;
           case 'r': buf[wpos++] = '\r'; break;
           case 't': buf[wpos++] = '\t'; break;
           case 'u': {
@@ -5120,6 +5311,7 @@ struct insitu_parser {
               set_error(e, error_code::invalid_utf16_surrogate, rpos);
               return false;
             }
+            if (cp == 0x0Au) track_position_to(rpos);
             detail::write_utf8_insitu(buf, wpos, cp);
             break;
           }
@@ -5133,7 +5325,19 @@ struct insitu_parser {
         set_error(e, error_code::invalid_string, rpos - 1);
         return false;
       }
-      buf[wpos++] = c;
+      if (uc >= 0x80) {
+        const std::size_t first = rpos - 1;
+        std::size_t next = first;
+        if (!detail::consume_utf8_run(buf, size, next)) {
+          set_error(e, error_code::invalid_string, next);
+          return false;
+        }
+        std::memmove(buf + wpos, buf + first, next - first);
+        wpos += next - first;
+        rpos = next;
+      } else {
+        buf[wpos++] = c;
+      }
     }
 
     // Unterminated string.
@@ -5148,17 +5352,20 @@ struct insitu_parser {
     out.u.a = {};
     out.set_kind(sv_value::kind::array);
 
+    if (i < size && buf[i] == ']') {
+      ++i;
+      return out;
+    }
+    if (depth >= opt.max_depth) {
+      set_error(e, error_code::nesting_too_deep, i);
+      return nullptr;
+    }
+
     auto* mr = doc->resource();
     auto reserve = [&](std::uint32_t want) {
       if (want <= out.u.a.cap) return;
-      std::uint32_t new_cap = out.u.a.cap ? out.u.a.cap : 1u;
-      while (new_cap < want) new_cap = (new_cap < 1024u) ? (new_cap * 2u) : (new_cap + new_cap / 2u);
-      sv_value* new_data = static_cast<sv_value*>(mr->allocate(sizeof(sv_value) * new_cap, alignof(sv_value)));
-      if (out.u.a.data && out.u.a.size) {
-        std::memcpy(new_data, out.u.a.data, sizeof(sv_value) * out.u.a.size);
-      }
-      out.u.a.data = new_data;
-      out.u.a.cap = new_cap;
+      const auto next = out.u.a.cap ? detail::grow_capacity(out.u.a.cap, want) : (std::max)(4u, want);
+      out.array_reserve(mr, next);
     };
 
     auto is_num_start = [](char c) noexcept {
@@ -5169,8 +5376,7 @@ struct insitu_parser {
     // without the old 2M cap to avoid realloc+memcpy and monotonic arena waste.
     // For other arrays, keep a conservative cap.
     if (depth <= 1) {
-      const std::size_t remaining = (i < size) ? (size - i) : 0;
-      const std::size_t guess = remaining / 20u;
+      const std::size_t guess = detail::estimate_array_items(buf, size, i);
       if (guess >= 16) {
         constexpr std::size_t kCap = 2u * 1024u * 1024u;
         const bool starts_number = (i < size) && is_num_start(buf[i]);
@@ -5181,13 +5387,9 @@ struct insitu_parser {
         reserve(want);
       }
     } else {
-      reserve(16);
+      reserve(4);
     }
 
-    if (i < size && buf[i] == ']') {
-      ++i;
-      return out;
-    }
 
     // Fast path for number-only arrays (e.g. the numbers payload):
     // parse floats eagerly to avoid lazy conversion during sum.
@@ -5203,9 +5405,9 @@ struct insitu_parser {
           }
           if (out.u.a.size == out.u.a.cap) reserve(out.u.a.size + 1u);
           if (num.is_int) {
-            out.u.a.data[out.u.a.size++] = sv_value::integer(num.i);
+            new (out.u.a.data + out.u.a.size++) sv_value(sv_value::integer(num.i));
           } else {
-            out.u.a.data[out.u.a.size++] = sv_value::number_token_with_double(std::string_view(buf + start, i - start), num.d);
+            new (out.u.a.data + out.u.a.size++) sv_value(sv_value::number_token_with_double(std::string_view(buf + start, i - start), num.d));
           }
 
           if (i >= size) {
@@ -5288,26 +5490,20 @@ struct insitu_parser {
     out.set_kind(sv_value::kind::object);
 
     auto* mr = doc->resource();
-    auto reserve = [&](std::uint32_t want) {
-      if (want <= out.u.o.cap) return;
-      std::uint32_t new_cap = out.u.o.cap ? out.u.o.cap : 1u;
-      while (new_cap < want) new_cap = (new_cap < 1024u) ? (new_cap * 2u) : (new_cap + new_cap / 2u);
-      sv_member* new_data = static_cast<sv_member*>(mr->allocate(sizeof(sv_member) * new_cap, alignof(sv_member)));
-      if (out.u.o.data && out.u.o.size) {
-        std::memcpy(new_data, out.u.o.data, sizeof(sv_member) * out.u.o.size);
-      }
-      out.u.o.data = new_data;
-      out.u.o.cap = new_cap;
-    };
-
-    // Many JSON objects are small and fixed-shape; reserving a few slots helps.
-    (void)depth;
-    reserve(8);
-
     if (i < size && buf[i] == '}') {
       ++i;
       return out;
     }
+    auto reserve = [&](std::uint32_t want) {
+      if (want <= out.u.o.cap) return;
+      const auto next = out.u.o.cap ? detail::grow_capacity(out.u.o.cap, want) : (std::max)(4u, want);
+      out.object_reserve(mr, next);
+    };
+
+    // Many JSON objects are small and fixed-shape; reserving a few slots helps.
+    (void)depth;
+    reserve(4);
+
 
     while (true) {
       detail::skip_ws(buf, size, i);
@@ -5383,22 +5579,29 @@ struct insitu_parser {
   }
 };
 
-inline document_parse_result parse_in_situ(std::string json, parse_options opt = {}) {
+inline document_parse_result parse_in_situ(std::string json, parse_options opt = {}) try {
   document d(std::move(json));
 
   insitu_parser p;
   p.doc = &d;
   p.opt = opt;
   return p.run();
+} catch (const std::bad_alloc&) {
+  document_parse_result result;
+  result.err.code = error_code::out_of_memory;
+  return result;
 }
 
 // Parse into an existing document, reusing its arena blocks and string capacity.
 // This avoids repeated allocations in tight loops.
-inline error parse_in_situ_into(document& d, std::string_view json, parse_options opt = {}) {
+inline error parse_in_situ_into(document& d, std::string_view json, parse_options opt = {}) try {
   d.assign_buffer(json);
   insitu_parser p;
   p.opt = opt;
   return p.run_inplace(d);
+} catch (const std::bad_alloc&) {
+  d.clear();
+  return {error_code::out_of_memory};
 }
 
 // Forward declaration for parse_many_into (defined later in this header).
@@ -5409,32 +5612,11 @@ inline document_parse_result parse(std::string_view json, parse_options opt = {}
 // This is a throughput helper for workloads like "parse N documents".
 // It does not change single-document parsing semantics.
 inline void parse_many_into(document_parse_result* out, const std::string_view* inputs, std::size_t count, parse_many_options options = {}) {
-  if (out == nullptr || inputs == nullptr) return;
-  if (count == 0) return;
-
-  const unsigned threads = detail::effective_threads(options.max_threads);
-  if (threads <= 1 || count == 1) {
-    for (std::size_t i = 0; i < count; ++i) out[i] = parse(inputs[i], options.opt);
-    return;
-  }
-
-  unsigned used = threads;
-  if (used > static_cast<unsigned>(count)) used = static_cast<unsigned>(count);
-
-  const std::size_t base = count / used;
-  const std::size_t rem = count % used;
-  detail::internal_array<std::future<void>> fut(used);
-
-  std::size_t begin = 0;
-  for (unsigned t = 0; t < used; ++t) {
-    const std::size_t len = base + (t < rem ? 1u : 0u);
-    const std::size_t end = begin + len;
-    fut[t] = std::async(std::launch::async, [&, begin, end]() {
+  if (!out || !inputs || count == 0) return;
+  detail::parallel_for_chunks(count, detail::effective_threads(options.max_threads),
+    [&](std::size_t begin, std::size_t end) {
       for (std::size_t i = begin; i < end; ++i) out[i] = parse(inputs[i], options.opt);
     });
-    begin = end;
-  }
-  for (unsigned t = 0; t < used; ++t) fut[t].get();
 }
 
 // -----------------------------
@@ -5445,16 +5627,23 @@ inline void parse_many_into(document_parse_result* out, const std::string_view* 
 // Strings/keys are copied into the arena.
 // For non-integer numbers, we copy the raw number token into the arena and parse to double lazily
 // on first access via as_double()/as_double_unchecked().
-inline error parse_owning_view_into(document& d, std::string_view json, parse_options opt = {}) {
+inline error parse_owning_view_into(document& d, std::string_view json, parse_options opt = {}) try {
   owning_view_parser p;
   p.opt = opt;
   return p.run_inplace(d, json);
+} catch (const std::bad_alloc&) {
+  d.clear();
+  return {error_code::out_of_memory};
 }
 
-inline document_parse_result parse_owning_view(std::string_view json, parse_options opt = {}) {
+inline document_parse_result parse_owning_view(std::string_view json, parse_options opt = {}) try {
   owning_view_parser p;
   p.opt = opt;
   return p.run(json);
+} catch (const std::bad_alloc&) {
+  document_parse_result result;
+  result.err.code = error_code::out_of_memory;
+  return result;
 }
 
 inline document parse_owning_view_or_throw(std::string_view json, parse_options opt = {}) {
@@ -5469,20 +5658,42 @@ inline document parse_owning_view_or_throw(std::string_view json, parse_options 
 
 // Parses JSON into an owning `document` (arena-backed DOM) and returns it.
 // This replaces the old `value`-tree parse as the default for high throughput.
-inline document_parse_result parse(std::string_view json, parse_options opt) {
-  auto estimate_arena_reserve = [](std::size_t json_bytes, bool no_strings) noexcept -> std::size_t {
+inline document_parse_result parse_large(std::string_view json, parse_options opt) try {
+  auto estimate_arena_reserve = [json](std::size_t json_bytes, bool no_strings, bool mt_backing = false) noexcept -> std::size_t {
     // For parse(dom), most strings/number tokens are views into the internal buffer,
     // so the arena is dominated by array/object storage.
     //
     // However, the no-string fast path does not keep a backing buffer, so it
     // materializes more into the arena (especially number-heavy arrays). Use a
     // larger multiplier to avoid many growth allocations.
-    constexpr std::size_t min_reserve = 64u * 1024u;
+    constexpr std::size_t min_reserve = 1024u;
     constexpr std::size_t max_reserve = static_cast<std::size_t>(CHJSON_PARSE_DOM_ARENA_RESERVE_MAX);
 
-    if (json_bytes == 0) return min_reserve;
+    if (json_bytes < 1024u) return 0;
+    std::size_t first = 0;
+    detail::skip_ws(json, first);
+    // Scalar roots do not need container storage, regardless of input length.
+    if (first == json.size() || (json[first] != '[' && json[first] != '{')) return 0;
+    if (!mt_backing && json[first] == '[') {
+      std::size_t item = first + 1;
+      detail::skip_ws(json, item);
+      // The numeric parser sizes its root storage before allocating any tokens.
+      if (item < json.size() && (json[item] == '-' || detail::is_digit(json[item]))) return 0;
+    }
+    if (!no_strings && !mt_backing) {
+      if (json[first] == '[') {
+        ++first;
+        detail::skip_ws(json, first);
+        if (first < json.size() && json[first] == '"') {
+          const auto items = detail::estimate_array_items(json.data(), json.size(), first);
+          if (items < json_bytes / 128u)
+            return (std::min)(max_reserve, (std::max)(min_reserve, items * sizeof(sv_value)));
+        }
+      }
+    }
 
-    const std::size_t mult = no_strings ? 2u : 4u;
+
+    const std::size_t mult = no_strings ? 2u : 3u;
     std::size_t guess = json_bytes;
     if (guess > (std::numeric_limits<std::size_t>::max)() / mult) {
       guess = max_reserve;
@@ -5524,7 +5735,7 @@ inline document_parse_result parse(std::string_view json, parse_options opt) {
     constexpr std::size_t kFpBackedMinBytes = 16u * 1024u * 1024u;
     const bool prefer_backing_buffer = fp_heavy && (json.size() >= kFpBackedMinBytes);
 
-    if (!prefer_backing_buffer) {
+    if (!prefer_backing_buffer || opt.max_depth < 2 || !opt.require_eof) {
       r.doc.arena().reserve_bytes(estimate_arena_reserve(json.size(), /*no_strings=*/true));
       no_string_parser p;
       p.opt = opt;
@@ -5862,7 +6073,7 @@ inline document_parse_result parse(std::string_view json, parse_options opt) {
     // MT path for large top-level containers, and for that case we fuse
     // "copy input into document buffer" + "span scan" into a single pass.
     const unsigned threads = detail::effective_threads(0);
-    if (threads > 1 && json.size() >= static_cast<std::size_t>(CHJSON_PARSE_MT_MIN_BYTES)) {
+    if (threads > 1 && opt.max_depth > 0 && json.size() >= static_cast<std::size_t>(CHJSON_PARSE_MT_MIN_BYTES)) {
       std::size_t top_i = 0;
       detail::skip_ws(json, top_i);
       const char top = (top_i < json.size()) ? json[top_i] : '\0';
@@ -6157,11 +6368,13 @@ inline document_parse_result parse(std::string_view json, parse_options opt) {
         for (unsigned attempt = 0; attempt < k_max_mt_retries; ++attempt) {
           // Allocate one backing buffer and split it into per-thread slices.
           // Keep it conservative: the DOM arena demand is typically <= ~4x input.
-          std::size_t total = estimate_arena_reserve(src.size(), /*no_strings=*/false);
+          std::size_t total = estimate_arena_reserve(src.size(), /*no_strings=*/false, /*mt_backing=*/true);
           if (attempt != 0) total *= 2;
           const std::size_t per = (used == 0) ? total : (total / used);
           const std::size_t align = alignof(std::max_align_t);
-          const std::size_t slice = ((per + align - 1) / align) * align;
+          // Round down so alignment padding cannot push a capped allocation
+          // beyond CHJSON_TLS_PARSE_MT_BACKING_MAX and defeat reuse every time.
+          const std::size_t slice = (std::max)(align, (per / align) * align);
           const std::size_t backing = slice * static_cast<std::size_t>(used);
 
           // Reuse MT backing/resources if possible to avoid per-parse allocations.
@@ -6178,6 +6391,8 @@ inline document_parse_result parse(std::string_view json, parse_options opt) {
             auto* raw = static_cast<std::pmr::monotonic_buffer_resource*>(
                 detail::chjson_allocate(sizeof(std::pmr::monotonic_buffer_resource) * static_cast<std::size_t>(used),
                                         alignof(std::pmr::monotonic_buffer_resource)));
+            for (unsigned t = 0; t < used; ++t)
+              new (raw + t) std::pmr::monotonic_buffer_resource(std::pmr::null_memory_resource());
             r.doc.mt_parse_resources_ = decltype(r.doc.mt_parse_resources_)(raw, document::mt_parse_resources_deleter{used});
             res_cap = used;
           }
@@ -6252,6 +6467,8 @@ inline document_parse_result parse(std::string_view json, parse_options opt) {
 
             // Fast scan for unescaped strings.
             while (i < size) {
+              i = detail::scan_string_special(buf, size, i);
+              if (i == size) break;
               const unsigned char uc = static_cast<unsigned char>(buf[i]);
               const char c = buf[i];
               if (c == '"') {
@@ -6264,16 +6481,37 @@ inline document_parse_result parse(std::string_view json, parse_options opt) {
                 set_error(e, error_code::invalid_string, i);
                 return false;
               }
-              ++i;
+              if (uc >= 0x80) {
+                if (!detail::consume_utf8_run(buf, size, i)) {
+                  set_error(e, error_code::invalid_string, i);
+                  return false;
+                }
+              } else {
+                ++i;
+              }
             }
 
+            return parse_escaped_string(out, e, quote_pos, start);
+          }
+
+          bool parse_escaped_string(std::string_view& out, error& e,
+                                      std::size_t quote_pos, std::size_t start) {
             // Escaped: two-pass decode into the arena.
             const std::size_t first_escape = i;
             std::size_t end_quote = std::numeric_limits<std::size_t>::max();
             {
               std::size_t scan = first_escape;
               while (scan < size) {
+                scan = detail::scan_string_special(buf, size, scan);
+                if (scan == size) break;
                 const unsigned char uc = static_cast<unsigned char>(buf[scan]);
+                if (uc >= 0x80) {
+                  if (!detail::consume_utf8_run(buf, size, scan)) {
+                    set_error(e, error_code::invalid_string, scan);
+                    return false;
+                  }
+                  continue;
+                }
                 const char c = buf[scan++];
                 if (c == '"') {
                   end_quote = scan - 1;
@@ -6311,6 +6549,14 @@ inline document_parse_result parse(std::string_view json, parse_options opt) {
             std::size_t rpos = start;
             std::size_t wpos = 0;
             while (rpos < end_quote) {
+              if (buf[rpos] != '\\') {
+                const auto* escape = static_cast<const char*>(std::memchr(buf + rpos, '\\', end_quote - rpos));
+                const std::size_t stop = escape ? static_cast<std::size_t>(escape - buf) : end_quote;
+                std::memcpy(dst + wpos, buf + rpos, stop - rpos);
+                wpos += stop - rpos;
+                rpos = stop;
+                if (rpos == end_quote) break;
+              }
               const unsigned char uc = static_cast<unsigned char>(buf[rpos]);
               const char c = buf[rpos++];
               if (c == '\\') {
@@ -6425,9 +6671,13 @@ inline document_parse_result parse(std::string_view json, parse_options opt) {
               ++i;
               return out;
             }
+            if (depth >= opt.max_depth) {
+              set_error(e, error_code::nesting_too_deep, i);
+              return nullptr;
+            }
 
             // Conservative reserve.
-            out.array_reserve(mr, 16u);
+            out.array_reserve(mr, 4u);
 
             while (true) {
               detail::skip_ws(buf, size, i);
@@ -6473,7 +6723,7 @@ inline document_parse_result parse(std::string_view json, parse_options opt) {
             detail::skip_ws(buf, size, i);
             sv_value out = sv_value::make_object(mr);
             (void)depth;
-            out.object_reserve(mr, 8u);
+            out.object_reserve(mr, 4u);
 
             if (i < size && buf[i] == '}') {
               ++i;
@@ -6552,7 +6802,6 @@ inline document_parse_result parse(std::string_view json, parse_options opt) {
           }
         };
 
-        detail::internal_array<std::thread> thr(used);
         detail::internal_array<error> errs(used);
         detail::internal_array<std::size_t> err_abs(used);
         detail::internal_array<unsigned char> built(spans_count);
@@ -6565,11 +6814,13 @@ inline document_parse_result parse(std::string_view json, parse_options opt) {
         const std::size_t n = spans.size();
         const std::size_t base = n / used;
         const std::size_t rem = n % used;
+        detail::internal_array<std::future<void>> tasks(used);
+        detail::future_join_guard<decltype(tasks)> join{tasks, used};
         std::size_t begin = 0;
         for (unsigned t = 0; t < used; ++t) {
-          const std::size_t len = base + (t < rem ? 1u : 0u); 
+          const std::size_t len = base + (t < rem ? 1u : 0u);
           const std::size_t end = begin + len;
-          thr[t] = std::thread([&, t, begin, end]() {
+          tasks[t] = detail::mt_pool().submit([&, t, begin, end]() {
             readonly_parser p;
             p.mr = r.doc.mt_parse_resources_.get() + t;
             p.opt = opt;
@@ -6594,7 +6845,7 @@ inline document_parse_result parse(std::string_view json, parse_options opt) {
                     return;
                   }
                   detail::skip_ws(p.buf, p.size, p.i);
-                  if (opt.require_eof && p.i != p.size) {
+                  if (p.i != p.size) {
                     errs[t].code = error_code::expected_comma_or_end;
                     errs[t].offset = p.i;
                     err_abs[t] = b + p.i;
@@ -6650,7 +6901,7 @@ inline document_parse_result parse(std::string_view json, parse_options opt) {
                     return;
                   }
                   detail::skip_ws(p.buf, p.size, p.i);
-                  if (opt.require_eof && p.i != p.size) {
+                  if (p.i != p.size) {
                     errs[t].code = error_code::expected_comma_or_end;
                     errs[t].offset = p.i;
                     err_abs[t] = b + p.i;
@@ -6675,9 +6926,7 @@ inline document_parse_result parse(std::string_view json, parse_options opt) {
           begin = end;
         }
 
-        for (unsigned t = 0; t < used; ++t) {
-          if (thr[t].joinable()) thr[t].join();
-        }
+        for (unsigned t = 0; t < used; ++t) tasks[t].get();
 
         // Report earliest error.
         std::size_t best_off = std::numeric_limits<std::size_t>::max();
@@ -6703,6 +6952,16 @@ inline document_parse_result parse(std::string_view json, parse_options opt) {
           if (best_err.code == error_code::out_of_memory && attempt + 1 < k_max_mt_retries) {
             // Retry with larger per-thread slices.
             continue;
+          }
+          if (best_err.code == error_code::out_of_memory) {
+            // A fixed worker slice can fill even when the system has memory.
+            // Reparse serially with the growable arena after releasing slices.
+            r.doc.clear();
+            r.doc.arena().reserve_bytes(estimate_arena_reserve(json.size(), false));
+            insitu_parser parser;
+            parser.opt = opt;
+            r.err = parser.run_inplace(r.doc);
+            return r;
           }
           set_err_abs(best_err.code, best_off);
           return r;
@@ -6734,6 +6993,29 @@ inline document_parse_result parse(std::string_view json, parse_options opt) {
   r.doc.arena().reserve_bytes(estimate_arena_reserve(json.size(), /*no_strings=*/false));
   r.err = parse_in_situ_into(r.doc, json, opt);
   return r;
+} catch (const std::bad_alloc&) {
+  document_parse_result result;
+  result.err.code = error_code::out_of_memory;
+  return result;
+}
+
+// Keep common tiny-document parsing outside the large MT dispatch function.
+inline document_parse_result parse(std::string_view json, parse_options opt) try {
+  if (json.size() >= 1024u) return parse_large(json, opt);
+  document_parse_result result;
+  if (CHJSON_PARSE_DOM_NO_STRING_FASTPATH && !json.empty() &&
+      std::memchr(json.data(), '"', json.size()) == nullptr) {
+    no_string_parser parser;
+    parser.opt = opt;
+    result.err = parser.run_inplace(result.doc, json);
+  } else {
+    result.err = parse_in_situ_into(result.doc, json, opt);
+  }
+  return result;
+} catch (const std::bad_alloc&) {
+  document_parse_result result;
+  result.err.code = error_code::out_of_memory;
+  return result;
 }
 
 inline document parse_or_throw(std::string_view json, parse_options opt = {}) {
@@ -6907,8 +7189,9 @@ inline void dump_to(std::string& out, const sv_value& v, bool pretty = false, in
             default:
               if (sp == cap) {
                 const std::size_t new_cap = cap * 2;
-                heap = detail::internal_array<frame>(new_cap);
-                for (std::size_t j = 0; j < cap; ++j) heap[j] = stack[j];
+                auto grown = detail::internal_array<frame>(new_cap);
+                for (std::size_t j = 0; j < cap; ++j) grown[j] = stack[j];
+                heap = std::move(grown);
                 stack = heap.get();
                 cap = new_cap;
               }
@@ -6955,8 +7238,9 @@ inline void dump_to(std::string& out, const sv_value& v, bool pretty = false, in
             default:
               if (sp == cap) {
                 const std::size_t new_cap = cap * 2;
-                heap = detail::internal_array<frame>(new_cap);
-                for (std::size_t j = 0; j < cap; ++j) heap[j] = stack[j];
+                auto grown = detail::internal_array<frame>(new_cap);
+                for (std::size_t j = 0; j < cap; ++j) grown[j] = stack[j];
+                heap = std::move(grown);
                 stack = heap.get();
                 cap = new_cap;
               }
@@ -7061,11 +7345,20 @@ inline std::string dump(const sv_value& v, bool pretty = false) {
   struct dump_reserve_hints {
     std::size_t compact{0};
     std::size_t pretty{0};
+    std::size_t compact_shape{0};
+    std::size_t pretty_shape{0};
   };
   thread_local dump_reserve_hints hints;
 
   std::string out;
   std::size_t& hint = pretty ? hints.pretty : hints.compact;
+  const std::size_t items = v.is_array() ? v.as_array().size() :
+                            v.is_object() ? v.as_object().size() :
+                            v.is_string() ? v.as_string_view().size() : 0;
+  const std::size_t shape = items * 8u + static_cast<std::size_t>(v.type());
+  auto& cached_shape = pretty ? hints.pretty_shape : hints.compact_shape;
+  if (shape != cached_shape) { hint = 0; cached_shape = shape; }
+
 
   if (hint != 0) {
     detail::maybe_reserve_small_aware(out, hint);
@@ -7089,8 +7382,8 @@ inline std::string dump(const sv_value& v, bool pretty = false) {
   // - Keep small/medium dumps single-threaded.
   // - Enable pooled MT dump only when it is likely to pay off.
   bool use_mt = false;
-  constexpr std::size_t k_mt_min_items = 1024;
-  constexpr std::size_t k_mt_min_bytes = 256u * 1024u;
+  constexpr std::size_t k_mt_min_items = CHJSON_DUMP_MT_MIN_ITEMS;
+  constexpr std::size_t k_mt_min_bytes = CHJSON_DUMP_MT_MIN_BYTES;
   if (detail::effective_threads(0) > 1) {
     if (v.type() == sv_value::kind::array) {
       if (v.u.a.size >= k_mt_min_items) {
@@ -7152,11 +7445,8 @@ inline void dump_to_mt(std::string& out, const sv_value& v, dump_mt_options opt 
     return;
   }
 
-  struct mt_ctx {
-    std::vector<std::string> chunks;
-    std::vector<std::future<void>> fut;
-  };
-  thread_local mt_ctx ctx;
+  using mt_ctx = detail::dump_mt_context;
+  auto& ctx = detail::dump_context_stash();
 
   // Only parallelize top-level array/object; nested parallelism is limited by opt.max_parallel_depth.
   // Primitive values fall back to the existing single-thread code.
@@ -7171,12 +7461,13 @@ inline void dump_to_mt(std::string& out, const sv_value& v, dump_mt_options opt 
             const std::size_t n = a.size();
             const std::size_t base = n / used;
             const std::size_t rem = n % used;
-            if (ctx.fut.size() < used) ctx.fut.resize(used);
+            if (ctx.futures.size() < used) ctx.futures.resize(used);
+            detail::future_join_guard<decltype(ctx.futures)> join{ctx.futures, used};
             std::size_t begin = 0;
             for (unsigned t = 0; t < used; ++t) {
               const std::size_t len = base + (t < rem ? 1u : 0u);
               const std::size_t end = begin + len;
-              ctx.fut[t] = detail::mt_pool().submit([&, t, begin, end]() {
+              ctx.futures[t] = detail::mt_pool().submit([&, t, begin, end]() {
                 std::string& buf = ctx.chunks[t];
                 buf.clear();
                 buf.reserve((end - begin) * 80u);
@@ -7187,7 +7478,7 @@ inline void dump_to_mt(std::string& out, const sv_value& v, dump_mt_options opt 
               });
               begin = end;
             }
-            for (unsigned t = 0; t < used; ++t) ctx.fut[t].get();
+            for (unsigned t = 0; t < used; ++t) ctx.futures[t].get();
             out.push_back('[');
             bool first = true;
             for (unsigned t = 0; t < used; ++t) {
@@ -7207,12 +7498,13 @@ inline void dump_to_mt(std::string& out, const sv_value& v, dump_mt_options opt 
             const std::size_t n = o.size();
             const std::size_t base = n / used;
             const std::size_t rem = n % used;
-            if (ctx.fut.size() < used) ctx.fut.resize(used);
+            if (ctx.futures.size() < used) ctx.futures.resize(used);
+            detail::future_join_guard<decltype(ctx.futures)> join{ctx.futures, used};
             std::size_t begin = 0;
             for (unsigned t = 0; t < used; ++t) {
               const std::size_t len = base + (t < rem ? 1u : 0u);
               const std::size_t end = begin + len;
-              ctx.fut[t] = detail::mt_pool().submit([&, t, begin, end]() {
+              ctx.futures[t] = detail::mt_pool().submit([&, t, begin, end]() {
                 std::string& buf = ctx.chunks[t];
                 buf.clear();
                 buf.reserve((end - begin) * 96u);
@@ -7225,7 +7517,7 @@ inline void dump_to_mt(std::string& out, const sv_value& v, dump_mt_options opt 
               });
               begin = end;
             }
-            for (unsigned t = 0; t < used; ++t) ctx.fut[t].get();
+            for (unsigned t = 0; t < used; ++t) ctx.futures[t].get();
             out.push_back('{');
             bool first = true;
             for (unsigned t = 0; t < used; ++t) {
@@ -7270,12 +7562,13 @@ inline void dump_to_mt(std::string& out, const sv_value& v, dump_mt_options opt 
         const std::size_t n = a.size();
         const std::size_t base = n / used;
         const std::size_t rem = n % used;
-        if (ctx.fut.size() < used) ctx.fut.resize(used);
+        if (ctx.futures.size() < used) ctx.futures.resize(used);
+        detail::future_join_guard<decltype(ctx.futures)> join{ctx.futures, used};
         std::size_t begin = 0;
         for (unsigned t = 0; t < used; ++t) {
           const std::size_t len = base + (t < rem ? 1u : 0u);
           const std::size_t end = begin + len;
-          ctx.fut[t] = detail::mt_pool().submit([&, t, begin, end]() {
+          ctx.futures[t] = detail::mt_pool().submit([&, t, begin, end]() {
             std::string& buf = ctx.chunks[t];
             buf.clear();
             buf.reserve((end - begin) * 96u);
@@ -7288,7 +7581,7 @@ inline void dump_to_mt(std::string& out, const sv_value& v, dump_mt_options opt 
           });
           begin = end;
         }
-        for (unsigned t = 0; t < used; ++t) ctx.fut[t].get();
+        for (unsigned t = 0; t < used; ++t) ctx.futures[t].get();
         for (unsigned t = 0; t < used; ++t) out.append(ctx.chunks[t]);
         detail::dump_indent(out, indent);
         out.push_back(']');
@@ -7322,12 +7615,13 @@ inline void dump_to_mt(std::string& out, const sv_value& v, dump_mt_options opt 
         const std::size_t n = o.size();
         const std::size_t base = n / used;
         const std::size_t rem = n % used;
-        if (ctx.fut.size() < used) ctx.fut.resize(used);
+        if (ctx.futures.size() < used) ctx.futures.resize(used);
+        detail::future_join_guard<decltype(ctx.futures)> join{ctx.futures, used};
         std::size_t begin = 0;
         for (unsigned t = 0; t < used; ++t) {
           const std::size_t len = base + (t < rem ? 1u : 0u);
           const std::size_t end = begin + len;
-          ctx.fut[t] = detail::mt_pool().submit([&, t, begin, end]() {
+          ctx.futures[t] = detail::mt_pool().submit([&, t, begin, end]() {
             std::string& buf = ctx.chunks[t];
             buf.clear();
             buf.reserve((end - begin) * 128u);
@@ -7342,7 +7636,7 @@ inline void dump_to_mt(std::string& out, const sv_value& v, dump_mt_options opt 
           });
           begin = end;
         }
-        for (unsigned t = 0; t < used; ++t) ctx.fut[t].get();
+        for (unsigned t = 0; t < used; ++t) ctx.futures[t].get();
         for (unsigned t = 0; t < used; ++t) out.append(ctx.chunks[t]);
         detail::dump_indent(out, indent);
         out.push_back('}');
@@ -7369,4 +7663,3 @@ inline std::string dump_mt(const sv_value& v, dump_mt_options opt = {}) {
 }
 
 } // namespace chjson
-   
