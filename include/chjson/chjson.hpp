@@ -1788,7 +1788,7 @@ inline void dump_escaped(std::string& out, std::string_view s) {
   if (first > 0) out.append(data, first);
 
   std::size_t chunk_begin = first;
-  for (std::size_t i = first; i < n; ++i) {
+  for (std::size_t i = first; i < n;) {
     const unsigned char uc = static_cast<unsigned char>(data[i]);
     const char c = data[i];
 
@@ -1810,17 +1810,19 @@ inline void dump_escaped(std::string& out, std::string_view s) {
       if (i > chunk_begin) out.append(data + chunk_begin, i - chunk_begin);
       out.append(esc, esc_len);
       chunk_begin = i + 1;
-      continue;
-    }
-
-    if (uc <= 0x1F) {
+    } else if (uc <= 0x1F) {
       if (i > chunk_begin) out.append(data + chunk_begin, i - chunk_begin);
       out.append("\\u00", 4);
       out.push_back(hex[(uc >> 4) & 0xF]);
       out.push_back(hex[uc & 0xF]);
       chunk_begin = i + 1;
+    } else {
+      // Scan ordinary spans in bulk, but handle adjacent escapes directly:
+      // a vector load for every escaped byte is slower on dense escape runs.
+      i += find_first_escape(std::string_view(data + i, n - i));
       continue;
     }
+    ++i;
   }
 
   if (n > chunk_begin) out.append(data + chunk_begin, n - chunk_begin);
@@ -2765,6 +2767,30 @@ public:
   // Reset to empty (frees all blocks).
   void reset() noexcept { release(); }
 
+  // Return wholly unused blocks after a smaller parse/clear. Allocations in
+  // blocks still in use never move, so existing DOM views remain valid.
+  std::size_t release_unused_blocks() noexcept {
+    std::size_t released = 0;
+    block** link = &head_;
+    tail_ = nullptr;
+    while (*link) {
+      block* b = *link;
+      if (b->used == 0) {
+        *link = b->next;
+        if (current_ == b) current_ = nullptr;
+        released += b->size;
+        block::destroy(b);
+      } else {
+        tail_ = b;
+        link = &b->next;
+      }
+    }
+    if (!current_) current_ = head_;
+    next_block_size_ = tail_ ? (tail_->size <= k_max_block_size / 2 ? tail_->size * 2 : k_max_block_size)
+                             : min_block_size();
+    return released;
+  }
+
   std::size_t blocks() const noexcept {
     std::size_t n = 0;
     for (block* b = head_; b != nullptr; b = b->next) ++n;
@@ -2841,7 +2867,9 @@ public:
   }
 
 private:
-  struct block {
+  // Naturally align the payload, including on 32-bit targets whose three-field
+  // header would otherwise consume padding from an exact DOM array reserve.
+  struct alignas(std::max_align_t) block {
     std::size_t size{0};
     std::size_t used{0};
     block* next{nullptr};
@@ -3010,8 +3038,19 @@ inline std::size_t estimate_array_items(const char* data, std::size_t size, std:
   std::size_t bytes_per_item = first == '-' || is_digit(first) ? 20u : 64u;
   if (first == '"') {
     const std::size_t probe = (std::min)(size - pos - 1, std::size_t{4096});
-    const auto* quote = static_cast<const char*>(std::memchr(data + pos + 1, '"', probe));
-    if (quote) bytes_per_item = (std::max)(bytes_per_item, static_cast<std::size_t>(quote - data - pos) + 2);
+    const char* begin = data + pos + 1;
+    const char* end = begin + probe;
+    for (const char* cursor = begin; cursor < end;) {
+      const auto* quote = static_cast<const char*>(std::memchr(cursor, '"', static_cast<std::size_t>(end - cursor)));
+      if (!quote) break;
+      const char* slash = quote;
+      while (slash > begin && slash[-1] == '\\') --slash;
+      if ((static_cast<std::size_t>(quote - slash) & 1u) == 0) {
+        bytes_per_item = (std::max)(bytes_per_item, static_cast<std::size_t>(quote - data - pos) + 2);
+        break;
+      }
+      cursor = quote + 1;
+    }
   }
   return (size - pos) / bytes_per_item;
 }
@@ -3169,7 +3208,10 @@ struct sv_value {
     object_data o;
   } u;
 
-  static constexpr std::size_t k_tag_offset = 20;
+  static constexpr std::size_t k_tag_offset = offsetof(array_data, _tag);
+  static_assert(k_tag_offset == offsetof(object_data, _tag) &&
+                k_tag_offset == offsetof(sv_raw_view, _tag) &&
+                k_tag_offset == offsetof(sv_number_value, _tag), "inconsistent DOM tag layout");
 
   kind type() const noexcept {
     // Store kind in padding; load a single byte (hot).
@@ -3442,16 +3484,6 @@ inline sv_value* sv_value::find(std::string_view key) noexcept {
 
 namespace detail {
 #if CHJSON_USE_TLS_PARSE_CACHE
-inline std::string& document_buffer_stash() {
-  thread_local std::string stash;
-  return stash;
-}
-
-inline pmr::arena_resource& document_arena_stash() {
-  thread_local pmr::arena_resource stash;
-  return stash;
-}
-
 struct mt_parse_tls_cache {
   detail::chjson_byte_ptr backing;
   std::size_t backing_size{0};
@@ -3468,10 +3500,20 @@ struct mt_parse_tls_cache {
   }
 };
 
-inline mt_parse_tls_cache& document_mt_parse_stash() {
-  thread_local mt_parse_tls_cache stash;
+struct document_tls_cache {
+  std::string buffer;
+  pmr::arena_resource arena;
+  mt_parse_tls_cache mt;
+};
+
+inline document_tls_cache& document_stash() {
+  thread_local document_tls_cache stash;
   return stash;
 }
+
+inline std::string& document_buffer_stash() { return document_stash().buffer; }
+inline pmr::arena_resource& document_arena_stash() { return document_stash().arena; }
+inline mt_parse_tls_cache& document_mt_parse_stash() { return document_stash().mt; }
 #endif
 } // namespace detail
 
@@ -3502,19 +3544,30 @@ inline void release_thread_caches() noexcept {
 
 struct document_parse_result;
 
+// Capacity accounting, not process RSS or allocator metadata. String capacity
+// includes the implementation's inline storage, and excludes the terminator.
+struct document_memory_usage {
+  std::size_t arena_used{0};
+  std::size_t arena_capacity{0};
+  std::size_t input_capacity{0};
+  std::size_t parallel_capacity{0};
+  std::size_t parallel_resource_bytes{0};
+};
+
 class document {
 public:
 #if CHJSON_USE_TLS_PARSE_CACHE
   document() : mt_parse_resources_(nullptr, mt_parse_resources_deleter{}) {
     // Reuse the last freed buffer on this thread to reduce heap churn for
     // repeated single-shot parse() calls that return a fresh document.
-    auto& stash = detail::document_buffer_stash();
-    if (stash.capacity() != 0) {
+    auto& cache = detail::document_stash();
+    auto& stash = cache.buffer;
+    if (stash.capacity() > buffer_.capacity()) {
       buffer_.swap(stash);
       stash.clear();
     }
 
-    auto& arena_stash = detail::document_arena_stash();
+    auto& arena_stash = cache.arena;
     if (arena_stash.bytes_committed() != 0) {
       arena_ = std::move(arena_stash);
     }
@@ -3522,7 +3575,7 @@ public:
     // Optional: reuse MT-parse backing/resources from this thread.
     // This reduces heap churn for workloads that repeatedly call parse() where
     // the MT path is taken.
-    auto& mt_stash = detail::document_mt_parse_stash();
+    auto& mt_stash = cache.mt;
     if (mt_stash.backing_size != 0 && mt_stash.backing) {
       mt_parse_backing_.swap(mt_stash.backing);
       mt_parse_backing_size_ = mt_stash.backing_size;
@@ -3546,10 +3599,11 @@ public:
 
 #if CHJSON_USE_TLS_PARSE_CACHE
   ~document() noexcept {
+    auto& cache = detail::document_stash();
     // Keep at most one cached buffer per thread (bounded by capacity).
     constexpr std::size_t max_cached_capacity = static_cast<std::size_t>(CHJSON_TLS_PARSE_BUFFER_MAX);
     if (buffer_.capacity() <= max_cached_capacity) {
-      auto& stash = detail::document_buffer_stash();
+      auto& stash = cache.buffer;
       if (stash.capacity() < buffer_.capacity()) {
         stash.swap(buffer_);
         stash.clear();
@@ -3564,7 +3618,7 @@ public:
       constexpr std::size_t max_cached_arena = static_cast<std::size_t>(CHJSON_TLS_PARSE_ARENA_MAX);
       const std::size_t committed = arena_.bytes_committed();
       if (committed != 0 && committed <= max_cached_arena) {
-        auto& arena_stash = detail::document_arena_stash();
+        auto& arena_stash = cache.arena;
         if (arena_stash.bytes_committed() < committed) {
           arena_stash = std::move(arena_);
           arena_stash.clear();
@@ -3575,7 +3629,7 @@ public:
     // Cache MT parse backing/resources to reduce allocations for repeated MT parses.
     // Keep at most one set per thread.
     if (mt_parse_backing_ || mt_parse_resources_) {
-      auto& mt_stash = detail::document_mt_parse_stash();
+      auto& mt_stash = cache.mt;
 
       if (mt_parse_backing_) {
         constexpr std::size_t max_cached_backing = static_cast<std::size_t>(CHJSON_TLS_PARSE_MT_BACKING_MAX);
@@ -3678,6 +3732,12 @@ public:
 
   std::pmr::memory_resource* resource() noexcept { return &arena_; }
   const std::pmr::memory_resource* resource() const noexcept { return &arena_; }
+
+  document_memory_usage memory_usage() const noexcept {
+    return {arena_.bytes_used(), arena_.bytes_committed(), buffer_.capacity(),
+            mt_parse_backing_size_, mt_parse_resources_ ?
+                sizeof(std::pmr::monotonic_buffer_resource) * mt_parse_resources_.get_deleter().count : 0};
+  }
 
 private:
   pmr::arena_resource arena_;

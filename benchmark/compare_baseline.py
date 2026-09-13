@@ -16,6 +16,8 @@ parser.add_argument("--samples", type=int, default=1,
 parser.add_argument("--affinity-mask", type=lambda value: int(value, 0),
                     help="Optional CPU bitmask inherited by both executables (e.g. 0xffff)")
 parser.add_argument("--extended", action="store_true", help="Also measure Unicode, escapes, and larger MT payloads")
+parser.add_argument("--case", action="append", dest="selected_cases",
+                    help="Run only this named case; repeat to select multiple cases")
 parser.add_argument("--output", type=Path, default=Path("benchmark-results.json"))
 args = parser.parse_args()
 if args.runs < 1:
@@ -50,10 +52,16 @@ cases = [
 if args.extended:
     cases.extend([
         ("escaped_strings", 2000, 300, "escaped_strings", 256),
+        ("dense_escapes", 2000, 100, "dense_escapes", 64),
         ("utf8_strings", 2000, 300, "utf8_strings", 256),
         ("mt_objects_2m", 512, 100, "objects", 4096),
         ("mt_objects_8m", 2048, 30, "objects", 4096),
     ])
+if args.selected_cases:
+    unknown = set(args.selected_cases) - {case[0] for case in cases}
+    if unknown:
+        parser.error("Unknown cases (some require --extended): " + ", ".join(sorted(unknown)))
+    cases = [case for case in cases if case[0] in args.selected_cases]
 report = {"runs_per_case": args.runs, "samples_per_case": args.samples,
           "affinity_mask": hex(args.affinity_mask) if args.affinity_mask is not None else None, "cases": {}}
 for name, count, iterations, mode, length in cases:
@@ -71,12 +79,16 @@ for name, count, iterations, mode, length in cases:
                 continue
             text = result.stdout
             metrics = {}
-            for operation, speed in re.findall(r"(parse\(dom\)|parse\(in_situ\)|dump\(dom\)): ([\d.]+) MiB/s", text):
+            for operation, speed in re.findall(r"(parse\(dom\)|parse\(in_situ\)|dump\(dom\)|dump\(reuse\)): ([\d.]+) MiB/s", text):
                 metrics[operation] = float(speed)
             for prefix, used, committed in re.findall(r"(cold arena|arena) used bytes: (\d+), committed bytes: (\d+)", text):
                 metrics[prefix + " used"] = int(used)
                 metrics[prefix + " committed"] = int(committed)
             metrics["payload bytes"] = int(re.search(r"payload bytes: (\d+)", text)[1])
+            memory = re.search(r"cold input capacity: (\d+), parallel capacity: (\d+), parallel resource bytes: (\d+)", text)
+            if memory:
+                for key, value in zip(("cold input capacity", "cold parallel capacity", "cold parallel resource bytes"), memory.groups()):
+                    metrics[key] = int(value)
             samples[label].append({"command": command, "metrics": metrics, "stdout": text})
     row = {}
     for label, values in samples.items():

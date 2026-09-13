@@ -251,17 +251,23 @@ Notes:
 
 ### Storage reuse and explicit release
 
-Small arenas start at 1 KiB. Empty containers and scalar roots do not reserve container storage. Containers grow their last arena allocation in place when space is available; other growth retains the usual monotonic arena lifetime. Large flat numeric arrays are counted before allocation, avoiding abandoned growth buffers. Long string arrays reserve space for DOM elements separately from the input text.
+Small arenas start at 1 KiB. Empty containers and scalar roots do not reserve container storage. Containers grow their last arena allocation in place when space is available; other growth retains the usual monotonic arena lifetime. Large flat numeric arrays are counted before allocation, avoiding abandoned growth buffers. Long string arrays reserve space for DOM elements separately from the input text; the sizing probe distinguishes escaped quotes from the end of a string. Arena payloads have natural alignment on both 32-bit and 64-bit targets.
 
 ```cpp
 chjson::document doc;
 auto err = chjson::parse_in_situ_into(doc, R"({"items":[1,2,3]})");
+auto memory = doc.memory_usage(); // arena, input buffer, and parallel parse capacities
+auto released = doc.arena().release_unused_blocks(); // free unused blocks, preserve live DOM views
 doc.clear();                 // invalidate the DOM, retain buffer/arena capacity
 doc.reset();                 // invalidate the DOM and release this document's storage
 chjson::release_thread_caches(); // release idle parse, number scratch, and MT dump caches on this thread
 ```
 
 `release_thread_caches()` does not invalidate live documents, release another thread's caches, or stop the shared worker pool. With the experimental internal allocator enabled, pool pages still remain allocated until process exit. Allocator-level release does not guarantee an immediate reduction in process RSS.
+
+`arena().release_unused_blocks()` returns the number of payload bytes released. It removes wholly unused blocks left by reservation or by parsing a smaller document after a larger one. Allocated data does not move. Partly occupied blocks and the document's input buffer retain their capacity; use `reset()` when the entire document can be discarded. The same arena API is available on `view_document`.
+
+`document::memory_usage()` reports `arena_used`, `arena_capacity`, `input_capacity`, `parallel_capacity`, and `parallel_resource_bytes`. These are capacity/accounting figures, not process RSS: they exclude arena block headers, allocator metadata, idle thread caches, worker stacks, and other transient storage. Arena usage includes consumed alignment padding and old allocations retained by the monotonic allocator. Input capacity includes the string implementation's inline storage and excludes its terminator. Parallel backing is accounted for separately from the main arena. Parse caches share one thread-local owner to reduce construction/destruction overhead; their existing capacity limits still apply.
 
 Parsed strings/keys and number tokens remain valid when an owning `document` is moved, including short inputs. The moved-from document has a null root and can be reused. `clear()`, `reset()`, reparsing, and backing-buffer reallocation invalidate existing views. A `view_document` still requires its original source to remain alive.
 
@@ -451,14 +457,14 @@ ctest --test-dir build/release -C Release --output-on-failure
 
 For GCC/Clang on Linux, add `-DCHJSON_ENABLE_SANITIZERS=ON` in a separate Debug build. Tests cover every parse mode, UTF-8 boundaries, document moves, depth limits, raw number preservation, allocation failure injection, deep dumps, worker exceptions, deterministic round trips, and input mutations. The isolated OOM test disables MSVC iterator proxies because those debug-only STL allocations can occur inside `noexcept` operations.
 
-The benchmark accepts `count iterations runs workload [string_length]`. Workloads are `objects` (default), `integers`, `floats`, `strings`, `escaped_strings`, `utf8_strings`, `empty`, and `scalar`. Timings use the median of repeated runs; cold arena storage and reused arena storage are reported separately from throughput. Neither metric is process RSS or total memory, and MT backing storage is separate from the main arena.
+The benchmark accepts `count iterations runs workload [string_length]`. Workloads are `objects` (default), `integers`, `floats`, `strings`, `escaped_strings`, `dense_escapes`, `utf8_strings`, `empty`, and `scalar`. Timings use the median of repeated runs; cold arena storage and reused arena storage are reported separately from throughput. Current headers also report cold input and parallel storage capacities. These figures are not process RSS or total memory. `dump(dom)` creates a fresh output string and may select automatic parallel dumping; `dump(reuse)` calls serial `dump_to()` with a reused output buffer to isolate serialization from fresh output allocation.
 
 ```sh
 ./build/release/chjson_bench 20000 500 7 floats
 python benchmark/compare_baseline.py --baseline /path/to/baseline/chjson_bench --candidate /path/to/new/chjson_bench --output benchmark-results.json
 ```
 
-Both comparison executables must contain the same benchmark source and use the same compiler, runtime library, and optimization flags. Set `-DCHJSON_BASELINE_INCLUDE=/path/to/old/include` to build `chjson_baseline_bench` alongside the current benchmark with matching flags. The comparison script records process failures as well as successful measurements. Use `--samples 3` to alternate multiple independent process pairs and take their median, `--extended` for Unicode, escapes and larger MT payloads, and optionally `--affinity-mask` to keep both processes on the same available logical CPUs. See the [second optimization report](OPTIMIZATION_ROUND2_REPORT.md) and [first optimization report](OPTIMIZATION_REPORT.md) for measured results and limitations.
+Both comparison executables must contain the same benchmark source and use the same compiler, runtime library, and optimization flags. Set `-DCHJSON_BASELINE_INCLUDE=/path/to/old/include` to build `chjson_baseline_bench` alongside the current benchmark with matching flags. The comparison script records process failures as well as successful measurements. Use `--samples 3` to alternate multiple independent process pairs and take their median, `--extended` for Unicode, escapes and larger MT payloads, and optionally `--affinity-mask` to keep both processes on the same available logical CPUs. Repeat `--case NAME` to select specific workloads. See the [third optimization report](OPTIMIZATION_ROUND3_REPORT.md), [second optimization report](OPTIMIZATION_ROUND2_REPORT.md), and [first optimization report](OPTIMIZATION_REPORT.md) for measured results and limitations.
 
 ## Examples
 

@@ -178,6 +178,12 @@ static void test_parallel_and_deep_dump() {
   for (int repeat = 0; repeat < 3; ++repeat) {
     auto result = parse(json);
     CHJSON_CHECK(!result.err);
+    const auto memory = result.doc.memory_usage();
+    CHJSON_CHECK(memory.arena_used == result.doc.arena().bytes_used());
+    CHJSON_CHECK(memory.arena_capacity == result.doc.arena().bytes_committed());
+    CHJSON_CHECK(memory.input_capacity >= result.doc.buffer().size());
+    CHJSON_CHECK(memory.parallel_capacity <= CHJSON_TLS_PARSE_MT_BACKING_MAX);
+    CHJSON_CHECK((memory.parallel_capacity == 0) == (memory.parallel_resource_bytes == 0));
     for (bool pretty : {false, true}) {
       std::string serial;
       dump_to(serial, result.doc.root(), pretty);
@@ -290,6 +296,143 @@ static void test_bulk_strings_and_flat_arrays() {
   auto float_doc = parse(floats);
   CHJSON_CHECK(!float_doc.err);
   CHJSON_CHECK(float_doc.doc.arena().bytes_committed() <= 4096 * sizeof(sv_value) + floats.size() + 1024);
+
+  // Escaped quotes do not terminate the first-string sizing probe. Even runs
+  // of backslashes before a closing quote do terminate it.
+  for (const char* ending : {"", "\\\\", "\\\\\\\\"}) {
+    std::string text = "[";
+    for (int i = 0; i < 320; ++i) {
+      if (i) text += ',';
+      text += "\"\\\"";
+      for (int j = 0; j < 64; ++j) text += "\\n\\\"\\\\";
+      text += ending;
+      text += '"';
+    }
+    text += ']';
+    check_modes(text, true);
+    release_thread_caches();
+    auto dense = parse(text);
+    CHJSON_CHECK(!dense.err && dense.doc.root().as_array().size() == 320);
+    // Forced-small MT slices may leave unused retry bookkeeping blocks.
+    // Check the live storage independently of those intentionally retained blocks.
+    dense.doc.arena().release_unused_blocks();
+    CHJSON_CHECK(dense.doc.arena().bytes_committed() <= 320 * sizeof(sv_value) + 1024);
+    auto serial = parse_in_situ(text);
+    CHJSON_CHECK(!serial.err && serial.doc.arena().bytes_committed() <= 320 * sizeof(sv_value) + 1024);
+    CHJSON_CHECK(dump(dense.doc.root()) == dump(serial.doc.root()));
+  }
+}
+
+static void test_escape_dump_spans() {
+  const char* escapes[] = {"\\u0000", "\\u0001", "\\u0002", "\\u0003", "\\u0004", "\\u0005", "\\u0006", "\\u0007",
+      "\\b", "\\t", "\\n", "\\u000B", "\\f", "\\r", "\\u000E", "\\u000F",
+      "\\u0010", "\\u0011", "\\u0012", "\\u0013", "\\u0014", "\\u0015", "\\u0016", "\\u0017",
+      "\\u0018", "\\u0019", "\\u001A", "\\u001B", "\\u001C", "\\u001D", "\\u001E", "\\u001F"};
+  const std::string suffix = std::string(513, 'x') + "\xE4\xBD\xA0\xF0\x9F\x98\x80";
+  for (std::size_t prefix = 0; prefix <= 32; ++prefix) {
+    std::string raw(prefix, 'a'), escaped = raw;
+    for (unsigned c = 0; c < 32; ++c) { raw += static_cast<char>(c); escaped += escapes[c]; }
+    raw += "\"\\\"\\";
+    escaped += "\\\"\\\\\\\"\\\\";
+    raw += suffix;
+    escaped += suffix;
+    for (bool pretty : {false, true}) {
+      const std::string expected = '"' + escaped + '"';
+      CHJSON_CHECK(dump(sv_value(std::string_view(raw)), pretty) == expected);
+      CHJSON_CHECK(dump(value(raw), pretty) == expected);
+      std::string appended = "prefix:";
+      dump_to(appended, sv_value(std::string_view(raw)), pretty);
+      CHJSON_CHECK(appended == "prefix:" + expected);
+      auto parsed = parse(expected);
+      CHJSON_CHECK(!parsed.err && parsed.doc.root().as_string_view() == raw);
+      check_modes("{" + expected + ":" + expected + "}", true);
+    }
+  }
+  // Short views with no accessible trailing padding exercise the vector tail.
+  for (std::size_t n = 1; n <= 64; ++n) {
+    auto data = std::make_unique<char[]>(n);
+    std::fill_n(data.get(), n, 'x');
+    data[0] = '\n';
+    CHJSON_CHECK(dump(sv_value(std::string_view(data.get(), n))) == "\"\\n" + std::string(n - 1, 'x') + '"');
+  }
+}
+
+static void test_arena_trim_and_diagnostics() {
+  pmr::arena_resource arena(64);
+  arena.reserve_bytes(64); // An unused head too small for the next allocation.
+  auto* live = static_cast<unsigned char*>(arena.allocate(512, 64));
+  CHJSON_CHECK(reinterpret_cast<std::uintptr_t>(live) % 64 == 0);
+  std::fill_n(live, 512, static_cast<unsigned char>(0xAB));
+  arena.reserve_bytes(arena.bytes_committed() + 4096); // An unused tail.
+  const auto before = arena.bytes_committed();
+  const auto used = arena.bytes_used();
+  const auto released = arena.release_unused_blocks();
+  CHJSON_CHECK(released >= 4160 && arena.blocks() == 1);
+  CHJSON_CHECK(arena.bytes_committed() + released == before && arena.bytes_used() == used);
+  CHJSON_CHECK(arena.release_unused_blocks() == 0);
+  for (std::size_t i = 0; i < 512; ++i) CHJSON_CHECK(live[i] == 0xAB);
+  auto* next = arena.allocate(128, 8);
+  CHJSON_CHECK(arena.try_expand(next, 128, 256));
+  pmr::arena_resource moved(std::move(arena));
+  CHJSON_CHECK(arena.release_unused_blocks() == 0);
+  moved.clear();
+  const auto all = moved.bytes_committed();
+  CHJSON_CHECK(moved.release_unused_blocks() == all && moved.blocks() == 0);
+  auto* reused = static_cast<unsigned char*>(moved.allocate(64, 64));
+  std::fill_n(reused, 64, static_cast<unsigned char>(0xCD));
+  CHJSON_CHECK(reused[63] == 0xCD && reinterpret_cast<std::uintptr_t>(reused) % 64 == 0);
+
+  // A natural-alignment exact reserve must fit without adding a second block.
+  pmr::arena_resource exact;
+  exact.reserve_bytes(4096 * sizeof(sv_value));
+  auto* exact_data = exact.allocate(4096 * sizeof(sv_value), alignof(sv_value));
+  CHJSON_CHECK(reinterpret_cast<std::uintptr_t>(exact_data) % alignof(sv_value) == 0);
+  CHJSON_CHECK(exact.blocks() == 1);
+
+  document doc;
+  doc.reset();
+  CHJSON_CHECK(!parse_in_situ_into(doc, "[1,2]"));
+  std::string large = "[0";
+  for (int i = 0; i < 10000; ++i) large += ",1";
+  large += ']';
+  CHJSON_CHECK(!parse_in_situ_into(doc, large));
+  CHJSON_CHECK(!parse_in_situ_into(doc, "{\"key\":\"value\"}"));
+  const auto retained = doc.memory_usage();
+  const auto* root_data = doc.root().u.o.data;
+  const auto freed = doc.arena().release_unused_blocks();
+  CHJSON_CHECK(freed > 0 && doc.memory_usage().arena_capacity + freed == retained.arena_capacity);
+  CHJSON_CHECK(doc.memory_usage().input_capacity == retained.input_capacity);
+  CHJSON_CHECK(doc.root().u.o.data == root_data && doc.root().find("key")->as_string_view() == "value");
+  doc.clear();
+  CHJSON_CHECK(doc.memory_usage().arena_used == 0);
+  CHJSON_CHECK(doc.memory_usage().parallel_capacity == 0 && doc.memory_usage().parallel_resource_bytes == 0);
+  doc.reset();
+  CHJSON_CHECK(doc.memory_usage().arena_capacity == 0 && doc.buffer().empty());
+  CHJSON_CHECK(!parse_in_situ_into(doc, "[true,false,null,1,\"x\",[],{}]"));
+  const auto values = doc.root().as_array();
+  std::vector<sv_value> copies(values.begin(), values.end());
+  CHJSON_CHECK(copies[0].as_bool() && !copies[1].as_bool() && copies[2].is_null());
+  CHJSON_CHECK(copies[3].as_double() == 1.0 && copies[3].is_number());
+  CHJSON_CHECK(copies[4].is_string() && copies[5].is_array() && copies[6].is_object());
+}
+
+static void test_thread_cache_lifetimes() {
+  for (int repeat = 0; repeat < 12; ++repeat) {
+    auto pending = std::async(std::launch::async, [] {
+      std::vector<document> held;
+      for (int i = 0; i < 32; ++i) {
+        held.push_back(parse_or_throw("{\"key\":\"value\"}"));
+        CHJSON_CHECK(!parse(i % 2 ? "null" : "[1,2,3]").err);
+      }
+      release_thread_caches();
+      for (const auto& doc : held) CHJSON_CHECK(doc.root().find("key")->as_string_view() == "value");
+      return std::move(held.back());
+    });
+    document transferred = pending.get(); // The producing thread's TLS has exited.
+    release_thread_caches();
+    CHJSON_CHECK(transferred.root().find("key")->as_string_view() == "value");
+    CHJSON_CHECK(!parse_in_situ_into(transferred, "[\"reused\"]"));
+  }
 }
 
 void test_regressions() {
@@ -300,4 +443,7 @@ void test_regressions() {
   test_original_error_positions();
   test_parallel_and_deep_dump();
   test_bulk_strings_and_flat_arrays();
+  test_escape_dump_spans();
+  test_arena_trim_and_diagnostics();
+  test_thread_cache_lifetimes();
 }

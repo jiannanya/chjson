@@ -69,13 +69,18 @@ std::string make_workload(std::string_view mode, std::size_t count, std::size_t 
     else if (mode == "floats") out += (i % 2) ? "3.141592653589793" : "1.23456789e-10";
     else if (mode == "strings") out += '"' + std::string(str_len, 'x') + '"';
     else if (mode == "escaped_strings") out += "\"\\n" + std::string(str_len, 'x') + "\\u4F60\\u597D\"";
+    else if (mode == "dense_escapes") {
+      out += '"';
+      for (std::size_t j = 0; j < str_len; ++j) out += "\\n\\\"\\\\";
+      out += '"';
+    }
     else if (mode == "utf8_strings") {
       out += '"';
       for (std::size_t j = 0; j < str_len / 6; ++j) out += "\xE4\xBD\xA0\xE5\xA5\xBD";
       out += std::string(str_len % 6, 'x') + '"';
     }
     else if (mode == "empty") out += "{\"a\":[],\"b\":{}}";
-    else throw std::invalid_argument("unknown workload; use objects, integers, floats, strings, escaped_strings, utf8_strings, empty, or scalar");
+    else throw std::invalid_argument("unknown workload; use objects, integers, floats, strings, escaped_strings, dense_escapes, utf8_strings, empty, or scalar");
   }
   out += ']';
   return out;
@@ -85,6 +90,18 @@ struct bench_result {
   double seconds{0.0};
   std::size_t bytes{0};
 };
+
+struct memory_counts {
+  bool available{false};
+  std::size_t input{0}, parallel{0}, resources{0};
+};
+template<class Doc>
+auto collect_memory(const Doc& doc, int) -> decltype(doc.memory_usage(), memory_counts{}) {
+  const auto m = doc.memory_usage();
+  return {true, m.input_capacity, m.parallel_capacity, m.parallel_resource_bytes};
+}
+template<class Doc>
+memory_counts collect_memory(const Doc&, ...) { return {}; }
 
 template <class Fn>
 bench_result run_median(std::size_t runs, Fn&& fn) {
@@ -158,6 +175,24 @@ bench_result bench_dump_dom(std::string_view json, std::size_t iters) {
   return {sec, bytes};
 }
 
+bench_result bench_dump_reuse(std::string_view json, std::size_t iters) {
+  auto r = chjson::parse(json);
+  if (r.err) throw std::runtime_error("benchmark input did not parse");
+  std::string out;
+  out.reserve(json.size());
+  std::size_t bytes = 0;
+  const auto t0 = clock_type::now();
+  for (std::size_t i = 0; i < iters; ++i) {
+    out.clear();
+    chjson::dump_to(out, r.doc.root());
+    bytes += out.size();
+    do_not_optimize(out.size());
+    do_not_optimize(out.data());
+  }
+  const auto t1 = clock_type::now();
+  return {std::chrono::duration<double>(t1 - t0).count(), bytes};
+}
+
 void print_mbps(const char* name, const bench_result& r) {
   const double mb = static_cast<double>(r.bytes) / (1024.0 * 1024.0);
   const double mbps = (r.seconds > 0.0) ? (mb / r.seconds) : 0.0;
@@ -189,14 +224,19 @@ int main(int argc, char** argv) {
   // A fresh thread has no inherited parse caches. Measure cold document storage
   // separately from the reused arena below; neither is process RSS.
   std::size_t cold_used = 0, cold_committed = 0;
+  memory_counts memory;
   std::thread measure([&] {
     auto parsed = chjson::parse(payload);
     if (parsed.err) std::abort();
     cold_used = parsed.doc.arena().bytes_used();
     cold_committed = parsed.doc.arena().bytes_committed();
+    memory = collect_memory(parsed.doc, 0);
   });
   measure.join();
   std::cout << "cold arena used bytes: " << cold_used << ", committed bytes: " << cold_committed << '\n';
+  if (memory.available)
+    std::cout << "cold input capacity: " << memory.input << ", parallel capacity: " << memory.parallel
+              << ", parallel resource bytes: " << memory.resources << '\n';
 
   // Warm-up
   {
@@ -220,6 +260,7 @@ int main(int argc, char** argv) {
             << ", blocks: " << blocks_sum << "\n";
 
   print_mbps("dump(dom)", run_median(runs, [&] { return bench_dump_dom(payload, iters); }));
+  print_mbps("dump(reuse)", run_median(runs, [&] { return bench_dump_reuse(payload, iters); }));
 
   return 0;
 }
