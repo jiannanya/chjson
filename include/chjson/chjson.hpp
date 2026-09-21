@@ -507,10 +507,12 @@ inline bool consume_utf8_run(const char* data, std::size_t size, std::size_t& po
   while (pos < size) {
     const auto first = static_cast<unsigned char>(data[pos]);
     if (first < 0x80) return true; // ASCII ends the run
+    const std::size_t remaining = size - pos;
+
     // Fast path: three-byte BMP sequence, which dominates non-ASCII JSON text
     // (CJK, Cyrillic, Greek, ...). Leads E0 and ED carry extra second-byte
     // restrictions (overlong / surrogate ranges) and use the general path.
-    if (size - pos >= 3 && first >= 0xE0 && first <= 0xEF && first != 0xE0 && first != 0xED) {
+    if (remaining >= 3 && first >= 0xE0 && first <= 0xEF && first != 0xE0 && first != 0xED) {
       const auto b1 = static_cast<unsigned char>(data[pos + 1]);
       const auto b2 = static_cast<unsigned char>(data[pos + 2]);
       if ((b1 & 0xC0) == 0x80 && (b2 & 0xC0) == 0x80) {
@@ -518,6 +520,29 @@ inline bool consume_utf8_run(const char* data, std::size_t size, std::size_t& po
         continue;
       }
     }
+
+    // Fast path: two-byte sequence (Latin-1 supplement and friends).
+    if (remaining >= 2 && first >= 0xC2 && first <= 0xDF) {
+      const auto b1 = static_cast<unsigned char>(data[pos + 1]);
+      if ((b1 & 0xC0) == 0x80) {
+        pos += 2;
+        continue;
+      }
+    }
+
+    // Fast path: four-byte sequence (supplementary planes, emoji). F0 requires a
+    // second byte >= 0x90 and F4 one <= 0x8F (overlong / out-of-range forms).
+    if (remaining >= 4 && first >= 0xF0 && first <= 0xF4) {
+      const auto b1 = static_cast<unsigned char>(data[pos + 1]);
+      const auto b2 = static_cast<unsigned char>(data[pos + 2]);
+      const auto b3 = static_cast<unsigned char>(data[pos + 3]);
+      if ((b1 & 0xC0) == 0x80 && (b2 & 0xC0) == 0x80 && (b3 & 0xC0) == 0x80 &&
+          (first != 0xF0 || b1 >= 0x90) && (first != 0xF4 || b1 <= 0x8F)) {
+        pos += 4;
+        continue;
+      }
+    }
+
     if (!consume_utf8(data, size, pos)) return false;
   }
   return true;
