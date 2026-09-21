@@ -32,9 +32,15 @@ static void check_modes(std::string_view json, bool valid, parse_options opt = {
 
 static void test_utf8_and_boundaries() {
   const std::vector<std::string> valid = {"\xC2\x80", "\xDF\xBF", "\xE0\xA0\x80",
+      // Leads handled by the three-byte fast path (E1..EC, EE, EF).
+      "\xE1\x80\x80", "\xE4\xBD\xA0", "\xEC\xBF\xBF", "\xEE\x80\x80",
+      "\xE4\xBD\xA0\xF0\x9F\x98\x80" "a" "\xE4\xBD\xA0",
       "\xED\x9F\xBF", "\xEF\xBF\xBF", "\xF0\x90\x80\x80", "\xF4\x8F\xBF\xBF"};
   const std::vector<std::string> invalid = {"\x80", "\xC0\x80", "\xC1\xBF", "\xC2",
       "\xE0\x80\x80", "\xED\xA0\x80", "\xF0\x80\x80\x80", "\xF4\x90\x80\x80",
+      // Truncated or non-continuation bytes inside the three-byte fast path.
+      "\xE1\x80", "\xE1\x41\x80", "\xE1\x80\x41", "\xEE\x80", "\xEF\x20\x20",
+      "\xE4\xBD\xA0\xF0\x80\x80\x80",
       "\xF5\x80\x80\x80", "\xFF", "\xE2\x82", "\xC2\x20"};
   for (std::size_t prefix = 0; prefix != 33; ++prefix) {
     const std::string padding(prefix, 'a');

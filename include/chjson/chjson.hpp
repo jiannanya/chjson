@@ -504,9 +504,22 @@ inline bool consume_utf8(const char* data, std::size_t size, std::size_t& pos) n
 }
 
 inline bool consume_utf8_run(const char* data, std::size_t size, std::size_t& pos) noexcept {
-  do {
+  while (pos < size) {
+    const auto first = static_cast<unsigned char>(data[pos]);
+    if (first < 0x80) return true; // ASCII ends the run
+    // Fast path: three-byte BMP sequence, which dominates non-ASCII JSON text
+    // (CJK, Cyrillic, Greek, ...). Leads E0 and ED carry extra second-byte
+    // restrictions (overlong / surrogate ranges) and use the general path.
+    if (size - pos >= 3 && first >= 0xE0 && first <= 0xEF && first != 0xE0 && first != 0xED) {
+      const auto b1 = static_cast<unsigned char>(data[pos + 1]);
+      const auto b2 = static_cast<unsigned char>(data[pos + 2]);
+      if ((b1 & 0xC0) == 0x80 && (b2 & 0xC0) == 0x80) {
+        pos += 3;
+        continue;
+      }
+    }
     if (!consume_utf8(data, size, pos)) return false;
-  } while (pos < size && static_cast<unsigned char>(data[pos]) >= 0x80);
+  }
   return true;
 }
 

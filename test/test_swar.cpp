@@ -56,6 +56,43 @@ std::size_t ref_find_first_escape(std::string_view s) {
 
 bool ref_needs_escaping(std::string_view s) { return ref_find_first_escape(s) != s.size(); }
 
+// Scalar reference for consume_utf8_run(): advance over consecutive well-formed
+// UTF-8 scalars (rejecting overlong forms, surrogates and truncation) until an
+// ASCII byte or the end of the buffer.
+std::size_t ref_consume_utf8_run(const char* data, std::size_t size, std::size_t pos, bool& ok) {
+  ok = true;
+  while (pos < size) {
+    const auto b0 = static_cast<unsigned char>(data[pos]);
+    if (b0 < 0x80) break; // ASCII ends the run
+    unsigned len = 0;
+    if (b0 >= 0xC2 && b0 <= 0xDF) len = 2;
+    else if (b0 >= 0xE0 && b0 <= 0xEF) len = 3;
+    else if (b0 >= 0xF0 && b0 <= 0xF4) len = 4;
+    if (len == 0 || size - pos < len) {
+      ok = false;
+      return pos;
+    }
+    const auto b1 = static_cast<unsigned char>(data[pos + 1]);
+    bool second_ok = (b1 & 0xC0) == 0x80;
+    if (b0 == 0xE0) second_ok = b1 >= 0xA0 && b1 <= 0xBF;
+    else if (b0 == 0xED) second_ok = b1 >= 0x80 && b1 <= 0x9F;
+    else if (b0 == 0xF0) second_ok = b1 >= 0x90 && b1 <= 0xBF;
+    else if (b0 == 0xF4) second_ok = b1 >= 0x80 && b1 <= 0x8F;
+    if (!second_ok) {
+      ok = false;
+      return pos;
+    }
+    for (unsigned k = 2; k < len; ++k) {
+      if ((static_cast<unsigned char>(data[pos + k]) & 0xC0) != 0x80) {
+        ok = false;
+        return pos;
+      }
+    }
+    pos += len;
+  }
+  return pos;
+}
+
 // ---------------------------------------------------------------------------
 // 1) Per-lane predicate masks.
 // ---------------------------------------------------------------------------
@@ -417,6 +454,52 @@ void test_scanners_on_padded_tail_lengths() {
   }
 }
 
+void test_utf8_run_matches_reference() {
+  std::mt19937_64 rng(20240922);
+
+  auto append_utf8 = [](std::string& out, std::uint32_t cp) {
+    if (cp <= 0x7Fu) {
+      out.push_back(static_cast<char>(cp));
+    } else if (cp <= 0x7FFu) {
+      out.push_back(static_cast<char>(0xC0u | (cp >> 6)));
+      out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+    } else if (cp <= 0xFFFFu) {
+      out.push_back(static_cast<char>(0xE0u | (cp >> 12)));
+      out.push_back(static_cast<char>(0x80u | ((cp >> 6) & 0x3Fu)));
+      out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+    } else {
+      out.push_back(static_cast<char>(0xF0u | (cp >> 18)));
+      out.push_back(static_cast<char>(0x80u | ((cp >> 12) & 0x3Fu)));
+      out.push_back(static_cast<char>(0x80u | ((cp >> 6) & 0x3Fu)));
+      out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+    }
+  };
+
+  for (int trial = 0; trial < 20000; ++trial) {
+    std::string buf;
+    const std::size_t parts = static_cast<std::size_t>(rng() % 20u);
+    for (std::size_t p = 0; p < parts; ++p) {
+      if ((rng() % 2u) == 0) {
+        std::uint32_t cp = static_cast<std::uint32_t>(rng() % 0x110000u);
+        while (cp >= 0xD800u && cp <= 0xDFFFu) cp = static_cast<std::uint32_t>(rng() % 0x110000u);
+        if (cp == 0u) cp = 0x41u; // avoid interior NUL noise; semantics are the same
+        append_utf8(buf, cp);
+      } else {
+        buf.push_back(static_cast<char>(rng() & 0xFFu));
+      }
+    }
+
+    for (std::size_t start = 0; start <= buf.size(); ++start) {
+      bool ref_ok = true;
+      const std::size_t ref_end = ref_consume_utf8_run(buf.data(), buf.size(), start, ref_ok);
+      std::size_t pos = start;
+      const bool got_ok = chjson::detail::consume_utf8_run(buf.data(), buf.size(), pos);
+      CHJSON_CHECK(got_ok == ref_ok);
+      if (got_ok) CHJSON_CHECK(pos == ref_end);
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // 3) Number token scanning: grammar acceptance and values.
 // ---------------------------------------------------------------------------
@@ -630,6 +713,7 @@ void test_swar() {
   test_first_byte_big_endian_layout();
   test_scanners_agree_with_reference();
   test_scanners_on_padded_tail_lengths();
+  test_utf8_run_matches_reference();
   test_number_token_grammar();
   test_integer_conversion_boundaries();
   test_integer_conversion_exhaustive_lengths();
