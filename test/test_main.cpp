@@ -9,6 +9,7 @@ void test_errors();
 void test_dom();
 void test_random();
 void test_regressions();
+void test_swar();
 
 int main() {
   test_numbers();
@@ -18,6 +19,7 @@ int main() {
   test_dom();
   test_random();
   test_regressions();
+  test_swar();
 
   std::cout << "chjson tests passed\n";
   return 0;

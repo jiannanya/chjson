@@ -1,5 +1,6 @@
 #include <chjson/chjson.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -16,12 +17,13 @@ using clock_type = std::chrono::steady_clock;
 
 template <class T>
 inline void do_not_optimize(const T& v) {
-#if defined(_MSC_VER)
-  const volatile unsigned char* p = reinterpret_cast<const unsigned char*>(&v);
-  (void)*p;
-#else
-  asm volatile("" : : "g"(v) : "memory");
-#endif
+  // Portable optimization barrier: a compiler fence plus a read through volatile.
+  // Deliberately avoids inline assembly so the benchmark builds unchanged on any
+  // compiler/target combination.
+  std::atomic_signal_fence(std::memory_order_seq_cst);
+  static volatile unsigned char sink = 0;
+  const unsigned char* p = reinterpret_cast<const unsigned char*>(&v);
+  sink = p[0];
 }
 
 std::string make_payload(std::size_t n_objects, std::size_t str_len) {

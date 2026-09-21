@@ -5,6 +5,7 @@ A header-only **C++17** JSON library with an arena-backed DOM, strict UTF-8 pars
 Design goals:
 
 - **Fast enough in practice** (arena-backed DOM, optional MT parse/dump).
+- **Portable fast paths** (word-at-a-time SWAR scanning, no target-specific intrinsics or inline assembly).
 - **Strict JSON by default** (RFC 8259-style JSON, no JSON5 extensions).
 - **High-quality errors** (error code + byte offset + line/column).
 
@@ -251,7 +252,7 @@ Notes:
 
 ### Storage reuse and explicit release
 
-Small arenas start at 1 KiB. Empty containers and scalar roots do not reserve container storage. Containers grow their last arena allocation in place when space is available; other growth retains the usual monotonic arena lifetime. Large flat numeric arrays are counted before allocation, avoiding abandoned growth buffers. Long string arrays reserve space for DOM elements separately from the input text; the sizing probe distinguishes escaped quotes from the end of a string. Arena payloads have natural alignment on both 32-bit and 64-bit targets.
+Small arenas start at 1 KiB. Empty containers and scalar roots do not reserve container storage. Containers start with a two-slot capacity (enough for the `{"a":1}`-sized objects that dominate real JSON) and grow their last arena allocation in place when space is available; other growth retains the usual monotonic arena lifetime. Large flat numeric arrays are counted before allocation, avoiding abandoned growth buffers. Long string arrays reserve space for DOM elements separately from the input text; the sizing probe distinguishes escaped quotes from the end of a string. Arena payloads have natural alignment on both 32-bit and 64-bit targets.
 
 ```cpp
 chjson::document doc;
@@ -407,8 +408,9 @@ These caches primarily target workloads that call `chjson::parse()` repeatedly i
 - `CHJSON_PARSE_MT_MIN_BYTES` (default `1 MiB`)
 - `CHJSON_PARSE_MT_MIN_SPANS` (default `64`)
 - `CHJSON_PARSE_MT_MIN_AVG_SPAN_BYTES` (default `2 KiB`)
-- `CHJSON_PARSE_MT_SCAN_SIMD` (default `0`)
   - If fixed worker slices remain too small after retrying, parsing falls back to the growable serial arena. A real allocation failure still reports `out_of_memory`.
+- `CHJSON_PARSE_MT_SCAN_WORD` (default `1`)
+  - Uses the portable word-at-a-time (SWAR) scan while copying the input in the MT span splitter. Define to `0` for the scalar fallback. `CHJSON_PARSE_MT_SCAN_SIMD` is accepted as a back-compat alias.
 - `CHJSON_DUMP_MT_MIN_ITEMS` (default `1024`)
 - `CHJSON_DUMP_MT_MIN_BYTES` (default `1 MiB`)
   - Both thresholds must be met for automatic parallel serialization. Explicit `dump_mt()` uses its own options.
@@ -440,7 +442,7 @@ Options:
 - `CHJSON_BUILD_TESTS` (default `ON`)
 - `CHJSON_BUILD_BENCHMARKS` (default `OFF`)
 - `CHJSON_BUILD_COMPARE_BENCH` (default `OFF`)
-- `CHJSON_BUILD_CONFIG_TESTS` (default `OFF`): additionally test disabled caches/fast path, the optional allocator/SIMD splitter, the C-locale number fallback, and deliberately small MT slices.
+- `CHJSON_BUILD_CONFIG_TESTS` (default `OFF`): additionally test disabled caches/fast path, the optional allocator/word-scan splitter, the C-locale number fallback, and deliberately small MT slices.
 - `CHJSON_ENABLE_SANITIZERS` (default `OFF`): ASan + UBSan on GCC/Clang, or ASan on MSVC.
 - `CHJSON_BASELINE_INCLUDE` (default empty): a previous version's include directory; builds `chjson_baseline_bench` from the same benchmark source and compiler/runtime flags.
 
@@ -464,7 +466,7 @@ The benchmark accepts `count iterations runs workload [string_length]`. Workload
 python benchmark/compare_baseline.py --baseline /path/to/baseline/chjson_bench --candidate /path/to/new/chjson_bench --output benchmark-results.json
 ```
 
-Both comparison executables must contain the same benchmark source and use the same compiler, runtime library, and optimization flags. Set `-DCHJSON_BASELINE_INCLUDE=/path/to/old/include` to build `chjson_baseline_bench` alongside the current benchmark with matching flags. The comparison script records process failures as well as successful measurements. Use `--samples 3` to alternate multiple independent process pairs and take their median, `--extended` for Unicode, escapes and larger MT payloads, and optionally `--affinity-mask` to keep both processes on the same available logical CPUs. Repeat `--case NAME` to select specific workloads. See the [third optimization report](OPTIMIZATION_ROUND3_REPORT.md), [second optimization report](OPTIMIZATION_ROUND2_REPORT.md), and [first optimization report](OPTIMIZATION_REPORT.md) for measured results and limitations.
+Both comparison executables must contain the same benchmark source and use the same compiler, runtime library, and optimization flags. Set `-DCHJSON_BASELINE_INCLUDE=/path/to/old/include` to build `chjson_baseline_bench` alongside the current benchmark with matching flags. The comparison script records process failures as well as successful measurements. Use `--samples 3` to alternate multiple independent process pairs and take their median, `--extended` for Unicode, escapes and larger MT payloads, and optionally `--affinity-mask` to keep both processes on the same available logical CPUs. Repeat `--case NAME` to select specific workloads.
 
 ## Examples
 

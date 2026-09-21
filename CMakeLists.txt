@@ -51,6 +51,7 @@ if(CHJSON_BUILD_TESTS)
     test/test_dom.cpp
     test/test_random.cpp
     test/test_regressions.cpp
+    test/test_swar.cpp
   )
   add_executable(chjson_tests ${CHJSON_TEST_SOURCES})
   target_link_libraries(chjson_tests PRIVATE chjson)
@@ -76,7 +77,8 @@ if(CHJSON_BUILD_TESTS)
     target_compile_definitions(chjson_tests_pool PRIVATE CHJSON_USE_INTERNAL_ALLOCATOR=1 CHJSON_PARSE_MT_SCAN_SIMD=1)
     target_compile_definitions(chjson_tests_strtod PRIVATE CHJSON_USE_FROM_CHARS_DOUBLE=0 CHJSON_USE_CHFLOAT=0)
     target_compile_definitions(chjson_tests_small_mt PRIVATE CHJSON_PARSE_DOM_ARENA_RESERVE_MAX=1024
-      CHJSON_PARSE_MT_MIN_BYTES=1024 CHJSON_PARSE_MT_MIN_SPANS=4 CHJSON_PARSE_MT_MIN_AVG_SPAN_BYTES=64)
+      CHJSON_PARSE_MT_MIN_BYTES=1024 CHJSON_PARSE_MT_MIN_SPANS=4 CHJSON_PARSE_MT_MIN_AVG_SPAN_BYTES=64
+      CHJSON_PARSE_MT_SCAN_WORD=0)
   endif()
 
 

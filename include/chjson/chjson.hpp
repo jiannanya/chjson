@@ -14,12 +14,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
-#if defined(_M_X64) || defined(__SSE2__)
-  #if defined(_MSC_VER)
-    #include <intrin.h>
-  #endif
-  #include <immintrin.h>
-#endif
 #include <limits>
 #include <map>
 #include <memory_resource>
@@ -128,10 +122,17 @@
   #define CHJSON_PARSE_MT_MIN_AVG_SPAN_BYTES (2u * 1024u)
 #endif
 
-// Enable SSE2-accelerated scanning in the MT span splitter.
+// Enable the portable word-at-a-time (SWAR) scan in the MT span splitter.
 // This only affects the initial top-level span scan (used to decide MT splitting).
-#ifndef CHJSON_PARSE_MT_SCAN_SIMD
-  #define CHJSON_PARSE_MT_SCAN_SIMD 0
+// The scan is portable and enabled by default; define CHJSON_PARSE_MT_SCAN_WORD=0
+// to keep the scalar byte-at-a-time fallback. The pre-SWAR name
+// CHJSON_PARSE_MT_SCAN_SIMD is accepted as an alias for compatibility.
+#ifndef CHJSON_PARSE_MT_SCAN_WORD
+  #ifdef CHJSON_PARSE_MT_SCAN_SIMD
+    #define CHJSON_PARSE_MT_SCAN_WORD CHJSON_PARSE_MT_SCAN_SIMD
+  #else
+    #define CHJSON_PARSE_MT_SCAN_WORD 1
+  #endif
 #endif
 
 // Automatic dumping should amortize scheduling across a substantial payload.
@@ -220,43 +221,213 @@ inline bool is_ws(char c) noexcept {
   return c == ' ' || c == '\n' || c == '\r' || c == '\t';
 }
 
+// -----------------------------
+// Portable SWAR byte scanning
+// -----------------------------
+// These helpers classify eight input bytes at a time using only fixed-width
+// unsigned integer arithmetic. They intentionally contain no target-specific
+// intrinsics, no inline assembly and no `#ifdef` on the instruction set, so the
+// same fast path is used on every architecture chjson is compiled for (x86,
+// x86-64, ARM32, AArch64, RISC-V, ...).
+//
+// Every mask below is built out of per-byte *high bits*: bit (8*k + 7) of the
+// result describes the byte at lane k of the word. The predicates are exact for
+// every lane individually and never carry or borrow across lane boundaries, so
+// they are safe to combine with |, ~ and &, and the lowest set bit is always
+// the first matching byte in memory order. That in turn means complements are
+// meaningful (needed by skip_ws()) and the scanners below need no fix-ups.
+//
+// Lane index -> memory offset conversion is resolved explicitly so the helpers
+// are correct on both little- and big-endian targets; `swar_little_endian()` is
+// constant-folded away by the optimizer.
+
+inline constexpr std::uint64_t swar_high_bits = 0x8080808080808080ull;
+inline constexpr std::uint64_t swar_low_bits = 0x0101010101010101ull;
+inline constexpr std::uint64_t swar_lane_low7 = 0x7F7F7F7F7F7F7F7Full;
+
+inline std::uint64_t swar_splat(unsigned char b) noexcept {
+  return swar_low_bits * static_cast<std::uint64_t>(b);
+}
+
+inline std::uint64_t swar_load(const char* p) noexcept {
+  std::uint64_t w = 0;
+  // memcpy keeps the load alignment- and aliasing-safe on every target; compilers
+  // lower it to a single unaligned word load where the ISA allows it.
+  std::memcpy(&w, p, sizeof(w));
+  return w;
+}
+
+inline void swar_store(char* p, std::uint64_t w) noexcept {
+  std::memcpy(p, &w, sizeof(w));
+}
+
+inline bool swar_little_endian() noexcept {
+  const std::uint16_t probe = 1u;
+  unsigned char first = 0;
+  std::memcpy(&first, &probe, sizeof(first));
+  return first == 1u;
+}
+
+inline unsigned swar_ctz64(std::uint64_t v) noexcept {
+  if (v == 0) return 64u;
+#if defined(__GNUC__) || defined(__clang__)
+  return static_cast<unsigned>(__builtin_ctzll(v));
+#else
+  unsigned n = 0;
+  while ((v & 1ull) == 0ull) {
+    v >>= 1;
+    ++n;
+  }
+  return n;
+#endif
+}
+
+inline unsigned swar_clz64(std::uint64_t v) noexcept {
+  if (v == 0) return 64u;
+#if defined(__GNUC__) || defined(__clang__)
+  return static_cast<unsigned>(__builtin_clzll(v));
+#else
+  unsigned n = 0;
+  std::uint64_t mask = 0x8000000000000000ull;
+  while ((v & mask) == 0ull) {
+    mask >>= 1;
+    ++n;
+  }
+  return n;
+#endif
+}
+
+inline unsigned swar_popcount64(std::uint64_t v) noexcept {
+#if defined(__GNUC__) || defined(__clang__)
+  return static_cast<unsigned>(__builtin_popcountll(v));
+#else
+  // Portable SWAR population count (no intrinsics required).
+  v = v - ((v >> 1) & 0x5555555555555555ull);
+  v = (v & 0x3333333333333333ull) + ((v >> 2) & 0x3333333333333333ull);
+  v = (v + (v >> 4)) & 0x0F0F0F0F0F0F0F0Full;
+  return static_cast<unsigned>((v * swar_low_bits) >> 56);
+#endif
+}
+
+// Memory offset (0..7) of the first lane whose high bit is set. `mask` must be nonzero.
+//
+// On little-endian targets the lowest-addressed byte occupies the lowest bits, so
+// the first match is found with a count-trailing-zeros. On big-endian targets the
+// highest bits describe the lowest addresses; a count-leading-zeros therefore
+// already yields the memory offset (`clz >> 3`), without reversing the lanes.
+inline std::size_t swar_first_byte(std::uint64_t mask) noexcept {
+  if (swar_little_endian())
+    return static_cast<std::size_t>(swar_ctz64(mask) >> 3);
+  return static_cast<std::size_t>(swar_clz64(mask) >> 3);
+}
+
+// Exact per-lane zero test: high bit set in every byte of `x` that is zero.
+//
+// The `(x & 0x7F..) + 0x7F..` term can never carry out of a lane (max 0x7F +
+// 0x7F = 0xFE), so there is no cross-lane contamination in either direction.
+inline std::uint64_t swar_is_zero(std::uint64_t x) noexcept {
+  return ~(((x & swar_lane_low7) + swar_lane_low7) | x) & swar_high_bits;
+}
+
+// Exact per-lane: high bit set in every byte equal to `b`.
+inline std::uint64_t swar_eq(std::uint64_t v, unsigned char b) noexcept {
+  return swar_is_zero(v ^ swar_splat(b));
+}
+
+// Exact per-lane: high bit set in every byte strictly less than `n` (1 <= n <= 128).
+//
+// Bytes with the top bit set are forced to "not less" by OR-ing `v & 0x80..`
+// back in, and the remaining 7 bits plus (128 - n) cannot exceed 0xFE, so again
+// there is no carry between lanes.
+inline std::uint64_t swar_lt(std::uint64_t v, unsigned char n) noexcept {
+  const std::uint64_t add = swar_splat(static_cast<unsigned char>(128u - n));
+  return ~((v & swar_high_bits) | ((v & swar_lane_low7) + add)) & swar_high_bits;
+}
+
+// Exact per-lane: high bit set in every byte strictly greater than `n` (0 <= n <= 127).
+inline std::uint64_t swar_gt(std::uint64_t v, unsigned char n) noexcept {
+  const std::uint64_t add = swar_splat(static_cast<unsigned char>(127u - n));
+  return ((v & swar_high_bits) | ((v & swar_lane_low7) + add)) & swar_high_bits;
+}
+
+// ---------------------------------------------------------------------------
+// Reduced-operation mask variants.
+// ---------------------------------------------------------------------------
+// The classic borrow/carry formulations are one to two ALU ops cheaper than the
+// exact ones above, but a borrow out of lane k (swar_eq_fast) or a carry into
+// lane k (swar_gt_fast) can set a spurious bit in a *higher* lane. They are
+// therefore safe only for callers that consume nothing but the position of the
+// lowest set lane (or `!= 0`).
+//
+// The safety argument, used by every call site below:
+//   * A spurious bit in lane i always requires a genuine match at some lane
+//     k < i, so no spurious bit can appear below the first genuine match.
+//   * The first genuine match at lane j itself is always reported, because
+//     reaching lane j would require a borrow/carry produced by a genuine match
+//     strictly below j, which contradicts j being first.
+//   * A mask with no genuine match anywhere has no borrow/carry source, hence
+//     no spurious bit, so `!= 0` tests stay exact.
+//
+// Do NOT complement these masks (a spurious bit becomes a false negative) and
+// do NOT take a population count of them.
+// test/test_swar.cpp checks both the lowest-lane contract enforced here and the
+// per-lane exactness of the variants above.
+
+// High bit set in every byte equal to `b`, plus possible spurious bits above a match.
+inline std::uint64_t swar_eq_fast(std::uint64_t v, unsigned char b) noexcept {
+  const std::uint64_t x = v ^ swar_splat(b);
+  return (x - swar_low_bits) & ~x & swar_high_bits;
+}
+
+// High bit set in every byte < `n` (1 <= n <= 128), plus possible bits above a match.
+inline std::uint64_t swar_lt_fast(std::uint64_t v, unsigned char n) noexcept {
+  return (v - swar_splat(n)) & ~v & swar_high_bits;
+}
+
+// High bit set in every byte > `n` (0 <= n <= 127), plus possible bits above a match.
+inline std::uint64_t swar_gt_fast(std::uint64_t v, unsigned char n) noexcept {
+  return ((v + swar_splat(static_cast<unsigned char>(127u - n))) | v) & swar_high_bits;
+}
+
+// High bit set in every byte with the top bit set (>= 0x80).
+inline std::uint64_t swar_high_bytes(std::uint64_t v) noexcept {
+  return v & swar_high_bits;
+}
+
+// Byte predicate fragments. Each one is exercised by test/test_swar.cpp against
+// a scalar reference; swar_is_string_special_fast() and swar_needs_escape_fast()
+// are the compositions used by the hot scanners today. The whitespace and digit
+// fragments are kept for callers that need an exact/composable mask of their own
+// (the default scanners use scalar loops for short runs, which measures faster).
+inline std::uint64_t swar_is_json_ws_fast(std::uint64_t v) noexcept {
+  return swar_eq_fast(v, ' ') | swar_eq_fast(v, '\n') | swar_eq_fast(v, '\r') | swar_eq_fast(v, '\t');
+}
+
+// Exact whitespace mask (per-lane exact, so complements are meaningful).
+inline std::uint64_t swar_is_json_ws_exact(std::uint64_t v) noexcept {
+  return swar_eq(v, ' ') | swar_eq(v, '\n') | swar_eq(v, '\r') | swar_eq(v, '\t');
+}
+
+inline std::uint64_t swar_is_non_digit_fast(std::uint64_t v) noexcept {
+  return swar_lt_fast(v, '0') | swar_gt_fast(v, '9');
+}
+
+// `"`, `\\`, control bytes and UTF-8 lead/continuation bytes: every byte that
+// ends the scan of an unescaped ASCII string body.
+inline std::uint64_t swar_is_string_special_fast(std::uint64_t v) noexcept {
+  return swar_eq_fast(v, '"') | swar_eq_fast(v, '\\') | swar_lt_fast(v, 0x20u) | swar_high_bytes(v);
+}
+
+// `"`, `\\` and control bytes: every byte that must be escaped on serialization.
+inline std::uint64_t swar_needs_escape_fast(std::uint64_t v) noexcept {
+  return swar_eq_fast(v, '"') | swar_eq_fast(v, '\\') | swar_lt_fast(v, 0x20u);
+}
+
 inline void skip_ws(const char* buf, std::size_t size, std::size_t& i) noexcept {
   // Extremely common case for compact JSON: no whitespace at the current position.
-  // Avoid the heavier SIMD path (which does a 16-byte load and mask setup) unless
-  // we actually see whitespace.
-  if (i >= size) return;
-  if (!is_ws(buf[i])) return;
-
-  // Fast path: SSE2 scan 16 bytes at a time (available on MSVC x64 and most x86).
-#if defined(_M_X64) || defined(__SSE2__)
-  while (i + 16 <= size) {
-    const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(buf + i));
-    const __m128i is_space = _mm_cmpeq_epi8(v, _mm_set1_epi8(' '));
-    const __m128i is_nl = _mm_cmpeq_epi8(v, _mm_set1_epi8('\n'));
-    const __m128i is_cr = _mm_cmpeq_epi8(v, _mm_set1_epi8('\r'));
-    const __m128i is_tab = _mm_cmpeq_epi8(v, _mm_set1_epi8('\t'));
-    const __m128i is_ws_v = _mm_or_si128(_mm_or_si128(is_space, is_nl), _mm_or_si128(is_cr, is_tab));
-    const unsigned ws_mask = static_cast<unsigned>(_mm_movemask_epi8(is_ws_v));
-    if (ws_mask == 0xFFFFu) {
-      i += 16;
-      continue;
-    }
-
-    const unsigned non = (~ws_mask) & 0xFFFFu;
-    if (non != 0u) {
-#if defined(_MSC_VER)
-      unsigned long idx = 0;
-      _BitScanForward(&idx, non);
-      i += static_cast<std::size_t>(idx);
-#else
-      i += static_cast<std::size_t>(__builtin_ctz(non));
-#endif
-      return;
-    }
-    i += 16;
-  }
-#endif
-
+  // Scalar loop intentionally: pretty-printed runs are only a few bytes long, and
+  // a word-at-a-time scan costs more than it saves on them. Long runs are still
+  // linear and cheap.
   while (i < size && is_ws(buf[i])) ++i;
 }
 
@@ -342,28 +513,26 @@ inline bool consume_utf8_run(const char* data, std::size_t size, std::size_t& po
 // Find the next quote, escape, control byte or UTF-8 byte. Never read past size,
 // including when the input is a string_view without padding or a terminator.
 inline std::size_t scan_string_special(const char* data, std::size_t size, std::size_t pos) noexcept {
-#if defined(_M_X64) || defined(__SSE2__)
-  const __m128i quote = _mm_set1_epi8('"');
-  const __m128i slash = _mm_set1_epi8('\\');
-  const __m128i space = _mm_set1_epi8(0x20);
-  while (size - pos >= 16) {
-    const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(data + pos));
-    // Signed comparison includes both 0x00..0x1F and 0x80..0xFF in one mask.
-    const __m128i special = _mm_or_si128(_mm_cmplt_epi8(v, space),
-        _mm_or_si128(_mm_cmpeq_epi8(v, quote), _mm_cmpeq_epi8(v, slash)));
-    const unsigned mask = static_cast<unsigned>(_mm_movemask_epi8(special));
-    if (mask) {
-#if defined(_MSC_VER)
-      unsigned long bit;
-      _BitScanForward(&bit, mask);
-      return pos + bit;
-#else
-      return pos + static_cast<unsigned>(__builtin_ctz(mask));
-#endif
-    }
-    pos += 16;
+  // Scalar-first: callers frequently resume right at the byte that ended the
+  // previous run (a quote or a backslash in escape-dense strings), and short
+  // runs of plain bytes are cheaper to peel scalar than to probe with a word.
+  if (pos >= size) return pos;
+  {
+    const auto c = static_cast<unsigned char>(data[pos]);
+    if (c == '"' || c == '\\' || c < 0x20 || c >= 0x80) return pos;
   }
-#endif
+
+  // Only take the word path when a full word is provably free of special bytes,
+  // so a short string or a dense-escape body never pays for the word setup.
+  if (size - pos >= 8 && swar_is_string_special_fast(swar_load(data + pos)) == 0ull) {
+    pos += 8;
+    // Portable SWAR scan (eight bytes per iteration on every architecture).
+    while (size - pos >= 8) {
+      const std::uint64_t m = swar_is_string_special_fast(swar_load(data + pos));
+      if (m != 0ull) return pos + swar_first_byte(m);
+      pos += 8;
+    }
+  }
   while (pos < size) {
     const auto c = static_cast<unsigned char>(data[pos]);
     if (c == '"' || c == '\\' || c < 0x20 || c >= 0x80) break;
@@ -373,6 +542,27 @@ inline std::size_t scan_string_special(const char* data, std::size_t size, std::
 }
 
 inline bool is_digit(char c) noexcept { return c >= '0' && c <= '9'; }
+
+// Advance `p` to the first byte at or after `p` that is not an ASCII digit.
+// `p` must be <= size.
+//
+// Deliberately scalar: typical JSON numbers are a handful of digits, where the
+// simple loop beats any word-scan setup, and the loop is also what feeds the
+// no-overflow-checked conversion in convert_integer_token().
+inline std::size_t scan_digits(const char* buf, std::size_t size, std::size_t p) noexcept {
+  while (p < size && is_digit(buf[p])) ++p;
+  return p;
+}
+
+// Convert a run of ASCII digits that is known to fit in a std::uint64_t
+// (at most 19 digits) without per-digit overflow bookkeeping.
+inline std::uint64_t accumulate_digits(const char* buf, std::size_t begin, std::size_t end) noexcept {
+  std::uint64_t acc = 0;
+  for (std::size_t k = begin; k < end; ++k)
+    acc = acc * 10u + static_cast<std::uint64_t>(buf[k] - '0');
+  return acc;
+}
+
 
 // -----------------------------
 // Internal allocator (mimalloc-inspired)
@@ -988,74 +1178,88 @@ inline double parse_double(std::string_view token) {
   return parse_double(token.data(), token.data() + token.size());
 }
 
-inline bool parse_number(const char* buf, std::size_t size, std::size_t& i, number_value& out, bool parse_fp = true) {
-  // JSON number grammar:
-  // -?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?
-  //
-  // Performance note: float-heavy inputs ('.'/'e') are common in benchmarks.
-  // Avoid doing integer accumulation/overflow tracking unless the token is
-  // actually an integer.
-  const std::size_t start = i;
-  if (i >= size) return false;
+// Result of validating the JSON number grammar without converting the value.
+// Sharing one scanner between both number_value flavors removes a duplicated
+// copy of the grammar from the hot path.
+struct number_scan_result {
+  bool ok{false};
+  bool neg{false};
+  bool is_int{true};
+  std::size_t digits_begin{0}; // first integer-part digit
+  std::size_t digits_end{0};   // one past the last integer-part digit
+  std::size_t end{0};          // one past the whole token
+};
 
+// Scan the JSON number grammar starting at `i`:
+//   -?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?
+// Digit runs go through scan_digits(); the grammar itself is validated exactly
+// once and shared by both number_value flavors.
+inline number_scan_result scan_number_token(const char* buf, std::size_t size, std::size_t i) noexcept {
+  number_scan_result r;
   std::size_t p = i;
-  bool neg = false;
-  if (buf[p] == '-') {
-    neg = true;
+
+  if (p < size && buf[p] == '-') {
+    r.neg = true;
     ++p;
-    if (p >= size) return false;
+    if (p >= size) return r;
   }
+  if (p >= size) return r;
 
-  const std::size_t digits_begin = p;
-
-  // First, scan the token to determine whether it is an integer or float.
-  // For floats, avoid doing integer accumulation/overflow tracking while scanning.
+  r.digits_begin = p;
   if (buf[p] == '0') {
     ++p;
-    if (p < size && is_digit(buf[p])) return false;
+    // Leading zeros are not allowed in JSON.
+    if (p < size && is_digit(buf[p])) return r;
   } else {
     const char c0 = buf[p];
-    if (c0 < '1' || c0 > '9') return false;
-    ++p;
-    while (p < size && is_digit(buf[p])) ++p;
+    if (c0 < '1' || c0 > '9') return r;
+    p = scan_digits(buf, size, p + 1);
   }
-  const std::size_t digits_end = p;
+  r.digits_end = p;
 
-  bool is_int = true;
   if (p < size && buf[p] == '.') {
-    is_int = false;
+    r.is_int = false;
     ++p;
-    if (p >= size || !is_digit(buf[p])) return false;
-    while (p < size && is_digit(buf[p])) ++p;
+    if (p >= size || !is_digit(buf[p])) return r;
+    p = scan_digits(buf, size, p);
   }
 
   if (p < size && (buf[p] == 'e' || buf[p] == 'E')) {
-    is_int = false;
+    r.is_int = false;
     ++p;
-    if (p >= size) return false;
+    if (p >= size) return r;
     if (buf[p] == '+' || buf[p] == '-') {
       ++p;
-      if (p >= size) return false;
+      if (p >= size) return r;
     }
-    if (!is_digit(buf[p])) return false;
-    while (p < size && is_digit(buf[p])) ++p;
+    if (!is_digit(buf[p])) return r;
+    p = scan_digits(buf, size, p);
   }
 
-  const std::size_t end = p;
-  i = end;
-  const char* token_first = buf + start;
-  const char* token_last = buf + end;
+  r.end = p;
+  r.ok = true;
+  return r;
+}
 
-  if (!is_int) {
-    out.is_int = false;
-    if (parse_fp) out.d = parse_double(token_first, token_last);
+// Convert an ASCII digit run to std::int64_t. Returns false when the value does
+// not fit (the caller then falls back to `double`, as before).
+//
+// Fast path: 18 digits or fewer always fit in std::int64_t
+// (10^18 - 1 < 2^63 - 1), so no overflow bookkeeping is needed at all -- this
+// covers essentially every integer in real JSON. Longer tokens take the careful
+// uint64 path with explicit overflow tracking preserved from the original code.
+inline bool convert_integer_token(const char* buf, std::size_t begin, std::size_t end,
+                                  bool neg, std::int64_t& out_i) noexcept {
+  const std::size_t ndigits = end - begin;
+  if (ndigits <= 18) {
+    const std::uint64_t acc = accumulate_digits(buf, begin, end);
+    out_i = neg ? -static_cast<std::int64_t>(acc) : static_cast<std::int64_t>(acc);
     return true;
   }
 
-  // Integer: compute value with overflow tracking (second pass over digits only).
   std::uint64_t acc = 0;
   bool overflow = false;
-  for (std::size_t k = digits_begin; k < digits_end; ++k) {
+  for (std::size_t k = begin; k < end; ++k) {
     const std::uint64_t d = static_cast<std::uint64_t>(buf[k] - '0');
     if (!overflow) {
       if (acc > (std::numeric_limits<std::uint64_t>::max() - d) / 10u) {
@@ -1065,32 +1269,50 @@ inline bool parse_number(const char* buf, std::size_t size, std::size_t& i, numb
       }
     }
   }
-
-  if (overflow) {
-    out.is_int = false;
-    if (parse_fp) out.d = parse_double(token_first, token_last);
-    return true;
-  }
+  if (overflow) return false;
 
   if (neg) {
     const std::uint64_t limit = static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) + 1ull;
-    if (acc > limit) {
-      out.is_int = false;
-      if (parse_fp) out.d = parse_double(token_first, token_last);
-      return true;
-    }
-    out.is_int = true;
-    out.i = (acc == limit) ? std::numeric_limits<std::int64_t>::min() : -static_cast<std::int64_t>(acc);
+    if (acc > limit) return false;
+    out_i = (acc == limit) ? std::numeric_limits<std::int64_t>::min() : -static_cast<std::int64_t>(acc);
     return true;
   }
 
-  if (acc > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
+  if (acc > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) return false;
+  out_i = static_cast<std::int64_t>(acc);
+  return true;
+}
+
+inline bool parse_number(const char* buf, std::size_t size, std::size_t& i, number_value& out, bool parse_fp = true) {
+  // JSON number grammar:
+  // -?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?
+  //
+  // The grammar is validated by a single scanner (scan_number_token), which uses
+  // the portable word-at-a-time digit scanner. Integer conversion is only done
+  // when the token really is an integer, and uses a no-overflow-check fast path
+  // for the common short-token case.
+  const std::size_t start = i;
+  if (i >= size) return false;
+
+  const number_scan_result tok = scan_number_token(buf, size, i);
+  if (!tok.ok) return false;
+  i = tok.end;
+
+  if (!tok.is_int) {
     out.is_int = false;
-    if (parse_fp) out.d = parse_double(token_first, token_last);
+    if (parse_fp) out.d = parse_double(buf + start, buf + tok.end);
+    return true;
+  }
+
+  std::int64_t iv = 0;
+  if (!convert_integer_token(buf, tok.digits_begin, tok.digits_end, tok.neg, iv)) {
+    // Out of std::int64_t range: fall back to a double, matching prior behavior.
+    out.is_int = false;
+    if (parse_fp) out.d = parse_double(buf + start, buf + tok.end);
     return true;
   }
   out.is_int = true;
-  out.i = static_cast<std::int64_t>(acc);
+  out.i = iv;
   return true;
 }
 
@@ -1100,49 +1322,10 @@ inline bool parse_number(const char* buf, std::size_t size, std::size_t& i, owne
   const std::size_t start = i;
   if (i >= size) return false;
 
-  std::size_t p = i;
-  bool neg = false;
-  if (buf[p] == '-') {
-    neg = true;
-    ++p;
-    if (p >= size) return false;
-  }
-
-  const std::size_t digits_begin = p;
-
-  if (buf[p] == '0') {
-    ++p;
-    if (p < size && is_digit(buf[p])) return false;
-  } else {
-    const char c0 = buf[p];
-    if (c0 < '1' || c0 > '9') return false;
-    ++p;
-    while (p < size && is_digit(buf[p])) ++p;
-  }
-
-  bool is_int = true;
-  if (p < size && buf[p] == '.') {
-    is_int = false;
-    ++p;
-    if (p >= size || !is_digit(buf[p])) return false;
-    while (p < size && is_digit(buf[p])) ++p;
-  }
-
-  if (p < size && (buf[p] == 'e' || buf[p] == 'E')) {
-    is_int = false;
-    ++p;
-    if (p >= size) return false;
-    if (buf[p] == '+' || buf[p] == '-') {
-      ++p;
-      if (p >= size) return false;
-    }
-    if (!is_digit(buf[p])) return false;
-    while (p < size && is_digit(buf[p])) ++p;
-  }
-
-  const std::size_t end = p;
-  i = end;
-  const std::string_view token(buf + start, end - start);
+  const number_scan_result tok = scan_number_token(buf, size, i);
+  if (!tok.ok) return false;
+  i = tok.end;
+  const std::string_view token(buf + start, tok.end - start);
 
   auto set_raw = [&]() {
     out.set_raw(token);
@@ -1157,57 +1340,22 @@ inline bool parse_number(const char* buf, std::size_t size, std::size_t& i, owne
     }
   };
 
-  if (!is_int) {
+  if (!tok.is_int) {
     out.is_int = false;
     set_raw();
     set_double();
     return true;
   }
 
-  // Integer: accumulation pass.
-  std::uint64_t acc = 0;
-  bool overflow = false;
-  for (std::size_t q = digits_begin; q < end; ++q) {
-    const std::uint64_t d = static_cast<std::uint64_t>(buf[q] - '0');
-    if (!overflow) {
-      if (acc > (std::numeric_limits<std::uint64_t>::max() - d) / 10u) {
-        overflow = true;
-      } else {
-        acc = acc * 10u + d;
-      }
-    }
-  }
-
-  if (overflow) {
-    out.is_int = false;
-    set_raw();
-    set_double();
-    return true;
-  }
-
-  if (neg) {
-    const std::uint64_t limit = static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) + 1ull;
-    if (acc > limit) {
-      out.is_int = false;
-      set_raw();
-      set_double();
-      return true;
-    }
-    out.is_int = true;
-    out.i = (acc == limit) ? std::numeric_limits<std::int64_t>::min() : -static_cast<std::int64_t>(acc);
-    out.clear_raw();
-    out.has_double = false;
-    return true;
-  }
-
-  if (acc > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
+  std::int64_t iv = 0;
+  if (!convert_integer_token(buf, tok.digits_begin, tok.digits_end, tok.neg, iv)) {
     out.is_int = false;
     set_raw();
     set_double();
     return true;
   }
   out.is_int = true;
-  out.i = static_cast<std::int64_t>(acc);
+  out.i = iv;
   out.clear_raw();
   out.has_double = false;
   return true;
@@ -1677,27 +1825,21 @@ inline value parse_value_or_throw(std::string_view json, parse_options opt = {})
 }
 
 namespace detail {
+// Shared predicate: does this word contain a byte that must be escaped when
+// serialized, i.e. '"', '\\', or any control byte <= 0x1F?
+inline std::uint64_t swar_needs_escape_mask(std::uint64_t v) noexcept {
+  return swar_needs_escape_fast(v);
+}
+
 inline bool needs_escaping(std::string_view s) noexcept {
   const char* p = s.data();
   const std::size_t n = s.size();
 
-#if defined(_M_X64) || defined(__SSE2__)
-  const __m128i q = _mm_set1_epi8('"');
-  const __m128i bs = _mm_set1_epi8('\\');
-  const __m128i k1f = _mm_set1_epi8(0x1F);
-  const __m128i zero = _mm_setzero_si128();
-
   std::size_t i = 0;
-  while (i + 16 <= n) {
-    const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p + i));
-    const __m128i is_q = _mm_cmpeq_epi8(v, q);
-    const __m128i is_bs = _mm_cmpeq_epi8(v, bs);
-    // Unsigned check for v <= 0x1F using saturated subtract.
-    const __m128i sub = _mm_subs_epu8(v, k1f);
-    const __m128i is_ctrl = _mm_cmpeq_epi8(sub, zero);
-    const __m128i any = _mm_or_si128(_mm_or_si128(is_q, is_bs), is_ctrl);
-    if (_mm_movemask_epi8(any) != 0) return true;
-    i += 16;
+  // Portable SWAR scan (eight bytes per iteration on every architecture).
+  while (i + 8 <= n) {
+    if (swar_needs_escape_mask(swar_load(p + i)) != 0ull) return true;
+    i += 8;
   }
   for (; i < n; ++i) {
     const unsigned char uc = static_cast<unsigned char>(p[i]);
@@ -1705,22 +1847,14 @@ inline bool needs_escaping(std::string_view s) noexcept {
     if (c == '"' || c == '\\' || uc <= 0x1F) return true;
   }
   return false;
-#else
-  for (std::size_t i = 0; i < n; ++i) {
-    const unsigned char uc = static_cast<unsigned char>(p[i]);
-    const char c = p[i];
-    if (c == '"' || c == '\\' || uc <= 0x1F) return true;
-  }
-  return false;
-#endif
 }
 
 inline std::size_t find_first_escape(std::string_view s) noexcept {
   const char* p = s.data();
   const std::size_t n = s.size();
 
-  // Very small strings are common in object keys; avoid SSE setup overhead.
-  if (n < 16) {
+  // Very small strings are common in object keys; avoid word-scan setup overhead.
+  if (n < 8) {
     for (std::size_t i = 0; i < n; ++i) {
       const unsigned char uc = static_cast<unsigned char>(p[i]);
       const char c = p[i];
@@ -1729,31 +1863,11 @@ inline std::size_t find_first_escape(std::string_view s) noexcept {
     return n;
   }
 
-#if defined(_M_X64) || defined(__SSE2__)
-  const __m128i q = _mm_set1_epi8('"');
-  const __m128i bs = _mm_set1_epi8('\\');
-  const __m128i k1f = _mm_set1_epi8(0x1F);
-  const __m128i zero = _mm_setzero_si128();
-
   std::size_t i = 0;
-  while (i + 16 <= n) {
-    const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p + i));
-    const __m128i is_q = _mm_cmpeq_epi8(v, q);
-    const __m128i is_bs = _mm_cmpeq_epi8(v, bs);
-    const __m128i sub = _mm_subs_epu8(v, k1f);
-    const __m128i is_ctrl = _mm_cmpeq_epi8(sub, zero);
-    const __m128i any = _mm_or_si128(_mm_or_si128(is_q, is_bs), is_ctrl);
-    const int mask = _mm_movemask_epi8(any);
-    if (mask != 0) {
-#if defined(_MSC_VER)
-      unsigned long bit = 0;
-      _BitScanForward(&bit, static_cast<unsigned long>(mask));
-      return i + static_cast<std::size_t>(bit);
-#else
-      return i + static_cast<std::size_t>(__builtin_ctz(static_cast<unsigned>(mask)));
-#endif
-    }
-    i += 16;
+  while (i + 8 <= n) {
+    const std::uint64_t m = swar_needs_escape_mask(swar_load(p + i));
+    if (m != 0ull) return i + swar_first_byte(m);
+    i += 8;
   }
   for (; i < n; ++i) {
     const unsigned char uc = static_cast<unsigned char>(p[i]);
@@ -1761,14 +1875,6 @@ inline std::size_t find_first_escape(std::string_view s) noexcept {
     if (c == '"' || c == '\\' || uc <= 0x1F) return i;
   }
   return n;
-#else
-  for (std::size_t i = 0; i < n; ++i) {
-    const unsigned char uc = static_cast<unsigned char>(p[i]);
-    const char c = p[i];
-    if (c == '"' || c == '\\' || uc <= 0x1F) return i;
-  }
-  return n;
-#endif
 }
 
 inline void dump_escaped(std::string& out, std::string_view s) {
@@ -2995,30 +3101,20 @@ struct flat_array_info {
 inline flat_array_info inspect_flat_array(const char* data, std::size_t size, std::size_t pos) noexcept {
   flat_array_info info{1, false};
   while (pos < size) {
-#if defined(_M_X64) || defined(__SSE2__)
-    if (size - pos >= 16) {
-      const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(data + pos));
-      const __m128i brackets = _mm_or_si128(v, _mm_set1_epi8(0x20));
-      const __m128i stop = _mm_or_si128(_mm_cmpeq_epi8(v, _mm_set1_epi8('"')),
-          _mm_or_si128(_mm_cmpeq_epi8(brackets, _mm_set1_epi8('{')),
-                       _mm_cmpeq_epi8(brackets, _mm_set1_epi8('}'))));
-      if (_mm_movemask_epi8(stop) == 0) {
-        unsigned mask = static_cast<unsigned>(_mm_movemask_epi8(_mm_cmpeq_epi8(v, _mm_set1_epi8(','))));
-        // Portable population count; does not require SSE4/POPCNT support.
-        mask -= (mask >> 1) & 0x5555u;
-        mask = (mask & 0x3333u) + ((mask >> 2) & 0x3333u);
-        mask = (mask + (mask >> 4)) & 0x0F0Fu;
-        info.items += (mask + (mask >> 8)) & 0x1Fu;
-        if (!info.has_fp) {
-          const __m128i fp = _mm_or_si128(_mm_cmpeq_epi8(v, _mm_set1_epi8('.')),
-                                        _mm_cmpeq_epi8(brackets, _mm_set1_epi8('e')));
-          info.has_fp = _mm_movemask_epi8(fp) != 0;
-        }
-        pos += 16;
-        continue;
+    // Portable SWAR fast path: skip word-aligned blocks that contain no
+    // structural byte, counting separators (and spotting floats) on the way.
+    while (size - pos >= 8) {
+      const std::uint64_t v = swar_load(data + pos);
+      const std::uint64_t stop = swar_eq(v, '"') | swar_eq(v, '[') | swar_eq(v, '{') |
+                                 swar_eq(v, '}') | swar_eq(v, ']');
+      if (stop != 0ull) break;
+      // Exact eq: the population count below must not include spurious lanes.
+      info.items += swar_popcount64(swar_eq(v, ','));
+      if (!info.has_fp) {
+        info.has_fp = (swar_eq_fast(v, '.') | swar_eq_fast(v, 'e') | swar_eq_fast(v, 'E')) != 0ull;
       }
+      pos += 8;
     }
-#endif
     const char c = data[pos++];
     if (c == ']') return info;
     if (c == '[' || c == '{' || c == '}' || c == '"') return {};
@@ -3064,23 +3160,42 @@ inline std::uint32_t grow_capacity(std::uint32_t cap, std::uint32_t want) {
   }
   return next;
 }
+
+// Initial element capacity for containers whose final size is not known yet.
+//
+// Deliberately 2 rather than 4: when a container is still the newest arena
+// allocation, growing it is served by arena_resource::try_expand(), which only
+// advances the block's bump pointer and copies nothing. A larger fixed reserve
+// therefore buys almost nothing on the hot path, while costing a full extra
+// element slot for every 1- and 2-element container -- which dominate real
+// JSON (e.g. `{"a":[],"b":{}}` or `{"k":1}`). Measured arena reduction for such
+// payloads is roughly half the container storage.
+inline constexpr std::uint32_t k_initial_container_capacity = 2u;
 template <class T>
 inline T* grow_storage(std::pmr::memory_resource* mr, T* old, std::uint32_t size,
-                       std::uint32_t cap, std::uint32_t next) {
+                       std::uint32_t cap, std::uint32_t next,
+                       pmr::arena_resource* arena_hint = nullptr) {
   if (next > (std::numeric_limits<std::size_t>::max)() / sizeof(T)) throw std::bad_alloc();
   const std::size_t bytes = sizeof(T) * static_cast<std::size_t>(next);
   static_assert(std::is_trivially_copyable_v<T>, "arena storage requires trivial values");
 #if defined(__cpp_rtti) || defined(_CPPRTTI)
   if (old) {
-    if (auto* arena = dynamic_cast<pmr::arena_resource*>(mr))
-      if (arena->try_expand(old, sizeof(T) * static_cast<std::size_t>(cap), bytes)) return old;
+    // Container growth happens once per small container, i.e. tens of thousands
+    // of times for a modest document, so recovering the arena here with an RTTI
+    // probe would show up directly in the profile. Parsers that already know the
+    // resource is the document arena pass `arena_hint` and skip the probe.
+    auto* arena = arena_hint ? arena_hint : dynamic_cast<pmr::arena_resource*>(mr);
+    if (arena && arena->try_expand(old, sizeof(T) * static_cast<std::size_t>(cap), bytes)) return old;
   }
+#else
+  (void)arena_hint;
 #endif
   auto* data = static_cast<T*>(mr->allocate(bytes, alignof(T)));
   if (size) std::uninitialized_copy_n(old, size, data);
   if (old) mr->deallocate(old, sizeof(T) * static_cast<std::size_t>(cap), alignof(T));
   return data;
 }
+
 } // namespace detail
 
 struct sv_raw_view {
@@ -3361,24 +3476,31 @@ struct sv_value {
   sv_array_view as_array() const;
   sv_object_view as_object() const;
 
-  void array_reserve(std::pmr::memory_resource* mr, std::uint32_t new_cap) {
+  // `arena_hint` is an optional arena_resource for `mr` that the caller already
+  // knows (for example the document arena). Passing it lets container growth try
+  // to expand in place without an RTTI probe; nullptr selects the generic path.
+  void array_reserve(std::pmr::memory_resource* mr, std::uint32_t new_cap,
+                     pmr::arena_resource* arena_hint = nullptr) {
     if (!is_array()) throw std::runtime_error("chjson: not array");
     if (new_cap <= u.a.cap) return;
-    u.a.data = detail::grow_storage(mr, u.a.data, u.a.size, u.a.cap, new_cap);
+    u.a.data = detail::grow_storage(mr, u.a.data, u.a.size, u.a.cap, new_cap, arena_hint);
     u.a.cap = new_cap;
   }
 
-  void array_push_back(std::pmr::memory_resource* mr, sv_value&& v) {
+  void array_push_back(std::pmr::memory_resource* mr, sv_value&& v,
+                       pmr::arena_resource* arena_hint = nullptr) {
     if (!is_array()) throw std::runtime_error("chjson: not array");
     const sv_value copy = v;
     if (u.a.size == (std::numeric_limits<std::uint32_t>::max)()) throw std::bad_alloc();
-    if (u.a.size == u.a.cap) array_reserve(mr, detail::grow_capacity(u.a.cap, u.a.size + 1u));
+    if (u.a.size == u.a.cap) array_reserve(mr, detail::grow_capacity(u.a.cap, u.a.size + 1u), arena_hint);
     new (&u.a.data[u.a.size]) sv_value(copy);
     ++u.a.size;
   }
 
-  void object_reserve(std::pmr::memory_resource* mr, std::uint32_t new_cap);
-  void object_emplace_back(std::pmr::memory_resource* mr, std::string_view key, sv_value&& v);
+  void object_reserve(std::pmr::memory_resource* mr, std::uint32_t new_cap,
+                      pmr::arena_resource* arena_hint = nullptr);
+  void object_emplace_back(std::pmr::memory_resource* mr, std::string_view key, sv_value&& v,
+                           pmr::arena_resource* arena_hint = nullptr);
 
   const sv_value* find(std::string_view key) const noexcept;
   sv_value* find(std::string_view key) noexcept;
@@ -3446,18 +3568,20 @@ inline sv_object_view sv_value::as_object() const {
   return sv_object_view{u.o.data, u.o.size};
 }
 
-inline void sv_value::object_reserve(std::pmr::memory_resource* mr, std::uint32_t new_cap) {
+inline void sv_value::object_reserve(std::pmr::memory_resource* mr, std::uint32_t new_cap,
+                                     pmr::arena_resource* arena_hint) {
   if (!is_object()) throw std::runtime_error("chjson: not object");
   if (new_cap <= u.o.cap) return;
-  u.o.data = detail::grow_storage(mr, u.o.data, u.o.size, u.o.cap, new_cap);
+  u.o.data = detail::grow_storage(mr, u.o.data, u.o.size, u.o.cap, new_cap, arena_hint);
   u.o.cap = new_cap;
 }
 
-inline void sv_value::object_emplace_back(std::pmr::memory_resource* mr, std::string_view key, sv_value&& v) {
+inline void sv_value::object_emplace_back(std::pmr::memory_resource* mr, std::string_view key, sv_value&& v,
+                                          pmr::arena_resource* arena_hint) {
   if (!is_object()) throw std::runtime_error("chjson: not object");
   const sv_value copy = v;
   if (u.o.size == (std::numeric_limits<std::uint32_t>::max)()) throw std::bad_alloc();
-  if (u.o.size == u.o.cap) object_reserve(mr, detail::grow_capacity(u.o.cap, u.o.size + 1u));
+  if (u.o.size == u.o.cap) object_reserve(mr, detail::grow_capacity(u.o.cap, u.o.size + 1u), arena_hint);
   new (&u.o.data[u.o.size]) sv_member{key, copy};
   ++u.o.size;
 }
@@ -4100,10 +4224,15 @@ struct view_parser {
     }
 
     auto* mr = doc->resource();
+    // The document arena is already known by type here, so container growth can
+    // use it directly instead of recovering it from the pmr resource with an
+    // RTTI probe (which most small containers would pay without ever growing).
+    auto* arena = &doc->arena();
     auto reserve = [&](std::uint32_t want) {
       if (want <= out.u.a.cap) return;
-      const auto next = out.u.a.cap ? detail::grow_capacity(out.u.a.cap, want) : (std::max)(4u, want);
-      out.array_reserve(mr, next);
+      const auto next = out.u.a.cap ? detail::grow_capacity(out.u.a.cap, want) : (std::max)(detail::k_initial_container_capacity, want);
+      out.u.a.data = detail::grow_storage(mr, out.u.a.data, out.u.a.size, out.u.a.cap, next, arena);
+      out.u.a.cap = next;
     };
 
     auto is_num_start = [](char c) noexcept {
@@ -4125,7 +4254,7 @@ struct view_parser {
         reserve(want);
       }
     } else {
-      reserve(4);
+      reserve(detail::k_initial_container_capacity);
     }
 
 
@@ -4234,15 +4363,20 @@ struct view_parser {
     }
 
     auto* mr = doc->resource();
+    // The document arena is already known by type here, so container growth can
+    // use it directly instead of recovering it from the pmr resource with an
+    // RTTI probe (which most small containers would pay without ever growing).
+    auto* arena = &doc->arena();
     auto reserve = [&](std::uint32_t want) {
       if (want <= out.u.o.cap) return;
-      const auto next = out.u.o.cap ? detail::grow_capacity(out.u.o.cap, want) : (std::max)(4u, want);
-      out.object_reserve(mr, next);
+      const auto next = out.u.o.cap ? detail::grow_capacity(out.u.o.cap, want) : (std::max)(detail::k_initial_container_capacity, want);
+      out.u.o.data = detail::grow_storage(mr, out.u.o.data, out.u.o.size, out.u.o.cap, next, arena);
+      out.u.o.cap = next;
     };
 
     // Many JSON objects are small and fixed-shape; reserving a few slots helps.
     (void)depth;
-    reserve(4);
+    reserve(detail::k_initial_container_capacity);
 
 
     while (true) {
@@ -4616,6 +4750,18 @@ struct owning_view_parser {
       return c == '-' || (c >= '0' && c <= '9');
     };
 
+    // The document arena is already known by type here, so container growth can
+    // use it directly instead of recovering it from the pmr resource with an
+    // RTTI probe (which most small containers would pay without ever growing).
+    auto* arena = &doc->arena();
+    auto reserve = [&](std::uint32_t want) {
+      if (want <= out.u.a.cap) return;
+      const auto next = out.u.a.cap ? detail::grow_capacity(out.u.a.cap, want)
+                                    : (std::max)(detail::k_initial_container_capacity, want);
+      out.u.a.data = detail::grow_storage(mr, out.u.a.data, out.u.a.size, out.u.a.cap, next, arena);
+      out.u.a.cap = next;
+    };
+
     if (depth <= 1) {
       const std::size_t guess = detail::estimate_array_items(buf, size, i);
       if (guess > 0) {
@@ -4625,10 +4771,10 @@ struct owning_view_parser {
         const std::uint32_t want = (want_sz > static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max()))
                                      ? std::numeric_limits<std::uint32_t>::max()
                                      : static_cast<std::uint32_t>(want_sz);
-        out.array_reserve(mr, want);
+        reserve(want);
       }
     } else {
-      out.array_reserve(mr, 4u);
+      reserve(detail::k_initial_container_capacity);
     }
 
 
@@ -4645,9 +4791,9 @@ struct owning_view_parser {
             return nullptr;
           }
           if (num.is_int) {
-            out.array_push_back(mr, sv_value::integer(num.i));
+            out.array_push_back(mr, sv_value::integer(num.i), arena);
           } else {
-            out.array_push_back(mr, sv_value::number_token_with_double(copy_span(buf + start, i - start), num.d));
+            out.array_push_back(mr, sv_value::number_token_with_double(copy_span(buf + start, i - start), num.d), arena);
           }
 
           if (i >= size) {
@@ -4686,7 +4832,7 @@ struct owning_view_parser {
       detail::skip_ws(buf, size, i);
       sv_value elem = parse_value(depth, e);
       if (e) return nullptr;
-      out.array_push_back(mr, std::move(elem));
+      out.array_push_back(mr, std::move(elem), arena);
 
       if (i >= size) {
         set_error(e, error_code::unexpected_eof);
@@ -4731,7 +4877,18 @@ struct owning_view_parser {
       return out;
     }
     (void)depth;
-    out.object_reserve(mr, 4u);
+    // The document arena is already known by type here, so container growth can
+    // use it directly instead of recovering it from the pmr resource with an
+    // RTTI probe (which most small containers would pay without ever growing).
+    auto* arena = &doc->arena();
+    auto reserve = [&](std::uint32_t want) {
+      if (want <= out.u.o.cap) return;
+      const auto next = out.u.o.cap ? detail::grow_capacity(out.u.o.cap, want)
+                                    : (std::max)(detail::k_initial_container_capacity, want);
+      out.u.o.data = detail::grow_storage(mr, out.u.o.data, out.u.o.size, out.u.o.cap, next, arena);
+      out.u.o.cap = next;
+    };
+    reserve(detail::k_initial_container_capacity);
 
 
     while (true) {
@@ -4770,7 +4927,7 @@ struct owning_view_parser {
       detail::skip_ws(buf, size, i);
       sv_value v = parse_value(depth, e);
       if (e) return nullptr;
-      out.object_emplace_back(mr, key, std::move(v));
+      out.object_emplace_back(mr, key, std::move(v), arena);
 
       if (i >= size) {
         set_error(e, error_code::unexpected_eof);
@@ -4932,10 +5089,15 @@ struct no_string_parser {
     }
 
     auto* mr = doc->resource();
+    // The document arena is already known by type here, so container growth can
+    // use it directly instead of recovering it from the pmr resource with an
+    // RTTI probe (which most small containers would pay without ever growing).
+    auto* arena = &doc->arena();
     auto reserve = [&](std::uint32_t want) {
       if (want <= out.u.a.cap) return;
-      const auto next = out.u.a.cap ? detail::grow_capacity(out.u.a.cap, want) : (std::max)(4u, want);
-      out.array_reserve(mr, next);
+      const auto next = out.u.a.cap ? detail::grow_capacity(out.u.a.cap, want) : (std::max)(detail::k_initial_container_capacity, want);
+      out.u.a.data = detail::grow_storage(mr, out.u.a.data, out.u.a.size, out.u.a.cap, next, arena);
+      out.u.a.cap = next;
     };
 
     // Flat arrays can be sized exactly, including raw floating-point tokens.
@@ -4954,7 +5116,7 @@ struct no_string_parser {
         if (guess >= 16) reserve(static_cast<std::uint32_t>(std::min<std::size_t>(guess, 2u * 1024u * 1024u)));
       }
     } else {
-      reserve(4);
+      reserve(detail::k_initial_container_capacity);
     }
 
 
@@ -5422,10 +5584,15 @@ struct insitu_parser {
     }
 
     auto* mr = doc->resource();
+    // The document arena is already known by type here, so container growth can
+    // use it directly instead of recovering it from the pmr resource with an
+    // RTTI probe (which most small containers would pay without ever growing).
+    auto* arena = &doc->arena();
     auto reserve = [&](std::uint32_t want) {
       if (want <= out.u.a.cap) return;
-      const auto next = out.u.a.cap ? detail::grow_capacity(out.u.a.cap, want) : (std::max)(4u, want);
-      out.array_reserve(mr, next);
+      const auto next = out.u.a.cap ? detail::grow_capacity(out.u.a.cap, want) : (std::max)(detail::k_initial_container_capacity, want);
+      out.u.a.data = detail::grow_storage(mr, out.u.a.data, out.u.a.size, out.u.a.cap, next, arena);
+      out.u.a.cap = next;
     };
 
     auto is_num_start = [](char c) noexcept {
@@ -5447,7 +5614,7 @@ struct insitu_parser {
         reserve(want);
       }
     } else {
-      reserve(4);
+      reserve(detail::k_initial_container_capacity);
     }
 
 
@@ -5550,19 +5717,24 @@ struct insitu_parser {
     out.set_kind(sv_value::kind::object);
 
     auto* mr = doc->resource();
+    // The document arena is already known by type here, so container growth can
+    // use it directly instead of recovering it from the pmr resource with an
+    // RTTI probe (which most small containers would pay without ever growing).
+    auto* arena = &doc->arena();
     if (i < size && buf[i] == '}') {
       ++i;
       return out;
     }
     auto reserve = [&](std::uint32_t want) {
       if (want <= out.u.o.cap) return;
-      const auto next = out.u.o.cap ? detail::grow_capacity(out.u.o.cap, want) : (std::max)(4u, want);
-      out.object_reserve(mr, next);
+      const auto next = out.u.o.cap ? detail::grow_capacity(out.u.o.cap, want) : (std::max)(detail::k_initial_container_capacity, want);
+      out.u.o.data = detail::grow_storage(mr, out.u.o.data, out.u.o.size, out.u.o.cap, next, arena);
+      out.u.o.cap = next;
     };
 
     // Many JSON objects are small and fixed-shape; reserving a few slots helps.
     (void)depth;
-    reserve(4);
+    reserve(detail::k_initial_container_capacity);
 
 
     while (true) {
@@ -6192,10 +6364,6 @@ inline document_parse_result parse_large(std::string_view json, parse_options op
         // Copy the prefix [0, first) upfront (no scanning work needed there).
         if (first > 0) std::memcpy(dst, in, first);
 
-#if CHJSON_PARSE_MT_SCAN_SIMD && (defined(_M_X64) || defined(__SSE2__) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2))
-        #include <emmintrin.h>
-#endif
-
         std::size_t pos = first;
         while (pos < nbytes) {
           if (mt_abort) {
@@ -6249,28 +6417,22 @@ inline document_parse_result parse_large(std::string_view json, parse_options op
             continue;
           }
 
-          // Not in string: SIMD-skip blocks with no special characters.
-#if CHJSON_PARSE_MT_SCAN_SIMD && (defined(_M_X64) || defined(__SSE2__) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2))
-          if (pos + 16 <= nbytes) {
-            const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(in + pos));
-            _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + pos), v);
+          // Not in string: SWAR-skip blocks with no special characters.
+#if CHJSON_PARSE_MT_SCAN_WORD
+          if (pos + 8 <= nbytes) {
+            const std::uint64_t v = detail::swar_load(in + pos);
+            detail::swar_store(dst + pos, v);
 
-            const __m128i q = _mm_cmpeq_epi8(v, _mm_set1_epi8('"'));
-            const __m128i lb = _mm_cmpeq_epi8(v, _mm_set1_epi8('['));
-            const __m128i rb = _mm_cmpeq_epi8(v, _mm_set1_epi8(']'));
-            const __m128i lc = _mm_cmpeq_epi8(v, _mm_set1_epi8('{'));
-            const __m128i rc = _mm_cmpeq_epi8(v, _mm_set1_epi8('}'));
-            const __m128i cm = _mm_cmpeq_epi8(v, _mm_set1_epi8(','));
-
-            const __m128i any = _mm_or_si128(_mm_or_si128(_mm_or_si128(q, lb), _mm_or_si128(rb, lc)), _mm_or_si128(rc, cm));
-            const int mask = _mm_movemask_epi8(any);
-            if (mask == 0) {
-              pos += 16;
+            const std::uint64_t any = detail::swar_eq_fast(v, '"') | detail::swar_eq_fast(v, '[') |
+                                      detail::swar_eq_fast(v, ']') | detail::swar_eq_fast(v, '{') |
+                                      detail::swar_eq_fast(v, '}') | detail::swar_eq_fast(v, ',');
+            if (any == 0ull) {
+              pos += 8;
               continue;
             }
 
-            // Slow path within this 16-byte block: handle only interesting bytes.
-            for (int off = 0; off < 16; ++off) {
+            // Slow path within this 8-byte block: handle only interesting bytes.
+            for (int off = 0; off < 8; ++off) {
               const std::size_t i2 = pos + static_cast<std::size_t>(off);
               const char c = in[i2];
 
@@ -6330,7 +6492,7 @@ inline document_parse_result parse_large(std::string_view json, parse_options op
             }
 
             // If we didn't break out (still not in_str and not closed), advance past the block.
-            if (!in_str && !closed) pos += 16;
+            if (!in_str && !closed) pos += 8;
             continue;
           }
 #endif
