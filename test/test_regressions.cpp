@@ -105,9 +105,9 @@ static void test_memory_and_capacity() {
   CHJSON_CHECK(doc.arena().bytes_committed() <= 4096);
   doc.clear();
   auto array = sv_value::make_array(doc.resource());
-  array.array_reserve(doc.resource(), 4);
+  array.array_reserve(doc.resource(), 4, &doc.arena());
   auto* before = array.u.a.data;
-  array.array_reserve(doc.resource(), 16);
+  array.array_reserve(doc.resource(), 16, &doc.arena());
   CHJSON_CHECK(before == array.u.a.data);
   for (int i = 0; i != 4096; ++i) array.array_push_back(doc.resource(), sv_value::integer(i));
   for (int i = 0; i != 4096; ++i) CHJSON_CHECK(array.as_array()[i].as_int() == i);
@@ -441,7 +441,152 @@ static void test_thread_cache_lifetimes() {
   }
 }
 
+static void test_dump_resume_and_escape_batches() {
+  for (std::size_t nested = 0; nested < 8; ++nested) {
+    std::string array = "[", object = "{";
+    for (std::size_t i = 0; i < 8; ++i) {
+      if (i) { array += ','; object += ','; }
+      const std::string value = i == nested ? "{\"k\":[1,{\"s\":\"x\\n\"}]}" : "{\"k\":123}";
+      array += value;
+      object += '"' + std::to_string(i) + "\":" + (i == nested ? value : "123");
+    }
+    array += ']'; object += '}';
+    for (const auto& json : {array, object}) {
+      check_modes(json, true);
+      auto parsed = parse(json);
+      std::string output = "prefix:";
+      dump_to(output, parsed.doc.root());
+      CHJSON_CHECK(output == "prefix:" + json);
+    }
+  }
+  for (std::size_t length : {1u, 2u, 41u, 42u, 43u, 125u, 126u, 127u, 128u, 255u, 256u, 513u}) {
+    for (unsigned char byte = 0; byte < 32; ++byte) {
+      std::string input(length, static_cast<char>(byte));
+      input += "ordinary UTF-8: \xE4\xBD\xA0\xE5\xA5\xBD";
+      input.append(length, '"');
+      input.append(length, '\\');
+      const auto encoded = dump(sv_value(std::string_view(input)));
+      auto parsed = parse(encoded);
+      CHJSON_CHECK(!parsed.err && parsed.doc.root().as_string_view() == input);
+      CHJSON_CHECK(dump(value(input)) == encoded);
+    }
+  }
+  for (std::size_t digits : {1024u, 1032u, 2048u}) {
+    auto storage = std::make_unique<char[]>(digits + 1);
+    storage[0] = '[';
+    std::fill_n(storage.get() + 1, digits, '1');
+    check_modes({storage.get(), digits + 1}, false);
+  }
+}
+
+static void test_short_number_grammar() {
+  // Differential grammar coverage against the general parser, with an exact
+  // unpadded allocation and a nonzero cursor. Include malformed float suffixes
+  // and valid numeric prefixes followed by junk (require_eof is a caller choice).
+  auto compare = [](std::string_view text) {
+    const std::size_t size = text.size() + 2;
+    auto input = std::make_unique<char[]>(size);
+    input[0] = input[1] = 'x';
+    std::copy(text.begin(), text.end(), input.get() + 2);
+    for (bool eager : {false, true}) {
+      std::size_t fast_pos = 2, general_pos = 2;
+      detail::number_value fast, general;
+      const bool fast_ok = detail::parse_number(input.get(), size, fast_pos, fast, eager);
+      const bool general_ok = detail::parse_number_general(input.get(), size, general_pos, general, eager);
+      CHJSON_CHECK(fast_ok == general_ok && fast_pos == general_pos);
+      if (!fast_ok) continue;
+      CHJSON_CHECK(fast.is_int == general.is_int);
+      if (fast.is_int) CHJSON_CHECK(fast.i == general.i);
+      else if (eager) CHJSON_CHECK(fast.d == general.d);
+    }
+  };
+  constexpr char alphabet[] = "01-+.eE2x";
+  for (std::size_t length = 0, count = 1; length <= 4; ++length, count *= 9) {
+    for (std::size_t pattern = 0; pattern < count; ++pattern) {
+      std::string text(length, '0');
+      std::size_t digits = pattern;
+      for (char& c : text) { c = alphabet[digits % 9]; digits /= 9; }
+      compare(text);
+    }
+  }
+  for (const char* token : {"-0", "1234567", "12345678", "-12345678", "123456789",
+                            "-0.00", "1.25", "-1.2e+3", "0.1e-99", "1.23456789",
+                            "1.23456e", "1.2345e+", "01", "-01", "1e+", "1.", "-"}) {
+    for (const char* suffix : {"", " ", ",", "garbage", "\n\t"}) compare(std::string(token) + suffix);
+  }
+  for (const char* token : {"0", "-0", "-1", "12345678", "123456789", "1.25", "-1.2e+3"}) {
+    check_modes(token, true);
+    check_modes(std::string(" \n") + token + "\t", true);
+    check_modes(std::string(token) + "x", false);
+    check_modes(std::string(token) + "x", true, {256, false});
+    // Reusing legacy number storage must release an old heap token and update
+    // lazy-double state, including after switching from a float to an integer.
+    for (bool eager : {false, true}) {
+      detail::owned_number_value fast, general;
+      fast.set_raw(std::string(80, '9'));
+      general.set_raw(std::string(80, '9'));
+      fast.has_double = general.has_double = true;
+      std::size_t fast_pos = 0, general_pos = 0;
+      CHJSON_CHECK(detail::parse_number(token, std::strlen(token), fast_pos, fast, eager));
+      CHJSON_CHECK(detail::parse_number_general(token, std::strlen(token), general_pos, general, eager));
+      CHJSON_CHECK(fast_pos == general_pos && fast.is_int == general.is_int);
+      CHJSON_CHECK(fast.raw_token() == general.raw_token() && fast.has_double == general.has_double);
+      if (fast.is_int) CHJSON_CHECK(fast.i == general.i);
+      else if (eager) CHJSON_CHECK(fast.d == general.d);
+    }
+  }
+}
+
+static void test_adjacent_readonly_escapes() {
+  for (const char* text : {"[]", "{}", "[ ]", "{ }"}) {
+    check_modes(text, false, {0, true});
+    check_modes(text, true, {1, true});
+    check_modes(std::string(text) + "x", false);
+    check_modes(std::string(text) + "x", true, {1, false});
+  }
+  for (const char* text : {"[[]]", "[{}]", "{\"k\":[]}", "{\"k\":{}}"}) {
+    check_modes(text, false, {1, true});
+    check_modes(text, true, {2, true});
+  }
+  for (const char* text : {"{\"k\":\"v\"}", "{\"k\":\"\\n\\u4f60\"}"}) {
+    check_modes(text, false, {1, true});
+    check_modes(text, true, {2, true});
+    const auto view_error = parse_view(text, {1, true}).err;
+    const auto insitu_error = parse_in_situ(text, {1, true}).err;
+    CHJSON_CHECK(view_error.code == insitu_error.code && view_error.offset == insitu_error.offset);
+  }
+  for (const char* text : {"{\"k\":", "{\"k\":\"\\x\"}"}) {
+    const auto view_error = parse_view(text, {1, true}).err;
+    const auto insitu_error = parse_in_situ(text, {1, true}).err;
+    CHJSON_CHECK(view_error.code == error_code::nesting_too_deep);
+    CHJSON_CHECK(view_error.code == insitu_error.code && view_error.offset == insitu_error.offset);
+    check_modes(text, false, {2, true});
+  }
+  for (std::size_t prefix : {0u, 1u, 7u, 8u, 15u, 31u, 256u}) {
+    const std::string text = '"' + std::string(prefix, 'a') +
+        "\\n\\\"\\\\\\u0000\\uD83D\\uDE00\xE4\xBD\xA0\\t\\/\\b\\f\\r\"";
+    check_modes(text, true);
+    for (std::size_t end = 0; end < text.size(); ++end) {
+      auto unpadded = std::make_unique<char[]>(end);
+      std::copy_n(text.data(), end, unpadded.get());
+      check_modes(std::string_view(unpadded.get(), end), false);
+    }
+    for (const char* bad : {"\\x", "\\u123", "\\u12xz", "\\uD800", "\\uDC00", "\xFF", "\n"})
+      check_modes('"' + std::string(prefix, 'a') + "\\n\\t" + bad + '"', false);
+    // Both read-only APIs must retain their ownership contracts after decoding.
+    auto view = parse_view(text);
+    std::string mutable_input = text;
+    auto owning = parse_owning_view(mutable_input);
+    CHJSON_CHECK(!view.err && !owning.err);
+    mutable_input.assign(mutable_input.size(), 'x');
+    CHJSON_CHECK(view.doc.root().as_string_view() == owning.doc.root().as_string_view());
+  }
+}
+
 void test_regressions() {
+  test_short_number_grammar();
+  test_adjacent_readonly_escapes();
+  test_dump_resume_and_escape_batches();
   test_utf8_and_boundaries();
   test_document_moves_and_reuse();
   test_memory_and_capacity();

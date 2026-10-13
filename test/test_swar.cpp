@@ -23,6 +23,12 @@ using namespace chjson;
 
 namespace {
 
+// Inspect masks in memory order on both little- and big-endian hosts.
+bool lane_set(std::uint64_t mask, std::size_t lane) {
+  const std::size_t shift = detail::swar_little_endian() ? lane * 8 + 7 : (7 - lane) * 8 + 7;
+  return ((mask >> shift) & 1u) != 0;
+}
+
 std::size_t ref_scan_string_special(const char* data, std::size_t size, std::size_t pos) {
   while (pos < size) {
     const unsigned char c = static_cast<unsigned char>(data[pos]);
@@ -113,7 +119,7 @@ void test_eq_mask_is_exact_per_lane() {
       for (std::size_t lane = 0; lane < 8; ++lane) {
         const bool matches = bytes[lane] == needle;
         // Every lane's high bit must exactly report equality.
-        const bool bit = ((mask >> (lane * 8 + 7)) & 1u) != 0u;
+        const bool bit = lane_set(mask, lane);
         CHJSON_CHECK(bit == matches);
         if (matches && first_true == 8) first_true = lane;
       }
@@ -163,7 +169,7 @@ void test_lt_mask_is_exact_per_lane() {
     std::size_t matches = 0;
     for (std::size_t lane = 0; lane < 8; ++lane) {
       const bool truth = bytes[lane] < bound;
-      const bool bit = ((mask >> (lane * 8 + 7)) & 1u) != 0u;
+      const bool bit = lane_set(mask, lane);
       CHJSON_CHECK(bit == truth);
       if (truth) {
         ++matches;
@@ -213,7 +219,7 @@ void test_gt_mask_is_exact_per_lane() {
     std::size_t expected = 8;
     for (std::size_t lane = 0; lane < 8; ++lane) {
       const bool truth = bytes[lane] > bound;
-      const bool bit = ((mask >> (lane * 8 + 7)) & 1u) != 0u;
+      const bool bit = lane_set(mask, lane);
       CHJSON_CHECK(bit == truth);
       if (truth && expected == 8) expected = lane;
     }
@@ -293,7 +299,7 @@ void test_fused_predicates_match_reference() {
 
       // Also verify the exact mask lane-by-lane, not just its first match.
       for (std::size_t lane = 0; lane < 8; ++lane) {
-        const bool bit = ((ws >> (lane * 8 + 7)) & 1u) != 0u;
+        const bool bit = lane_set(ws, lane);
         CHJSON_CHECK(bit == is_ws_ref(bytes[lane]));
       }
     }
@@ -319,7 +325,7 @@ void test_fused_predicates_match_reference() {
       for (std::size_t lane = 0; lane < 8; ++lane) {
         const bool truth = bytes[lane] == '"' || bytes[lane] == '[' || bytes[lane] == '{' ||
                            bytes[lane] == '}' || bytes[lane] == ']';
-        CHJSON_CHECK((((stop >> (lane * 8 + 7)) & 1u) != 0u) == truth);
+        CHJSON_CHECK(lane_set(stop, lane) == truth);
       }
       const std::uint64_t commas = chjson::detail::swar_eq(w, ',');
       std::size_t ref_commas = 0;
@@ -702,9 +708,62 @@ void test_first_byte_big_endian_layout() {
   }
 }
 
+void test_explicit_endian_paths() {
+  std::mt19937_64 rng(12481248);
+  for (int trial = 0; trial < 20000; ++trial) {
+    std::uint64_t be = 0, le = 0, digits_be = 0, digits_le = 0, decimal = 0;
+    const auto needle = static_cast<unsigned char>(rng());
+    for (unsigned lane = 0; lane < 8; ++lane) {
+      const auto byte = static_cast<unsigned char>(lane == 3 ? needle ^ 1u : lane == 4 ? needle : rng());
+      be = (be << 8) | byte;
+      le |= std::uint64_t(byte) << (8 * lane);
+      const unsigned digit = static_cast<unsigned>(rng() % 10);
+      digits_be = (digits_be << 8) | ('0' + digit);
+      digits_le |= std::uint64_t('0' + digit) << (8 * lane);
+      decimal = decimal * 10 + digit;
+    }
+    // Exercise the actual production big-endian branch on every host, including
+    // the adjacent needle^1 / needle pattern that exposes borrow contamination.
+    CHJSON_CHECK(detail::swar_eq_fast(be, needle, false) == detail::swar_eq(be, needle));
+    const auto less = static_cast<unsigned char>(1 + rng() % 128);
+    const auto greater = static_cast<unsigned char>(rng() % 128);
+    CHJSON_CHECK(detail::swar_lt_fast(be, less, false) == detail::swar_lt(be, less));
+    CHJSON_CHECK(detail::swar_gt_fast(be, greater, false) == detail::swar_gt(be, greater));
+    CHJSON_CHECK(detail::swar_ctz64(detail::swar_eq_fast(le, needle, true)) ==
+                 detail::swar_ctz64(detail::swar_eq(le, needle)));
+    CHJSON_CHECK(detail::accumulate_eight_digits(digits_be, false) == decimal);
+    CHJSON_CHECK(detail::accumulate_eight_digits(digits_le, true) == decimal);
+  }
+}
+
+void test_unpadded_scan_boundaries() {
+  for (std::size_t size = 0; size < 96; ++size) {
+    auto storage = std::make_unique<char[]>(size);
+    std::fill_n(storage.get(), size, 'x');
+    for (std::size_t start = 0; start <= size; ++start) {
+      CHJSON_CHECK(detail::scan_string_special(storage.get(), size, start) == size);
+      CHJSON_CHECK(detail::find_first_escape({storage.get() + start, size - start}) == size - start);
+    }
+    if (size) {
+      for (unsigned char special : {'"', '\\', '\0', '\x1F', '\x80'}) {
+        storage[size - 1] = static_cast<char>(special);
+        CHJSON_CHECK(detail::scan_string_special(storage.get(), size, 0) == size - 1);
+      }
+    }
+  }
+  for (std::size_t size : {8u, 16u, 32u, 1024u, 1032u}) {
+    auto storage = std::make_unique<char[]>(size);
+    std::fill_n(storage.get(), size, '1');
+    CHJSON_CHECK(detail::inspect_flat_array(storage.get(), size, 0).items == 0);
+    CHJSON_CHECK(detail::scan_digits(storage.get(), size, 0) == size);
+  }
+}
+
 } // namespace
 
 void test_swar() {
+  test_explicit_endian_paths();
+  test_unpadded_scan_boundaries();
   test_eq_mask_is_exact_per_lane();
   test_lt_mask_is_exact_per_lane();
   test_gt_mask_is_exact_per_lane();

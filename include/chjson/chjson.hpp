@@ -3,6 +3,7 @@
 // chjson: a small, header-only C++17 JSON library.
 // Goals: fast enough in practice, strict JSON by default, high-quality errors.
 
+#include <array>
 #include <cassert>
 #include <algorithm>
 #include <atomic>
@@ -370,22 +371,32 @@ inline std::uint64_t swar_gt(std::uint64_t v, unsigned char n) noexcept {
 //
 // Do NOT complement these masks (a spurious bit becomes a false negative) and
 // do NOT take a population count of them.
+// On big-endian hosts the wrappers use exact masks, since the lowest numeric
+// lane is the last byte in memory. The endian selection folds away at compile time.
 // test/test_swar.cpp checks both the lowest-lane contract enforced here and the
 // per-lane exactness of the variants above.
 
 // High bit set in every byte equal to `b`, plus possible spurious bits above a match.
-inline std::uint64_t swar_eq_fast(std::uint64_t v, unsigned char b) noexcept {
+inline std::uint64_t swar_eq_fast(std::uint64_t v, unsigned char b,
+                                 bool little_endian = swar_little_endian()) noexcept {
+  // Borrow propagates toward higher bits, which precede the real match in
+  // big-endian memory order. Exact masks retain the first-byte contract there.
+  if (!little_endian) return swar_eq(v, b);
   const std::uint64_t x = v ^ swar_splat(b);
   return (x - swar_low_bits) & ~x & swar_high_bits;
 }
 
 // High bit set in every byte < `n` (1 <= n <= 128), plus possible bits above a match.
-inline std::uint64_t swar_lt_fast(std::uint64_t v, unsigned char n) noexcept {
+inline std::uint64_t swar_lt_fast(std::uint64_t v, unsigned char n,
+                                 bool little_endian = swar_little_endian()) noexcept {
+  if (!little_endian) return swar_lt(v, n);
   return (v - swar_splat(n)) & ~v & swar_high_bits;
 }
 
 // High bit set in every byte > `n` (0 <= n <= 127), plus possible bits above a match.
-inline std::uint64_t swar_gt_fast(std::uint64_t v, unsigned char n) noexcept {
+inline std::uint64_t swar_gt_fast(std::uint64_t v, unsigned char n,
+                                 bool little_endian = swar_little_endian()) noexcept {
+  if (!little_endian) return swar_gt(v, n);
   return ((v + swar_splat(static_cast<unsigned char>(127u - n))) | v) & swar_high_bits;
 }
 
@@ -548,32 +559,58 @@ inline bool consume_utf8_run(const char* data, std::size_t size, std::size_t& po
   return true;
 }
 
+// Scalar classification uses one lookup for ordinary bytes, controls and UTF-8.
+inline constexpr auto string_special_bytes = [] {
+  std::array<unsigned char, 256> table{};
+  for (unsigned c = 0; c < 256; ++c)
+    table[c] = static_cast<unsigned char>(c == '"' || c == '\\' || c < 0x20 || c >= 0x80);
+  return table;
+}();
+
 // Find the next quote, escape, control byte or UTF-8 byte. Never read past size,
 // including when the input is a string_view without padding or a terminator.
-inline std::size_t scan_string_special(const char* data, std::size_t size, std::size_t pos) noexcept {
+// Keep short strings in the caller even when the long-run loop is unrolled.
+#if defined(_MSC_VER)
+__forceinline
+#elif defined(__GNUC__) || defined(__clang__)
+__attribute__((always_inline)) inline
+#else
+inline
+#endif
+std::size_t scan_string_special(const char* data, std::size_t size, std::size_t pos) noexcept {
   // Scalar-first: callers frequently resume right at the byte that ended the
   // previous run (a quote or a backslash in escape-dense strings), and short
   // runs of plain bytes are cheaper to peel scalar than to probe with a word.
   if (pos >= size) return pos;
   {
     const auto c = static_cast<unsigned char>(data[pos]);
-    if (c == '"' || c == '\\' || c < 0x20 || c >= 0x80) return pos;
+    if (string_special_bytes[c] != 0) return pos;
   }
 
-  // Only take the word path when a full word is provably free of special bytes,
-  // so a short string or a dense-escape body never pays for the word setup.
+  // Continue word scanning after a plain first word. If it already contains
+  // a special byte, finish the short run with scalar classification.
   if (size - pos >= 8 && swar_is_string_special_fast(swar_load(data + pos)) == 0ull) {
     pos += 8;
-    // Portable SWAR scan (eight bytes per iteration on every architecture).
+    // Check each word before proceeding, so a short run never pays to
+    // classify the next word. Pair the iterations to halve loop-bound checks.
+    while (size - pos >= 16) {
+      const auto first = swar_is_string_special_fast(swar_load(data + pos));
+      if (first) return pos + swar_first_byte(first);
+      const auto second = swar_is_string_special_fast(swar_load(data + pos + 8));
+      if (second) return pos + 8 + swar_first_byte(second);
+      pos += 16;
+    }
     while (size - pos >= 8) {
       const std::uint64_t m = swar_is_string_special_fast(swar_load(data + pos));
       if (m != 0ull) return pos + swar_first_byte(m);
       pos += 8;
     }
+  } else {
+    ++pos; // The first byte was already checked above.
   }
   while (pos < size) {
     const auto c = static_cast<unsigned char>(data[pos]);
-    if (c == '"' || c == '\\' || c < 0x20 || c >= 0x80) break;
+    if (string_special_bytes[c] != 0) break;
     ++pos;
   }
   return pos;
@@ -584,18 +621,45 @@ inline bool is_digit(char c) noexcept { return c >= '0' && c <= '9'; }
 // Advance `p` to the first byte at or after `p` that is not an ASCII digit.
 // `p` must be <= size.
 //
-// Deliberately scalar: typical JSON numbers are a handful of digits, where the
-// simple loop beats any word-scan setup, and the loop is also what feeds the
-// no-overflow-checked conversion in convert_integer_token().
+// Peel short runs before using word classification for long mantissas/exponents.
 inline std::size_t scan_digits(const char* buf, std::size_t size, std::size_t p) noexcept {
+  for (unsigned k = 0; k < 4; ++k) {
+    if (p == size || !is_digit(buf[p])) return p;
+    ++p;
+  }
+  while (size - p >= 8) {
+    const auto mask = swar_is_non_digit_fast(swar_load(buf + p));
+    if (mask) return p + swar_first_byte(mask);
+    p += 8;
+  }
   while (p < size && is_digit(buf[p])) ++p;
   return p;
 }
 
-// Convert a run of ASCII digits that is known to fit in a std::uint64_t
-// (at most 19 digits) without per-digit overflow bookkeeping.
+// Combine eight validated digits in independent pairs, then groups of four.
+// Each intermediate fits its lane, so multiplication cannot contaminate a neighbor.
+inline std::uint64_t accumulate_eight_digits(std::uint64_t word,
+                                             bool little_endian = swar_little_endian()) noexcept {
+  word &= 0x0F0F0F0F0F0F0F0Full;
+  if (little_endian) {
+    word = (word * 10u + (word >> 8)) & 0x00FF00FF00FF00FFull;
+    word = (word * 100u + (word >> 16)) & 0x0000FFFF0000FFFFull;
+    word = (word * 10000u + (word >> 32)) & 0xFFFFFFFFull;
+  } else {
+    word = ((word >> 8) * 10u + word) & 0x00FF00FF00FF00FFull;
+    word = ((word >> 16) * 100u + word) & 0x0000FFFF0000FFFFull;
+    word = ((word >> 32) * 10000u + word) & 0xFFFFFFFFull;
+  }
+  return word;
+}
+
+// Convert up to 19 validated ASCII digits without per-digit overflow bookkeeping.
 inline std::uint64_t accumulate_digits(const char* buf, std::size_t begin, std::size_t end) noexcept {
   std::uint64_t acc = 0;
+  while (end - begin >= 8) {
+    acc = acc * 100000000u + accumulate_eight_digits(swar_load(buf + begin));
+    begin += 8;
+  }
   for (std::size_t k = begin; k < end; ++k)
     acc = acc * 10u + static_cast<std::uint64_t>(buf[k] - '0');
   return acc;
@@ -1216,119 +1280,143 @@ inline double parse_double(std::string_view token) {
   return parse_double(token.data(), token.data() + token.size());
 }
 
-// Result of validating the JSON number grammar without converting the value.
-// Sharing one scanner between both number_value flavors removes a duplicated
-// copy of the grammar from the hot path.
-struct number_scan_result {
-  bool ok{false};
-  bool neg{false};
-  bool is_int{true};
-  std::size_t digits_begin{0}; // first integer-part digit
-  std::size_t digits_end{0};   // one past the last integer-part digit
-  std::size_t end{0};          // one past the whole token
-};
-
-// Scan the JSON number grammar starting at `i`:
-//   -?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?
-// Digit runs go through scan_digits(); the grammar itself is validated exactly
-// once and shared by both number_value flavors.
-inline number_scan_result scan_number_token(const char* buf, std::size_t size, std::size_t i) noexcept {
-  number_scan_result r;
-  std::size_t p = i;
-
-  if (p < size && buf[p] == '-') {
-    r.neg = true;
-    ++p;
-    if (p >= size) return r;
-  }
-  if (p >= size) return r;
-
-  r.digits_begin = p;
-  if (buf[p] == '0') {
-    ++p;
-    // Leading zeros are not allowed in JSON.
-    if (p < size && is_digit(buf[p])) return r;
-  } else {
-    const char c0 = buf[p];
-    if (c0 < '1' || c0 > '9') return r;
-    p = scan_digits(buf, size, p + 1);
-  }
-  r.digits_end = p;
-
-  if (p < size && buf[p] == '.') {
-    r.is_int = false;
-    ++p;
-    if (p >= size || !is_digit(buf[p])) return r;
-    p = scan_digits(buf, size, p);
-  }
-
-  if (p < size && (buf[p] == 'e' || buf[p] == 'E')) {
-    r.is_int = false;
-    ++p;
-    if (p >= size) return r;
-    if (buf[p] == '+' || buf[p] == '-') {
-      ++p;
-      if (p >= size) return r;
-    }
-    if (!is_digit(buf[p])) return r;
-    p = scan_digits(buf, size, p);
-  }
-
-  r.end = p;
-  r.ok = true;
-  return r;
-}
-
-// Convert an ASCII digit run to std::int64_t. Returns false when the value does
-// not fit (the caller then falls back to `double`, as before).
-//
-// Fast path: 18 digits or fewer always fit in std::int64_t
-// (10^18 - 1 < 2^63 - 1), so no overflow bookkeeping is needed at all -- this
-// covers essentially every integer in real JSON. Longer tokens take the careful
-// uint64 path with explicit overflow tracking preserved from the original code.
-inline bool convert_integer_token(const char* buf, std::size_t begin, std::size_t end,
-                                  bool neg, std::int64_t& out_i) noexcept {
-  const std::size_t ndigits = end - begin;
-  if (ndigits <= 18) {
-    const std::uint64_t acc = accumulate_digits(buf, begin, end);
-    out_i = neg ? -static_cast<std::int64_t>(acc) : static_cast<std::int64_t>(acc);
-    return true;
-  }
-
-  std::uint64_t acc = 0;
-  bool overflow = false;
-  for (std::size_t k = begin; k < end; ++k) {
-    const std::uint64_t d = static_cast<std::uint64_t>(buf[k] - '0');
-    if (!overflow) {
-      if (acc > (std::numeric_limits<std::uint64_t>::max() - d) / 10u) {
-        overflow = true;
-      } else {
-        acc = acc * 10u + d;
-      }
-    }
-  }
-  if (overflow) return false;
-
-  if (neg) {
-    const std::uint64_t limit = static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) + 1ull;
-    if (acc > limit) return false;
-    out_i = (acc == limit) ? std::numeric_limits<std::int64_t>::min() : -static_cast<std::int64_t>(acc);
-    return true;
-  }
-
-  if (acc > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) return false;
-  out_i = static_cast<std::int64_t>(acc);
+// Long canonical JSON integers have no leading zeros. Keep the word conversion
+// and signed boundary checks separate so common short numbers stay cheap to inline.
+inline bool convert_long_integer_token(const char* buf, std::size_t begin, std::size_t end,
+                                       bool neg, std::int64_t& out_i) noexcept {
+  if (end - begin > 19) return false;
+  const std::uint64_t acc = accumulate_digits(buf, begin, end);
+  const auto max = static_cast<std::uint64_t>((std::numeric_limits<std::int64_t>::max)());
+  const auto limit = max + static_cast<std::uint64_t>(neg);
+  if (acc > limit) return false;
+  out_i = neg ? (acc == limit ? (std::numeric_limits<std::int64_t>::min)()
+                              : -static_cast<std::int64_t>(acc))
+              : static_cast<std::int64_t>(acc);
   return true;
 }
 
-inline bool parse_number(const char* buf, std::size_t size, std::size_t& i, number_value& out, bool parse_fp = true) {
-  // JSON number grammar:
-  // -?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?
-  //
-  // The grammar is validated by a single scanner (scan_number_token), which uses
-  // the portable word-at-a-time digit scanner. Integer conversion is only done
-  // when the token really is an integer, and uses a no-overflow-check fast path
-  // for the common short-token case.
+// Convert a validated JSON integer digit run. Short numbers need no overflow
+// bookkeeping; long numbers use word arithmetic and a single signed limit check.
+inline bool convert_integer_token(const char* buf, std::size_t begin, std::size_t end,
+                                  bool neg, std::int64_t& out_i) noexcept {
+  if (end - begin > 7) return convert_long_integer_token(buf, begin, end, neg, out_i);
+  std::uint64_t acc = 0;
+  for (std::size_t k = begin; k < end; ++k)
+    acc = acc * 10u + static_cast<std::uint64_t>(buf[k] - '0');
+  out_i = neg ? -static_cast<std::int64_t>(acc) : static_cast<std::int64_t>(acc);
+  return true;
+}
+
+
+// General number scan, shared by both number_value flavors. Integer digits are
+// accumulated as they are validated; floating-point conversion remains optional.
+struct number_scan_result {
+  bool ok{false};
+  bool neg{false};
+  bool is_int{true};          // integer syntax, including out-of-range integers
+  std::size_t digits_begin{0}; // first integer-part digit
+  std::size_t digits_end{0};   // one past the last integer-part digit
+  std::size_t end{0};          // one past the whole token
+  std::int64_t integer{0};
+  bool fits_int{false};       // integer is valid only when this is true
+};
+
+// Continue only after the short integer path encounters a long run or a
+// fractional/exponent suffix. Keeping this out of the short path leaves its
+// validation and conversion in one small loop.
+#if defined(_MSC_VER)
+__declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+__attribute__((noinline))
+#endif
+inline void scan_number_tail(const char* buf, std::size_t size, std::size_t p,
+                             number_scan_result& r) noexcept {
+  // The caller leaves a nonnegative, validated integer prefix in r.integer.
+  std::uint64_t acc = static_cast<std::uint64_t>(r.integer);
+  while (size - p >= 8) {
+    const auto word = swar_load(buf + p);
+    if (swar_is_non_digit_fast(word)) break;
+    // A canonical run of at most 19 digits fits uint64_t. Longer runs still
+    // need full grammar validation, but will be retained as raw number tokens.
+    if (p - r.digits_begin <= 11) acc = acc * 100000000u + accumulate_eight_digits(word);
+    p += 8;
+  }
+  while (p < size && is_digit(buf[p])) {
+    if (p - r.digits_begin < 19) acc = acc * 10u + static_cast<unsigned>(buf[p] - '0');
+    ++p;
+  }
+  r.digits_end = p;
+  if (p < size && buf[p] == '.') {
+    r.is_int = false;
+    ++p;
+    if (p >= size || !is_digit(buf[p])) return;
+    p = scan_digits(buf, size, p);
+  }
+  if (p < size && (buf[p] == 'e' || buf[p] == 'E')) {
+    r.is_int = false;
+    ++p;
+    if (p >= size) return;
+    if (buf[p] == '+' || buf[p] == '-') {
+      ++p;
+      if (p >= size) return;
+    }
+    if (!is_digit(buf[p])) return;
+    p = scan_digits(buf, size, p);
+  }
+  r.end = p;
+  r.ok = true;
+  const auto max = static_cast<std::uint64_t>((std::numeric_limits<std::int64_t>::max)());
+  const auto limit = max + static_cast<std::uint64_t>(r.neg);
+  r.fits_int = r.is_int && r.digits_end - r.digits_begin <= 19 && acc <= limit;
+  if (r.fits_int) {
+    r.integer = r.neg ? (acc == limit ? (std::numeric_limits<std::int64_t>::min)()
+                                     : -static_cast<std::int64_t>(acc))
+                      : static_cast<std::int64_t>(acc);
+  }
+}
+
+// Validate -?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)? and
+// accumulate short integers during their first (and only) digit scan.
+inline number_scan_result scan_number_token(const char* buf, std::size_t size, std::size_t i) noexcept {
+  number_scan_result r;
+  std::size_t p = i;
+  if (p < size && buf[p] == '-') {
+    r.neg = true;
+    ++p;
+  }
+  if (p >= size || !is_digit(buf[p])) return r;
+  r.digits_begin = p;
+  r.integer = static_cast<unsigned>(buf[p++] - '0');
+  if (r.integer == 0) {
+    if (p < size && is_digit(buf[p])) return r;
+  } else {
+    if (size - p >= 8 && swar_is_non_digit_fast(swar_load(buf + p)) == 0) {
+      scan_number_tail(buf, size, p, r);
+      return r;
+    }
+    const std::size_t short_end = r.digits_begin + (std::min)(size - r.digits_begin, std::size_t{7});
+    while (p < short_end && is_digit(buf[p]))
+      r.integer = r.integer * 10u + static_cast<unsigned>(buf[p++] - '0');
+    if (p < size && is_digit(buf[p])) {
+      scan_number_tail(buf, size, p, r);
+      return r;
+    }
+  }
+  r.digits_end = p;
+  if (p < size && (buf[p] == '.' || buf[p] == 'e' || buf[p] == 'E')) {
+    scan_number_tail(buf, size, p, r);
+    return r;
+  }
+  r.end = p;
+  r.ok = true;
+  r.fits_int = true;
+  if (r.neg) r.integer = -r.integer;
+  return r;
+}
+
+inline bool parse_number_general(const char* buf, std::size_t size, std::size_t& i, number_value& out, bool parse_fp = true) {
+  // Integer conversion is already complete; floats and out-of-range integers
+  // use the requested eager/lazy floating-point policy.
   const std::size_t start = i;
   if (i >= size) return false;
 
@@ -1336,27 +1424,20 @@ inline bool parse_number(const char* buf, std::size_t size, std::size_t& i, numb
   if (!tok.ok) return false;
   i = tok.end;
 
-  if (!tok.is_int) {
+  if (!tok.fits_int) {
     out.is_int = false;
     if (parse_fp) out.d = parse_double(buf + start, buf + tok.end);
     return true;
   }
 
-  std::int64_t iv = 0;
-  if (!convert_integer_token(buf, tok.digits_begin, tok.digits_end, tok.neg, iv)) {
-    // Out of std::int64_t range: fall back to a double, matching prior behavior.
-    out.is_int = false;
-    if (parse_fp) out.d = parse_double(buf + start, buf + tok.end);
-    return true;
-  }
   out.is_int = true;
-  out.i = iv;
+  out.i = tok.integer;
   return true;
 }
 
 
 
-inline bool parse_number(const char* buf, std::size_t size, std::size_t& i, owned_number_value& out, bool parse_fp = true) {
+inline bool parse_number_general(const char* buf, std::size_t size, std::size_t& i, owned_number_value& out, bool parse_fp = true) {
   const std::size_t start = i;
   if (i >= size) return false;
 
@@ -1378,25 +1459,123 @@ inline bool parse_number(const char* buf, std::size_t size, std::size_t& i, owne
     }
   };
 
-  if (!tok.is_int) {
+  if (!tok.fits_int) {
     out.is_int = false;
     set_raw();
     set_double();
     return true;
   }
 
-  std::int64_t iv = 0;
-  if (!convert_integer_token(buf, tok.digits_begin, tok.digits_end, tok.neg, iv)) {
-    out.is_int = false;
-    set_raw();
-    set_double();
-    return true;
-  }
   out.is_int = true;
-  out.i = iv;
+  out.i = tok.integer;
   out.clear_raw();
   out.has_double = false;
   return true;
+}
+
+// At most eight remaining bytes: scalar scanning is cheaper than setting up
+// word classification. Validate and accumulate integers in one pass; float
+// suffixes are validated here too, so lazy read-only parsing never rescans them.
+enum class short_number_kind { invalid, integer, floating };
+
+#if defined(_MSC_VER)
+__forceinline
+#elif defined(__GNUC__) || defined(__clang__)
+__attribute__((always_inline)) inline
+#else
+inline
+#endif
+short_number_kind parse_short_number(const char* buf, std::size_t size, std::size_t& i,
+                                            std::int64_t& out) noexcept {
+  std::size_t p = i;
+  if (p >= size || size - p > 8) return short_number_kind::invalid;
+  const bool neg = buf[p] == '-';
+  p += static_cast<std::size_t>(neg);
+  if (p == size || !is_digit(buf[p])) return short_number_kind::invalid;
+  std::int64_t acc = static_cast<unsigned>(buf[p++] - '0');
+  if (acc == 0) {
+    if (p < size && is_digit(buf[p])) return short_number_kind::invalid;
+  } else {
+    while (p < size && is_digit(buf[p]))
+      acc = acc * 10 + static_cast<unsigned>(buf[p++] - '0');
+  }
+  auto kind = short_number_kind::integer;
+  if (p < size && buf[p] == '.') {
+    kind = short_number_kind::floating;
+    ++p;
+    if (p == size || !is_digit(buf[p])) return short_number_kind::invalid;
+    do { ++p; } while (p < size && is_digit(buf[p]));
+  }
+  if (p < size && (buf[p] == 'e' || buf[p] == 'E')) {
+    kind = short_number_kind::floating;
+    ++p;
+    if (p == size) return short_number_kind::invalid;
+    if (buf[p] == '+' || buf[p] == '-') ++p;
+    if (p == size || !is_digit(buf[p])) return short_number_kind::invalid;
+    do { ++p; } while (p < size && is_digit(buf[p]));
+  }
+  out = neg ? -acc : acc;
+  i = p;
+  return kind;
+}
+
+// Keep numeric scratch state out of string/container parser frames. The
+// compile-time policy removes floating conversion from the read-only variant.
+template<bool ParseFp>
+#if defined(_MSC_VER)
+__declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+__attribute__((noinline))
+#endif
+inline bool parse_number_impl(const char* buf, std::size_t size, std::size_t& i,
+                              number_value& out) {
+  constexpr bool parse_fp = ParseFp;
+  if (size - i > 8) return parse_number_general(buf, size, i, out, parse_fp);
+  const std::size_t start = i;
+  const auto kind = parse_short_number(buf, size, i, out.i);
+  if (kind == short_number_kind::invalid) return false;
+  out.is_int = kind == short_number_kind::integer;
+  if (!out.is_int && parse_fp) out.d = parse_double(buf + start, buf + i);
+  return true;
+}
+
+// Keep numeric scratch state out of string/container parser frames. The
+// compile-time policy removes floating conversion from the read-only variant.
+template<bool ParseFp>
+#if defined(_MSC_VER)
+__declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+__attribute__((noinline))
+#endif
+inline bool parse_number_impl(const char* buf, std::size_t size, std::size_t& i,
+                              owned_number_value& out) {
+  constexpr bool parse_fp = ParseFp;
+  if (size - i > 8) return parse_number_general(buf, size, i, out, parse_fp);
+  const std::size_t start = i;
+  const auto kind = parse_short_number(buf, size, i, out.i);
+  if (kind == short_number_kind::invalid) return false;
+  out.is_int = kind == short_number_kind::integer;
+  if (out.is_int) {
+    out.clear_raw();
+    out.has_double = false;
+  } else {
+    out.set_raw(std::string_view(buf + start, i - start));
+    out.d = parse_fp ? parse_double(buf + start, buf + i) : 0.0;
+    out.has_double = parse_fp;
+  }
+  return true;
+}
+
+inline bool parse_number(const char* buf, std::size_t size, std::size_t& i,
+                         number_value& out, bool parse_fp = true) {
+  return parse_fp ? parse_number_impl<true>(buf, size, i, out)
+                  : parse_number_impl<false>(buf, size, i, out);
+}
+
+inline bool parse_number(const char* buf, std::size_t size, std::size_t& i,
+                         owned_number_value& out, bool parse_fp = true) {
+  return parse_fp ? parse_number_impl<true>(buf, size, i, out)
+                  : parse_number_impl<false>(buf, size, i, out);
 }
 
 inline bool parse_number(std::string_view s, std::size_t& i, number_value& out, bool parse_fp = true) {
@@ -1915,6 +2094,54 @@ inline std::size_t find_first_escape(std::string_view s) noexcept {
   return n;
 }
 
+// Batch adjacent escapes into a bounded local buffer. Sparse strings still copy
+// their ordinary spans directly, while dense strings avoid one append per byte.
+inline void dump_escaped_tail(std::string& out, std::string_view s) {
+  static constexpr char hex[] = "0123456789ABCDEF";
+  const char* data = s.data();
+  const std::size_t n = s.size();
+  char escaped[256];
+  std::size_t used = 0;
+  for (std::size_t i = 0; i < n;) {
+    const unsigned char uc = static_cast<unsigned char>(data[i]);
+    const char c = data[i];
+    char esc = 0;
+    switch (c) {
+      case '"': esc = '"'; break;
+      case '\\': esc = '\\'; break;
+      case '\b': esc = 'b'; break;
+      case '\f': esc = 'f'; break;
+      case '\n': esc = 'n'; break;
+      case '\r': esc = 'r'; break;
+      case '\t': esc = 't'; break;
+      default: break;
+    }
+    if (used > sizeof(escaped) - 6) {
+      out.append(escaped, used);
+      used = 0;
+    }
+    if (esc) {
+      escaped[used++] = '\\';
+      escaped[used++] = esc;
+    } else if (uc <= 0x1F) {
+      std::memcpy(escaped + used, "\\u00", 4);
+      escaped[used + 4] = hex[uc >> 4];
+      escaped[used + 5] = hex[uc & 0xF];
+      used += 6;
+    } else {
+      out.append(escaped, used);
+      used = 0;
+      const auto count = find_first_escape(s.substr(i));
+      out.append(data + i, count);
+      i += count;
+      continue;
+    }
+    ++i;
+  }
+  out.append(escaped, used);
+  out.push_back('"');
+}
+
 inline void dump_escaped(std::string& out, std::string_view s) {
   static constexpr char hex[] = "0123456789ABCDEF";
 
@@ -1930,6 +2157,13 @@ inline void dump_escaped(std::string& out, std::string_view s) {
   }
 
   if (first > 0) out.append(data, first);
+  if (first + 1 < n) {
+    const auto next = static_cast<unsigned char>(data[first + 1]);
+    if (next == '"' || next == '\\' || next <= 0x1F) {
+      dump_escaped_tail(out, s.substr(first));
+      return;
+    }
+  }
 
   std::size_t chunk_begin = first;
   for (std::size_t i = first; i < n;) {
@@ -3153,6 +3387,7 @@ inline flat_array_info inspect_flat_array(const char* data, std::size_t size, st
       }
       pos += 8;
     }
+    if (pos == size) break;
     const char c = data[pos++];
     if (c == ']') return info;
     if (c == '[' || c == '{' || c == '}' || c == '"') return {};
@@ -3216,18 +3451,17 @@ inline T* grow_storage(std::pmr::memory_resource* mr, T* old, std::uint32_t size
   if (next > (std::numeric_limits<std::size_t>::max)() / sizeof(T)) throw std::bad_alloc();
   const std::size_t bytes = sizeof(T) * static_cast<std::size_t>(next);
   static_assert(std::is_trivially_copyable_v<T>, "arena storage requires trivial values");
-#if defined(__cpp_rtti) || defined(_CPPRTTI)
   if (old) {
     // Container growth happens once per small container, i.e. tens of thousands
     // of times for a modest document, so recovering the arena here with an RTTI
     // probe would show up directly in the profile. Parsers that already know the
     // resource is the document arena pass `arena_hint` and skip the probe.
-    auto* arena = arena_hint ? arena_hint : dynamic_cast<pmr::arena_resource*>(mr);
+    auto* arena = arena_hint;
+#if defined(__cpp_rtti) || defined(_CPPRTTI)
+    if (!arena) arena = dynamic_cast<pmr::arena_resource*>(mr);
+#endif
     if (arena && arena->try_expand(old, sizeof(T) * static_cast<std::size_t>(cap), bytes)) return old;
   }
-#else
-  (void)arena_hint;
-#endif
   auto* data = static_cast<T*>(mr->allocate(bytes, alignof(T)));
   if (size) std::uninitialized_copy_n(old, size, data);
   if (old) mr->deallocate(old, sizeof(T) * static_cast<std::size_t>(cap), alignof(T));
@@ -4019,6 +4253,12 @@ struct view_parser {
     return r;
   }
 
+  // Error reporting must not enlarge the successful short-scalar path.
+#if defined(_MSC_VER)
+  __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+  __attribute__((noinline))
+#endif
   void set_error(error& e, error_code code, std::size_t at = std::numeric_limits<std::size_t>::max()) {
     if (e) return;
     e.code = code;
@@ -4026,6 +4266,12 @@ struct view_parser {
     detail::update_line_col(s, e.offset, e.line, e.column);
   }
 
+  // Keep recursive dispatch out of object member loops.
+#if defined(_MSC_VER)
+  __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+  __attribute__((noinline))
+#endif
   sv_value parse_value(std::size_t depth, error& e) {
     if (depth >= opt.max_depth) {
       set_error(e, error_code::nesting_too_deep);
@@ -4046,8 +4292,18 @@ struct view_parser {
         if (!parse_string(out, e)) return nullptr;
         return sv_value(out);
       }
-      case '[': return parse_array(depth + 1, e);
-      case '{': return parse_object(depth + 1, e);
+      case '[':
+        if (size - i >= 2 && buf[i + 1] == ']') {
+          i += 2;
+          return sv_value::make_array(doc->resource());
+        }
+        return parse_array(depth + 1, e);
+      case '{':
+        if (size - i >= 2 && buf[i + 1] == '}') {
+          i += 2;
+          return sv_value::make_object(doc->resource());
+        }
+        return parse_object(depth + 1, e);
       default: {
         if (c == '-' || (c >= '0' && c <= '9')) {
           detail::number_value num;
@@ -4078,6 +4334,12 @@ struct view_parser {
     return v;
   }
 
+  // Keep the string parser's register/stack requirements out of container loops.
+#if defined(_MSC_VER)
+  __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+  __attribute__((noinline))
+#endif
   bool parse_string(std::string_view& out, error& e) {
     if (i >= size || buf[i] != '"') {
       set_error(e, error_code::invalid_string);
@@ -4139,18 +4401,24 @@ struct view_parser {
           break;
         }
         if (c == '\\') {
-          if (scan >= size) {
-            set_error(e, error_code::unexpected_eof, quote_pos);
-            return false;
-          }
-          const char esc = buf[scan++];
-          if (esc == 'u') {
-            if (scan + 4 > size) {
+          // Consume adjacent escapes together. Their backslashes already delimit
+          // the runs, so there is no plain-text or UTF-8 span to scan between them.
+          do {
+            if (scan >= size) {
               set_error(e, error_code::unexpected_eof, quote_pos);
               return false;
             }
-            scan += 4;
-          }
+            const char esc = buf[scan++];
+            if (esc == 'u') {
+              if (size - scan < 4) {
+                set_error(e, error_code::unexpected_eof, quote_pos);
+                return false;
+              }
+              scan += 4;
+            }
+            if (scan == size || buf[scan] != '\\') break;
+            ++scan;
+          } while (true);
           continue;
         }
         if (uc <= 0x1F) {
@@ -4452,8 +4720,17 @@ struct view_parser {
       ++i;
 
       detail::skip_ws(buf, size, i);
-      sv_value v = parse_value(depth, e);
-      if (e) return nullptr;
+      // String-valued members need no recursive type dispatch. Keep the depth
+      // check before taking this path so error precedence is unchanged.
+      sv_value v;
+      if (i < size && buf[i] == '"' && depth < opt.max_depth) {
+        std::string_view text;
+        if (!parse_string(text, e)) return nullptr;
+        v = sv_value(text);
+      } else {
+        v = parse_value(depth, e);
+        if (e) return nullptr;
+      }
       if (out.u.o.size == out.u.o.cap) reserve(out.u.o.size + 1u);
       new (&out.u.o.data[out.u.o.size]) sv_member{key, std::move(v)};
       ++out.u.o.size;
@@ -4534,6 +4811,12 @@ struct owning_view_parser {
     return r;
   }
 
+  // Error reporting must not enlarge the successful short-scalar path.
+#if defined(_MSC_VER)
+  __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+  __attribute__((noinline))
+#endif
   void set_error(error& e, error_code code, std::size_t at = std::numeric_limits<std::size_t>::max()) {
     if (e) return;
     e.code = code;
@@ -4603,6 +4886,12 @@ struct owning_view_parser {
     return v;
   }
 
+  // Keep the string parser's register/stack requirements out of container loops.
+#if defined(_MSC_VER)
+  __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+  __attribute__((noinline))
+#endif
   bool parse_string(std::string_view& out, error& e) {
     if (i >= size || buf[i] != '"') {
       set_error(e, error_code::invalid_string);
@@ -4664,18 +4953,24 @@ struct owning_view_parser {
           break;
         }
         if (c == '\\') {
-          if (scan >= size) {
-            set_error(e, error_code::unexpected_eof, quote_pos);
-            return false;
-          }
-          const char esc = buf[scan++];
-          if (esc == 'u') {
-            if (scan + 4 > size) {
+          // Consume adjacent escapes together. Their backslashes already delimit
+          // the runs, so there is no plain-text or UTF-8 span to scan between them.
+          do {
+            if (scan >= size) {
               set_error(e, error_code::unexpected_eof, quote_pos);
               return false;
             }
-            scan += 4;
-          }
+            const char esc = buf[scan++];
+            if (esc == 'u') {
+              if (size - scan < 4) {
+                set_error(e, error_code::unexpected_eof, quote_pos);
+                return false;
+              }
+              scan += 4;
+            }
+            if (scan == size || buf[scan] != '\\') break;
+            ++scan;
+          } while (true);
           continue;
         }
         if (uc <= 0x1F) {
@@ -5402,6 +5697,12 @@ struct insitu_parser {
     return r;
   }
 
+  // Keep source-position diagnostics out of the successful parsing path.
+#if defined(_MSC_VER)
+  __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+  __attribute__((noinline))
+#endif
   void set_error(error& e, error_code code, std::size_t at = std::numeric_limits<std::size_t>::max()) {
     if (e) return;
     e.code = code;
@@ -5470,6 +5771,12 @@ struct insitu_parser {
     return v;
   }
 
+  // Keep the string parser's register/stack requirements out of container loops.
+#if defined(_MSC_VER)
+  __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+  __attribute__((noinline))
+#endif
   bool parse_string(std::string_view& out, error& e) {
     if (i >= size || buf[i] != '"') {
       set_error(e, error_code::invalid_string);
@@ -5529,56 +5836,60 @@ struct insitu_parser {
         return true;
       }
       if (c == '\\') {
-        if (rpos >= size) {
-          set_error(e, error_code::unexpected_eof, quote_pos);
-          return false;
-        }
-        const char esc = buf[rpos++];
-        switch (esc) {
-          case '"': buf[wpos++] = '"'; break;
-          case '\\': buf[wpos++] = '\\'; break;
-          case '/': buf[wpos++] = '/'; break;
-          case 'b': buf[wpos++] = '\b'; break;
-          case 'f': buf[wpos++] = '\f'; break;
-          case 'n': track_position_to(rpos); buf[wpos++] = '\n'; break;
-          case 'r': buf[wpos++] = '\r'; break;
-          case 't': buf[wpos++] = '\t'; break;
-          case 'u': {
-            std::uint32_t cp = 0;
-            if (!detail::parse_u4_insitu(buf, size, rpos, cp)) {
-              set_error(e, error_code::invalid_unicode_escape, rpos);
-              return false;
-            }
-            if (cp >= 0xD800u && cp <= 0xDBFFu) {
-              if (rpos + 2 > size || buf[rpos] != '\\' || buf[rpos + 1] != 'u') {
-                set_error(e, error_code::invalid_utf16_surrogate, rpos);
-                return false;
-              }
-              rpos += 2;
-              std::uint32_t low = 0;
-              if (!detail::parse_u4_insitu(buf, size, rpos, low)) {
+        do {
+          if (rpos >= size) {
+            set_error(e, error_code::unexpected_eof, quote_pos);
+            return false;
+          }
+          const char esc = buf[rpos++];
+          switch (esc) {
+            case '"': buf[wpos++] = '"'; break;
+            case '\\': buf[wpos++] = '\\'; break;
+            case '/': buf[wpos++] = '/'; break;
+            case 'b': buf[wpos++] = '\b'; break;
+            case 'f': buf[wpos++] = '\f'; break;
+            case 'n': track_position_to(rpos); buf[wpos++] = '\n'; break;
+            case 'r': buf[wpos++] = '\r'; break;
+            case 't': buf[wpos++] = '\t'; break;
+            case 'u': {
+              std::uint32_t cp = 0;
+              if (!detail::parse_u4_insitu(buf, size, rpos, cp)) {
                 set_error(e, error_code::invalid_unicode_escape, rpos);
                 return false;
               }
-              if (low < 0xDC00u || low > 0xDFFFu) {
+              if (cp >= 0xD800u && cp <= 0xDBFFu) {
+                if (rpos + 2 > size || buf[rpos] != '\\' || buf[rpos + 1] != 'u') {
+                  set_error(e, error_code::invalid_utf16_surrogate, rpos);
+                  return false;
+                }
+                rpos += 2;
+                std::uint32_t low = 0;
+                if (!detail::parse_u4_insitu(buf, size, rpos, low)) {
+                  set_error(e, error_code::invalid_unicode_escape, rpos);
+                  return false;
+                }
+                if (low < 0xDC00u || low > 0xDFFFu) {
+                  set_error(e, error_code::invalid_utf16_surrogate, rpos);
+                  return false;
+                }
+                const std::uint32_t hi = cp - 0xD800u;
+                const std::uint32_t lo = low - 0xDC00u;
+                cp = 0x10000u + ((hi << 10) | lo);
+              } else if (cp >= 0xDC00u && cp <= 0xDFFFu) {
                 set_error(e, error_code::invalid_utf16_surrogate, rpos);
                 return false;
               }
-              const std::uint32_t hi = cp - 0xD800u;
-              const std::uint32_t lo = low - 0xDC00u;
-              cp = 0x10000u + ((hi << 10) | lo);
-            } else if (cp >= 0xDC00u && cp <= 0xDFFFu) {
-              set_error(e, error_code::invalid_utf16_surrogate, rpos);
-              return false;
+              if (cp == 0x0Au) track_position_to(rpos);
+              detail::write_utf8_insitu(buf, wpos, cp);
+              break;
             }
-            if (cp == 0x0Au) track_position_to(rpos);
-            detail::write_utf8_insitu(buf, wpos, cp);
-            break;
+            default:
+              set_error(e, error_code::invalid_escape, rpos - 1);
+              return false;
           }
-          default:
-            set_error(e, error_code::invalid_escape, rpos - 1);
-            return false;
-        }
+          if (rpos == size || buf[rpos] != '\\') break;
+          ++rpos;
+        } while (true);
         continue;
       }
       if (uc <= 0x1F) {
@@ -6778,18 +7089,24 @@ inline document_parse_result parse_large(std::string_view json, parse_options op
                   break;
                 }
                 if (c == '\\') {
-                  if (scan >= size) {
-                    set_error(e, error_code::unexpected_eof, quote_pos);
-                    return false;
-                  }
-                  const char esc = buf[scan++];
-                  if (esc == 'u') {
-                    if (scan + 4 > size) {
+                  // Consume adjacent escapes together. Their backslashes already delimit
+                  // the runs, so there is no plain-text or UTF-8 span to scan between them.
+                  do {
+                    if (scan >= size) {
                       set_error(e, error_code::unexpected_eof, quote_pos);
                       return false;
                     }
-                    scan += 4;
-                  }
+                    const char esc = buf[scan++];
+                    if (esc == 'u') {
+                      if (size - scan < 4) {
+                        set_error(e, error_code::unexpected_eof, quote_pos);
+                        return false;
+                      }
+                      scan += 4;
+                    }
+                    if (scan == size || buf[scan] != '\\') break;
+                    ++scan;
+                  } while (true);
                   continue;
                 }
                 if (uc <= 0x1F) {
@@ -7329,7 +7646,13 @@ inline void dump_to(std::string& out, const sv_value& v, bool pretty = false, in
       }
     };
 
-    auto dump_shallow_object_of_scalars = [&](const sv_value& obj) -> bool {
+    // If a nested value ends the shallow path, keep the completed root prefix
+    // and resume the iterative writer at that member/element. A late nested
+    // value must not make us serialize a large prefix twice.
+    const std::size_t shallow_mark = out.size();
+    std::size_t resume_mark = shallow_mark;
+    std::uint32_t resume_index = 0;
+    auto dump_shallow_object_of_scalars = [&](const sv_value& obj, bool root_object = false) -> bool {
       if (obj.type() != sv_value::kind::object) return false;
       const sv_member* data = obj.u.o.data;
       const std::uint32_t n = obj.u.o.size;
@@ -7339,6 +7662,10 @@ inline void dump_to(std::string& out, const sv_value& v, bool pretty = false, in
         return true;
       }
       for (std::uint32_t i = 0; i < n; ++i) {
+        if (root_object) {
+          resume_index = i;
+          resume_mark = i ? out.size() : shallow_mark;
+        }
         if (i) out.push_back(',');
         detail::dump_escaped(out, data[i].first);
         out.push_back(':');
@@ -7351,7 +7678,7 @@ inline void dump_to(std::string& out, const sv_value& v, bool pretty = false, in
     auto try_dump_shallow = [&]() -> bool {
       const auto tk = v.type();
       if (tk == sv_value::kind::object) {
-        return dump_shallow_object_of_scalars(v);
+        return dump_shallow_object_of_scalars(v, true);
       }
       if (tk != sv_value::kind::array) return false;
 
@@ -7363,6 +7690,8 @@ inline void dump_to(std::string& out, const sv_value& v, bool pretty = false, in
         return true;
       }
       for (std::uint32_t i = 0; i < n; ++i) {
+        resume_index = i;
+        resume_mark = i ? out.size() : shallow_mark;
         if (i) out.push_back(',');
         const sv_value& e = data[i];
         if (dump_shallow_scalar(e)) continue;
@@ -7372,14 +7701,14 @@ inline void dump_to(std::string& out, const sv_value& v, bool pretty = false, in
       return true;
     };
 
-    const std::size_t shallow_mark = out.size();
+    if (dump_shallow_scalar(v)) return;
     if (try_dump_shallow()) return;
-    out.resize(shallow_mark);
+    out.resize(resume_mark);
 
     struct frame {
-      const sv_value* v{nullptr};
-      std::uint32_t idx{0};
-      sv_value::kind k{sv_value::kind::null};
+      const sv_value* v;
+      std::uint32_t idx;
+      sv_value::kind k;
     };
     // Keep the on-stack buffer <4KB to avoid __chkstk probing overhead on Windows.
     // Grow to heap only for very deep nesting.
@@ -7389,7 +7718,7 @@ inline void dump_to(std::string& out, const sv_value& v, bool pretty = false, in
     frame* stack = small;
     std::size_t cap = k_small_cap;
     std::size_t sp = 0;
-    stack[sp++] = frame{&v, 0u, v.type()};
+    stack[sp++] = frame{&v, resume_index, v.type()};
 
     while (sp != 0) {
       frame& f = stack[sp - 1];

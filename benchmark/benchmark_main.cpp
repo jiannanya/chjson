@@ -63,11 +63,31 @@ std::string make_payload(std::size_t n_objects, std::size_t str_len) {
 
 std::string make_workload(std::string_view mode, std::size_t count, std::size_t str_len) {
   if (mode == "objects") return make_payload(count, str_len);
+  if (mode == "late_nested_array") {
+    auto out = make_payload(count, str_len);
+    out.pop_back();
+    if (count) out += ',';
+    out += "[1,{\"nested\":true}]]";
+    return out;
+  }
+  if (mode == "late_nested_object") {
+    std::string out = "{";
+    for (std::size_t i = 0; i < count; ++i) {
+      if (i) out += ',';
+      out += '"' + std::to_string(i) + "\":\"" + std::string(str_len, 'x') + '"';
+    }
+    if (count) out += ',';
+    out += "\"nested\":[1,{\"ok\":true}]}";
+    return out;
+  }
   if (mode == "scalar") return "123";
+  // Explicit scalar inputs also exercise signs, parser cutoffs and lazy floats.
+  if (mode.substr(0, 7) == "scalar:") return std::string(mode.substr(7));
   std::string out = "[";
   for (std::size_t i = 0; i < count; ++i) {
     if (i) out += ',';
     if (mode == "integers") out += std::to_string(i);
+    else if (mode == "long_integers") out += i % 2 ? "-9223372036854775808" : "123456789012345678";
     else if (mode == "floats") out += (i % 2) ? "3.141592653589793" : "1.23456789e-10";
     else if (mode == "strings") out += '"' + std::string(str_len, 'x') + '"';
     else if (mode == "escaped_strings") out += "\"\\n" + std::string(str_len, 'x') + "\\u4F60\\u597D\"";
@@ -82,7 +102,7 @@ std::string make_workload(std::string_view mode, std::size_t count, std::size_t 
       out += std::string(str_len % 6, 'x') + '"';
     }
     else if (mode == "empty") out += "{\"a\":[],\"b\":{}}";
-    else throw std::invalid_argument("unknown workload; use objects, integers, floats, strings, escaped_strings, dense_escapes, utf8_strings, empty, or scalar");
+    else throw std::invalid_argument("unknown workload; use objects, late_nested_array, late_nested_object, integers, long_integers, floats, strings, escaped_strings, dense_escapes, utf8_strings, empty, scalar, or scalar:<JSON>");
   }
   out += ']';
   return out;
@@ -177,6 +197,20 @@ bench_result bench_dump_dom(std::string_view json, std::size_t iters) {
   return {sec, bytes};
 }
 
+template<bool Owning>
+bench_result bench_parse_readonly(std::string_view json, std::size_t iters) {
+  std::conditional_t<Owning, chjson::document, chjson::view_document> doc;
+  const auto t0 = clock_type::now();
+  for (std::size_t i = 0; i < iters; ++i) {
+    chjson::error err;
+    if constexpr (Owning) err = chjson::parse_owning_view_into(doc, json);
+    else err = chjson::parse_view_into(doc, json);
+    if (err) throw std::runtime_error("benchmark input did not parse");
+    do_not_optimize(doc.root().type());
+  }
+  return {std::chrono::duration<double>(clock_type::now() - t0).count(), json.size() * iters};
+}
+
 bench_result bench_dump_reuse(std::string_view json, std::size_t iters) {
   auto r = chjson::parse(json);
   if (r.err) throw std::runtime_error("benchmark input did not parse");
@@ -263,6 +297,8 @@ int main(int argc, char** argv) {
 
   print_mbps("dump(dom)", run_median(runs, [&] { return bench_dump_dom(payload, iters); }));
   print_mbps("dump(reuse)", run_median(runs, [&] { return bench_dump_reuse(payload, iters); }));
+  print_mbps("parse(view_reuse)", run_median(runs, [&] { return bench_parse_readonly<false>(payload, iters); }));
+  print_mbps("parse(owning_view_reuse)", run_median(runs, [&] { return bench_parse_readonly<true>(payload, iters); }));
 
   return 0;
 }

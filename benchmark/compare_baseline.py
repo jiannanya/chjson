@@ -16,6 +16,7 @@ parser.add_argument("--samples", type=int, default=1,
 parser.add_argument("--affinity-mask", type=lambda value: int(value, 0),
                     help="Optional CPU bitmask inherited by both executables (e.g. 0xffff)")
 parser.add_argument("--extended", action="store_true", help="Also measure Unicode, escapes, and larger MT payloads")
+parser.add_argument("--short-scalars", action="store_true", help="Also test varied short scalar roots")
 parser.add_argument("--case", action="append", dest="selected_cases",
                     help="Run only this named case; repeat to select multiple cases")
 parser.add_argument("--output", type=Path, default=Path("benchmark-results.json"))
@@ -37,6 +38,8 @@ if args.affinity_mask is not None:
         if not kernel.SetProcessAffinityMask(kernel.GetCurrentProcess(), args.affinity_mask):
             raise ctypes.WinError(ctypes.get_last_error())
     else:
+        if not hasattr(os, "sched_setaffinity"):
+            parser.error("--affinity-mask is not supported on this platform")
         os.sched_setaffinity(0, {i for i in range(args.affinity_mask.bit_length()) if args.affinity_mask & (1 << i)})
 
 cases = [
@@ -56,11 +59,23 @@ if args.extended:
         ("utf8_strings", 2000, 300, "utf8_strings", 256),
         ("mt_objects_2m", 512, 100, "objects", 4096),
         ("mt_objects_8m", 2048, 30, "objects", 4096),
+        ("long_integers", 20000, 300, "long_integers", 24),
+        ("late_nested_array", 2000, 500, "late_nested_array", 24),
+        ("late_nested_object", 2000, 500, "late_nested_object", 24),
     ])
+if args.short_scalars:
+    for name, token in [
+        ("zero", "0"), ("negative", "-12345"), ("seven_digits", "1234567"),
+        ("eight_digits", "12345678"), ("nine_digits", "123456789"),
+        ("float", "1.25"), ("exponent", "-1.2e+3"),
+        ("true", "true"), ("null", "null"), ("string", '"short"'),
+        ("escaped", '"a\\nb"'),
+    ]:
+        cases.append(("scalar_" + name, 1, 1000000, "scalar:" + token, 24))
 if args.selected_cases:
     unknown = set(args.selected_cases) - {case[0] for case in cases}
     if unknown:
-        parser.error("Unknown cases (some require --extended): " + ", ".join(sorted(unknown)))
+        parser.error("Unknown cases (some require --extended or --short-scalars): " + ", ".join(sorted(unknown)))
     cases = [case for case in cases if case[0] in args.selected_cases]
 report = {"runs_per_case": args.runs, "samples_per_case": args.samples,
           "affinity_mask": hex(args.affinity_mask) if args.affinity_mask is not None else None, "cases": {}}
@@ -79,7 +94,7 @@ for name, count, iterations, mode, length in cases:
                 continue
             text = result.stdout
             metrics = {}
-            for operation, speed in re.findall(r"(parse\(dom\)|parse\(in_situ\)|dump\(dom\)|dump\(reuse\)): ([\d.]+) MiB/s", text):
+            for operation, speed in re.findall(r"((?:parse|dump)\([a-z_]+\)): ([\d.]+) MiB/s", text):
                 metrics[operation] = float(speed)
             for prefix, used, committed in re.findall(r"(cold arena|arena) used bytes: (\d+), committed bytes: (\d+)", text):
                 metrics[prefix + " used"] = int(used)
@@ -114,5 +129,5 @@ for name, count, iterations, mode, length in cases:
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
 
-if any(case["candidate"].get("exit_code", 0) for case in report["cases"].values()):
-    raise SystemExit("candidate benchmark failed; see the result file")
+if any(case[label].get("exit_code", 0) for case in report["cases"].values() for label in ("baseline", "candidate")):
+    raise SystemExit("benchmark failed; see the result file")

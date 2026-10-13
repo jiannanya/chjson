@@ -442,7 +442,7 @@ Options:
 - `CHJSON_BUILD_TESTS` (default `ON`)
 - `CHJSON_BUILD_BENCHMARKS` (default `OFF`)
 - `CHJSON_BUILD_COMPARE_BENCH` (default `OFF`)
-- `CHJSON_BUILD_CONFIG_TESTS` (default `OFF`): additionally test disabled caches/fast path, the optional allocator/word-scan splitter, the C-locale number fallback, and deliberately small MT slices.
+- `CHJSON_BUILD_CONFIG_TESTS` (default `OFF`): additionally test disabled caches/fast path, the optional allocator/word-scan splitter, the C-locale number fallback, deliberately small MT slices, and disabled RTTI.
 - `CHJSON_ENABLE_SANITIZERS` (default `OFF`): ASan + UBSan on GCC/Clang, or ASan on MSVC.
 - `CHJSON_BASELINE_INCLUDE` (default empty): a previous version's include directory; builds `chjson_baseline_bench` from the same benchmark source and compiler/runtime flags.
 
@@ -459,14 +459,16 @@ ctest --test-dir build/release -C Release --output-on-failure
 
 For GCC/Clang on Linux, add `-DCHJSON_ENABLE_SANITIZERS=ON` in a separate Debug build. Tests cover every parse mode, UTF-8 boundaries, document moves, depth limits, raw number preservation, allocation failure injection, deep dumps, worker exceptions, deterministic round trips, and input mutations. The isolated OOM test disables MSVC iterator proxies because those debug-only STL allocations can occur inside `noexcept` operations.
 
-The benchmark accepts `count iterations runs workload [string_length]`. Workloads are `objects` (default), `integers`, `floats`, `strings`, `escaped_strings`, `dense_escapes`, `utf8_strings`, `empty`, and `scalar`. Timings use the median of repeated runs; cold arena storage and reused arena storage are reported separately from throughput. Current headers also report cold input and parallel storage capacities. These figures are not process RSS or total memory. `dump(dom)` creates a fresh output string and may select automatic parallel dumping; `dump(reuse)` calls serial `dump_to()` with a reused output buffer to isolate serialization from fresh output allocation.
+The benchmark accepts `count iterations runs workload [string_length]`. Workloads are `objects` (default), `integers`, `long_integers`, `floats`, `strings`, `escaped_strings`, `dense_escapes`, `utf8_strings`, `empty`, `scalar`, `scalar:<JSON>`, `late_nested_array`, and `late_nested_object`. The last two detect repeated serialization when the shallow path encounters a nested value near the end. Timings use the median of repeated runs; cold arena storage and reused arena storage are reported separately from throughput. Current headers also report cold input and parallel storage capacities. These figures are not process RSS or total memory. `dump(dom)` creates a fresh output string and may select automatic parallel dumping; `dump(reuse)` calls serial `dump_to()` with a reused output buffer to isolate serialization from fresh output allocation. `parse(view_reuse)` and `parse(owning_view_reuse)` measure the read-only APIs with reusable documents.
 
 ```sh
 ./build/release/chjson_bench 20000 500 7 floats
 python benchmark/compare_baseline.py --baseline /path/to/baseline/chjson_bench --candidate /path/to/new/chjson_bench --output benchmark-results.json
 ```
 
-Both comparison executables must contain the same benchmark source and use the same compiler, runtime library, and optimization flags. Set `-DCHJSON_BASELINE_INCLUDE=/path/to/old/include` to build `chjson_baseline_bench` alongside the current benchmark with matching flags. The comparison script records process failures as well as successful measurements. Use `--samples 3` to alternate multiple independent process pairs and take their median, `--extended` for Unicode, escapes and larger MT payloads, and optionally `--affinity-mask` to keep both processes on the same available logical CPUs. Repeat `--case NAME` to select specific workloads.
+Both comparison executables must contain the same benchmark source and use the same compiler, runtime library, and optimization flags. Set `-DCHJSON_BASELINE_INCLUDE=/path/to/old/include` to build `chjson_baseline_bench` alongside the current benchmark with matching flags. The comparison script records process failures as well as successful measurements. Use `--samples 3` to alternate multiple independent process pairs and take their median, `--extended` for Unicode, escapes and larger MT payloads, `--short-scalars` for zero, signed integers, digit-length boundaries, floats, literals and short strings, and optionally `--affinity-mask` to keep both processes on the same available logical CPUs. Repeat `--case NAME` to select specific workloads.
+
+The [performance report](benchmark/PERFORMANCE.md) records the measured changes and reproduction commands. All fast paths use C++17 integer arithmetic and bounded `memcpy` loads, without ISA intrinsics, inline assembly, native CPU flags, or an input-padding requirement. Big-endian scan masks and digit conversion have explicit differential tests, and known arena resources retain in-place growth with RTTI disabled. CI is configured for GCC/Clang on Linux, Clang on macOS, MSVC on Windows, Linux 32-bit builds, and ASan/UBSan; see [the workflow](.github/workflows/ci.yml).
 
 ## Examples
 

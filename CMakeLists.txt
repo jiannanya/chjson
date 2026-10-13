@@ -67,7 +67,7 @@ if(CHJSON_BUILD_TESTS)
   set_tests_properties(chjson_allocation_tests PROPERTIES TIMEOUT 120)
 
   if(CHJSON_BUILD_CONFIG_TESTS)
-    foreach(config IN ITEMS no_cache pool strtod small_mt)
+    foreach(config IN ITEMS no_cache pool strtod small_mt no_rtti)
       add_executable(chjson_tests_${config} ${CHJSON_TEST_SOURCES})
       target_link_libraries(chjson_tests_${config} PRIVATE chjson)
       add_test(NAME chjson_tests_${config} COMMAND chjson_tests_${config})
@@ -79,6 +79,11 @@ if(CHJSON_BUILD_TESTS)
     target_compile_definitions(chjson_tests_small_mt PRIVATE CHJSON_PARSE_DOM_ARENA_RESERVE_MAX=1024
       CHJSON_PARSE_MT_MIN_BYTES=1024 CHJSON_PARSE_MT_MIN_SPANS=4 CHJSON_PARSE_MT_MIN_AVG_SPAN_BYTES=64
       CHJSON_PARSE_MT_SCAN_WORD=0)
+    if(MSVC)
+      target_compile_options(chjson_tests_no_rtti PRIVATE /GR-)
+    elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+      target_compile_options(chjson_tests_no_rtti PRIVATE -fno-rtti)
+    endif()
   endif()
 
 
